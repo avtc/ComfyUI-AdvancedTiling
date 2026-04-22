@@ -120,6 +120,7 @@ def create_dit_tiling_patch(settings: Settings, padding: int):
         w_patches = w_positions.shape[0]
 
         if num_patches != h_patches * w_patches:
+            print(f"[DiTTiling] SKIP: num_patches={num_patches} != h={h_patches}*w={w_patches}={h_patches*w_patches}")
             return data
 
         cache_key = (h_patches, w_patches, padding, hash(settings))
@@ -131,6 +132,14 @@ def create_dit_tiling_patch(settings: Settings, padding: int):
             )
 
         pad_sources, pad_img_ids = _cache[cache_key]
+        num_padding = pad_sources.shape[0]
+
+        print(f"[DiTTiling] h={h_patches} w={w_patches} padding={padding} "
+              f"orig={num_patches} + pad={num_padding} = {num_patches + num_padding} "
+              f"img_ids range h:[{h_positions[0].item():.1f},{h_positions[-1].item():.1f}] "
+              f"w:[{w_positions[0].item():.1f},{w_positions[-1].item():.1f}] "
+              f"pad_img_ids range h:[{pad_img_ids[0,:,1].min().item():.1f},{pad_img_ids[0,:,1].max().item():.1f}] "
+              f"w:[{pad_img_ids[0,:,2].min().item():.1f},{pad_img_ids[0,:,2].max().item():.1f}]")
 
         # Gather padding hidden states from source positions in original grid
         pad_hidden = hidden_states[:, pad_sources, :]

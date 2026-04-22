@@ -234,6 +234,8 @@ class AdvancedTilingVAEDecode:
         patch_model(vae_copy.first_stage_model, settings)
         # Decode latents to image
         image = vae_copy.decode(samples["samples"])
+        print(f"[AdvancedTiling] VAE decode output shape: {image.shape}, dtype: {image.dtype}, "
+              f"min: {image.min().item():.4f}, max: {image.max().item():.4f}")
         if crop:
             # Crop image based on tiling settings
             mask = create_crop_mask(image.shape[2], image.shape[1], settings)
