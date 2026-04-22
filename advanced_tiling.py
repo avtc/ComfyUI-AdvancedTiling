@@ -237,6 +237,6 @@ class AdvancedTilingVAEDecode:
         if crop:
             # Crop image based on tiling settings
             mask = create_crop_mask(image.shape[2], image.shape[1], settings)
-            image = torch.cat((image, mask), dim=3)
+            image = torch.cat((image, mask.to(device=image.device)), dim=3)
 
         return (image,)
