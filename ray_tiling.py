@@ -30,15 +30,6 @@ if HAS_RAYLIGHT:
                 "required": {
                     "settings": ("ADVANCED_TILING_SETTINGS",),
                     "ray_actors": ("RAY_ACTORS",),
-                    "dit_padding": (
-                        "INT",
-                        {
-                            "default": 16,
-                            "min": 0,
-                            "max": 128,
-                            "step": 4,
-                        },
-                    ),
                 },
             }
 
@@ -48,9 +39,9 @@ if HAS_RAYLIGHT:
         CATEGORY = "conditioning"
 
         @ray_patch
-        def patch(self, model, settings, dit_padding):
-            patch_dit_model(model, settings, dit_padding)
+        def patch(self, model, settings):
+            patch_dit_model(model, settings)
 
-        def run(self, settings, ray_actors, dit_padding=16):
-            self.patch(ray_actors, settings, dit_padding)
+        def run(self, settings, ray_actors):
+            self.patch(ray_actors, settings)
             return (ray_actors,)

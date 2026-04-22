@@ -163,15 +163,6 @@ class AdvancedTiling:
             "required": {
                 "settings": ("ADVANCED_TILING_SETTINGS",),
                 "model": ("MODEL",),
-                "dit_padding": (
-                    "INT",
-                    {
-                        "default": 16,
-                        "min": 0,
-                        "max": 128,
-                        "step": 4,
-                    },
-                ),
             },
         }
 
@@ -179,7 +170,7 @@ class AdvancedTiling:
     RETURN_TYPES = ("MODEL",)
     FUNCTION = "run"
 
-    def run(self, settings, model, dit_padding=16):
+    def run(self, settings, model):
         """
         Does the actual patching of the model
         """
@@ -189,7 +180,7 @@ class AdvancedTiling:
         if _has_conv2d(model_copy.model.diffusion_model):
             patch_model(model_copy.model, settings)
         else:
-            patch_dit_model(model_copy, settings, dit_padding)
+            patch_dit_model(model_copy, settings)
 
         return (model_copy,)
 
