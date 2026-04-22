@@ -4,7 +4,6 @@ Main advanced tiling implementation
 
 from typing import Optional
 import functools
-import copy
 
 import torch
 from torch import Tensor
@@ -181,7 +180,7 @@ class AdvancedTiling:
         Does the actual patching of the model
         """
 
-        model_copy = copy.deepcopy(model)
+        model_copy = model.clone()
 
         if _has_conv2d(model_copy.model.diffusion_model):
             patch_model(model_copy.model, settings)
@@ -229,7 +228,7 @@ class AdvancedTilingVAEDecode:
         :return: Final image
         """
 
-        vae_copy = copy.deepcopy(vae)
+        vae_copy = vae.clone()
         # Enable tiling
         patch_model(vae_copy.first_stage_model, settings)
         # Decode latents to image
