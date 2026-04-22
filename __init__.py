@@ -22,4 +22,12 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "AdvancedTilingVAEDecode": "Advanced Tiling VAE Decode",
 }
 
+try:
+    from .ray_tiling import AdvancedTilingRay, HAS_RAYLIGHT
+    if HAS_RAYLIGHT:
+        NODE_CLASS_MAPPINGS["AdvancedTilingRay"] = AdvancedTilingRay
+        NODE_DISPLAY_NAME_MAPPINGS["AdvancedTilingRay"] = "Advanced Tiling (Raylight)"
+except ImportError:
+    pass
+
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]

@@ -12,6 +12,7 @@ from torch.nn import Conv2d
 from torch.nn import functional as F
 from torch.nn.modules.utils import _pair
 from .modes import modes, Settings
+from .dit_tiling import patch_dit_model, _has_conv2d
 
 
 @functools.cache
@@ -147,7 +148,7 @@ class AdvancedTilingSettings:
 
 class AdvancedTiling:
     """
-    Patches Conv2D layers in a model to perform tiling
+    Patches model to perform tiling - supports both UNet (Conv2d) and DiT models
     """
 
     # pylint: disable=invalid-name
@@ -163,19 +164,29 @@ class AdvancedTiling:
                 "settings": ("ADVANCED_TILING_SETTINGS",),
                 "model": ("MODEL",),
             },
+            "optional": {
+                "padding": (
+                    "INT",
+                    {"default": 16, "min": 4, "max": 64, "step": 1},
+                ),
+            },
         }
 
     CATEGORY = "conditioning"
     RETURN_TYPES = ("MODEL",)
     FUNCTION = "run"
 
-    def run(self, settings, model):
+    def run(self, settings, model, padding=16):
         """
         Does the actual patching of the model
         """
 
         model_copy = copy.deepcopy(model)
-        patch_model(model_copy.model, settings)
+
+        if _has_conv2d(model_copy.model.diffusion_model):
+            patch_model(model_copy.model, settings)
+        else:
+            patch_dit_model(model_copy, settings, padding)
 
         return (model_copy,)
 
