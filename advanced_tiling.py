@@ -234,11 +234,22 @@ class AdvancedTilingVAEDecode:
         patch_model(vae_copy.first_stage_model, settings)
         # Decode latents to image
         image = vae_copy.decode(samples["samples"])
-        print(f"[AdvancedTiling] VAE decode output shape: {image.shape}, dtype: {image.dtype}, "
-              f"min: {image.min().item():.4f}, max: {image.max().item():.4f}")
+
+        # WanVAE returns 5D (B, T, H, W, C), standard VAE returns 4D (B, H, W, C)
+        is_5d = image.ndim == 5
+        if is_5d:
+            # Flatten T into B for uniform processing
+            bt, t, h, w, c = image.shape
+            image = image.reshape(bt * t, h, w, c)
+
         if crop:
             # Crop image based on tiling settings
+            # image is (B, H, W, C) at this point
             mask = create_crop_mask(image.shape[2], image.shape[1], settings)
             image = torch.cat((image, mask.to(device=image.device)), dim=3)
+
+        if is_5d:
+            # Restore 5D shape
+            image = image.reshape(bt, t, h, w, -1)
 
         return (image,)
