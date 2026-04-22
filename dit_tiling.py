@@ -1,19 +1,16 @@
 """
-DiT model tiling via per-layer hidden state replacement.
+DiT model tiling via latent content replacement.
 
-Works with any DiT model that supports the post_input and double_block
-transformer_options hooks, including Qwen Image via both standard ComfyUI
-and raylight FSDP/USP.
+Works with any DiT model that supports the post_input transformer_options hook,
+including Qwen Image via both standard ComfyUI and raylight FSDP/USP.
 
-Instead of adding padding patches to the sequence (which the model's attention
-ignores), this approach keeps the same sequence length and replaces the hidden
-states of "waste" patches (outside the hexagonal tile boundary) with content
-from the opposite edge after every transformer block. This is the direct DiT
-analog of Conv2d tiling — same image size, wrapping enforced at every layer.
+On each denoising step, the input latent's waste region (outside the hexagonal
+tile boundary) is overwritten with content from the opposite edge via hex
+coordinate remapping. This ensures the model sees wrapped content, the VAE
+output shows wrapped content (not noise), and the KSampler preview reflects it.
 
-The post_input hook captures the 2D patch layout from img_ids and precomputes
-the waste-to-source mapping. The double_block hook applies the mapping after
-each transformer block.
+A post_input hook also replaces the position IDs (img_ids) for waste patches
+to match their source positions, so RoPE encodes them at the opposite edge.
 """
 
 import torch
@@ -35,11 +32,7 @@ def _build_waste_mapping(
     settings: Settings,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Compute waste-to-source index mapping for hex tiling.
-
-    Uses hex_tiling with original_size == padded_size to determine which
-    patches are inside the hexagon (identity mapping) vs outside (waste).
-    Waste patches map to their hex-wrapped source on the opposite edge.
+    Compute waste-to-source index mapping for hex tiling at patch granularity.
 
     :param h_patches: Number of patch rows
     :param w_patches: Number of patch columns
@@ -67,21 +60,60 @@ def _build_waste_mapping(
     )
 
 
-def create_dit_tiling_patch(settings: Settings):
+def create_latent_tiling_wrapper(settings: Settings):
     """
-    Create per-layer tiling patches for DiT models.
+    Create a model function wrapper that copies source content to waste
+    positions in the input latent on each denoising step.
 
-    Returns (post_input_fn, double_block_fn) — two hook functions:
-    - post_input_fn: captures 2D layout from img_ids, precomputes mapping
-    - double_block_fn: replaces waste patches after each transformer block
+    Modifies the latent in-place so the KSampler preview shows wrapped
+    content at waste positions.
 
     :param settings: Tiling settings
-    :return: (post_input_fn, double_block_fn)
+    :return: Wrapper function for set_model_unet_function_wrapper
+    """
+    from .advanced_tiling import calculate_mapping
+
+    _cache = {}
+
+    def wrapper(apply_model, args):
+        x = args["input"]
+        is_5d = x.ndim == 5
+
+        if is_5d:
+            _, _, _, H, W = x.shape
+        else:
+            _, _, H, W = x.shape
+
+        cache_key = (W, H, hash(settings))
+        if cache_key not in _cache:
+            _cache[cache_key] = calculate_mapping(
+                (W, H), (W, H), settings
+            )
+
+        mapping = _cache[cache_key]
+
+        # Copy source content to waste positions in-place
+        if is_5d:
+            x[:, :, :, mapping[1], mapping[0]] = x[:, :, :, mapping[3], mapping[2]]
+        else:
+            x[:, :, mapping[1], mapping[0]] = x[:, :, mapping[3], mapping[2]]
+
+        return apply_model(args["input"], args["timestep"], **args["c"])
+
+    return wrapper
+
+
+def create_img_ids_patch(settings: Settings):
+    """
+    Create a post_input hook that replaces waste patches' position IDs
+    with their source positions, so RoPE encodes them at the opposite edge.
+
+    :param settings: Tiling settings
+    :return: Post_input hook function
     """
     _cache = {}
 
     def post_input(data: dict) -> dict:
-        img = data["img"]
         img_ids = data["img_ids"]
         transformer_options = data["transformer_options"]
 
@@ -98,42 +130,27 @@ def create_dit_tiling_patch(settings: Settings):
 
         waste_idx, source_idx = _cache[cache_key]
 
-        # Replace waste patches' hidden states with source (opposite edge) content
-        img[:, waste_idx] = img[:, source_idx]
         # Replace waste patches' position IDs to match source positions
-        # so RoPE encodes them at the opposite edge, not their original corner
         img_ids[:, waste_idx] = img_ids[:, source_idx]
 
-        transformer_options["tiling_waste_idx"] = waste_idx
-        transformer_options["tiling_source_idx"] = source_idx
-
         return data
 
-    def double_block(data: dict) -> dict:
-        img = data["img"]
-        transformer_options = data["transformer_options"]
-
-        waste_idx = transformer_options.get("tiling_waste_idx")
-        source_idx = transformer_options.get("tiling_source_idx")
-
-        if waste_idx is not None and source_idx is not None:
-            img[:, waste_idx] = img[:, source_idx]
-
-        return data
-
-    return post_input, double_block
+    return post_input
 
 
 def patch_dit_model(model_patcher, settings: Settings):
     """
     Apply DiT tiling patch to a ComfyUI ModelPatcher.
 
-    Uses post_input hook to capture layout and double_block hook to replace
-    waste patches after each transformer block.
+    Uses a model function wrapper to copy source content to waste positions
+    in the latent on each denoising step, and a post_input hook to fix
+    position IDs for waste patches.
 
     :param model_patcher: ComfyUI ModelPatcher instance
     :param settings: Tiling settings
     """
-    post_input_fn, double_block_fn = create_dit_tiling_patch(settings)
-    model_patcher.set_model_post_input_patch(post_input_fn)
-    model_patcher.set_model_double_block_patch(double_block_fn)
+    wrapper = create_latent_tiling_wrapper(settings)
+    model_patcher.set_model_unet_function_wrapper(wrapper)
+
+    img_ids_patch = create_img_ids_patch(settings)
+    model_patcher.set_model_post_input_patch(img_ids_patch)
