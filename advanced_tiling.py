@@ -4,6 +4,7 @@ Main advanced tiling implementation
 
 from typing import Optional
 import functools
+import copy
 
 import torch
 from torch import Tensor
@@ -228,7 +229,7 @@ class AdvancedTilingVAEDecode:
         :return: Final image
         """
 
-        vae_copy = vae.clone()
+        vae_copy = copy.deepcopy(vae)
         # Enable tiling
         patch_model(vae_copy.first_stage_model, settings)
         # Decode latents to image
