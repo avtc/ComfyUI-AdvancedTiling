@@ -1,12 +1,19 @@
 """
-DiT model tiling via post_input hook patching.
+DiT model tiling via per-layer hidden state replacement.
 
-Works with any DiT model that supports the post_input transformer_options hook,
-including Qwen Image 2512 via both standard ComfyUI and raylight FSDP/USP.
+Works with any DiT model that supports the post_input and double_block
+transformer_options hooks, including Qwen Image via both standard ComfyUI
+and raylight FSDP/USP.
 
-The padded sequence layout is: [original patches] + [padding patches].
-This ensures the model's output crop ([:, :num_embeds]) correctly extracts
-the original patches, while padding patches provide seamless wrap-around context.
+Instead of adding padding patches to the sequence (which the model's attention
+ignores), this approach keeps the same sequence length and replaces the hidden
+states of "waste" patches (outside the hexagonal tile boundary) with content
+from the opposite edge after every transformer block. This is the direct DiT
+analog of Conv2d tiling — same image size, wrapping enforced at every layer.
+
+The post_input hook captures the 2D patch layout from img_ids and precomputes
+the waste-to-source mapping. The double_block hook applies the mapping after
+each transformer block.
 """
 
 import torch
@@ -14,7 +21,7 @@ import torch.nn as nn
 from torch.nn import Conv2d
 
 from .modes import Settings
-from .modes.hex import hex_patch_tiling
+from .modes.hex import hex_tiling
 
 
 def _has_conv2d(model: nn.Module) -> bool:
@@ -22,153 +29,102 @@ def _has_conv2d(model: nn.Module) -> bool:
     return any(isinstance(m, Conv2d) for m in model.modules())
 
 
-def _build_padding(
+def _build_waste_mapping(
     h_patches: int,
     w_patches: int,
-    padding: int,
     settings: Settings,
-    device: torch.device,
-    dtype: torch.dtype,
-    h_positions: torch.Tensor,
-    w_positions: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Compute source indices and img_ids for padding patches.
+    Compute waste-to-source index mapping for hex tiling.
 
-    Iterates over the 2D padded grid, skipping original-region positions.
-    For each padding position, finds the source via hex tiling and computes
-    the actual 2D spatial position (extrapolated from the original img_ids pattern).
+    Uses hex_tiling with original_size == padded_size to determine which
+    patches are inside the hexagon (identity mapping) vs outside (waste).
+    Waste patches map to their hex-wrapped source on the opposite edge.
 
-    :param h_patches: Patch rows in original grid
-    :param w_patches: Patch columns in original grid
-    :param padding: Padding amount on each side
+    :param h_patches: Number of patch rows
+    :param w_patches: Number of patch columns
     :param settings: Tiling settings
-    :param device: Target device for tensors
-    :param dtype: Target dtype for img_ids
-    :param h_positions: Sorted unique h positions from original img_ids
-    :param w_positions: Sorted unique w positions from original img_ids
-    :return: (source_indices, padding_img_ids) where source_indices is LongTensor
-             of flat indices into the original grid, and padding_img_ids is (1, P, 3)
+    :return: (waste_indices, source_indices) — Long tensors for indexing
     """
-    padded_h = h_patches + 2 * padding
-    padded_w = w_patches + 2 * padding
+    waste = []
+    source = []
 
-    h_min = h_positions[0].item()
-    w_min = w_positions[0].item()
-    h_step = (h_positions[-1] - h_positions[0]).item() / max(h_patches - 1, 1)
-    w_step = (w_positions[-1] - w_positions[0]).item() / max(w_patches - 1, 1)
-
-    sources = []
-    positions = []
-
-    for ph in range(padded_h):
-        for pw in range(padded_w):
-            oh = ph - padding
-            ow = pw - padding
-
-            if 0 <= oh < h_patches and 0 <= ow < w_patches:
-                continue
-
-            src_h, src_w = hex_patch_tiling(
-                ph, pw,
-                h_patches, w_patches,
-                padded_h, padded_w,
+    for h in range(h_patches):
+        for w in range(w_patches):
+            new_x, new_y = hex_tiling(
+                w, h,
+                (w_patches, h_patches),
+                (w_patches, h_patches),
                 settings,
             )
-            src_h = (src_h - padding) % h_patches
-            src_w = (src_w - padding) % w_patches
-            sources.append(src_h * w_patches + src_w)
+            if new_x != w or new_y != h:
+                waste.append(h * w_patches + w)
+                source.append(new_y * w_patches + new_x)
 
-            actual_h = h_min + oh * h_step
-            actual_w = w_min + ow * w_step
-            positions.append([0.0, actual_h, actual_w])
-
-    sources_tensor = torch.tensor(sources, dtype=torch.long, device=device)
-    positions_tensor = torch.tensor(positions, dtype=dtype, device=device).unsqueeze(0)
-
-    return sources_tensor, positions_tensor
+    return (
+        torch.tensor(waste, dtype=torch.long),
+        torch.tensor(source, dtype=torch.long),
+    )
 
 
-def create_dit_tiling_patch(settings: Settings, padding: int):
+def create_dit_tiling_patch(settings: Settings):
     """
-    Create a post_input patch function for DiT tiling.
+    Create per-layer tiling patches for DiT models.
 
-    The returned function conforms to the post_input hook signature:
-      fn({"img": ..., "txt": ..., "img_ids": ..., "txt_ids": ..., "transformer_options": ...}) -> dict
-
-    Layout: [original patches (N)] + [padding patches (P)]
-    The model's output crop ([:, :N]) extracts original patches correctly.
+    Returns (post_input_fn, double_block_fn) — two hook functions:
+    - post_input_fn: captures 2D layout from img_ids, precomputes mapping
+    - double_block_fn: replaces waste patches after each transformer block
 
     :param settings: Tiling settings
-    :param padding: Number of patches to pad on each side
-    :return: Patch function
+    :return: (post_input_fn, double_block_fn)
     """
     _cache = {}
 
-    def tiling_post_input(data: dict) -> dict:
-        hidden_states = data["img"]
-        encoder_hidden_states = data["txt"]
+    def post_input(data: dict) -> dict:
         img_ids = data["img_ids"]
-        txt_ids = data["txt_ids"]
         transformer_options = data["transformer_options"]
-
-        bsz, num_patches, dim = hidden_states.shape
 
         h_positions = img_ids[0, :, 1].unique().sort()[0]
         w_positions = img_ids[0, :, 2].unique().sort()[0]
         h_patches = h_positions.shape[0]
         w_patches = w_positions.shape[0]
 
-        if num_patches != h_patches * w_patches:
-            print(f"[DiTTiling] SKIP: num_patches={num_patches} != h={h_patches}*w={w_patches}={h_patches*w_patches}")
-            return data
-
-        cache_key = (h_patches, w_patches, padding, hash(settings))
+        cache_key = (h_patches, w_patches, hash(settings))
         if cache_key not in _cache:
-            _cache[cache_key] = _build_padding(
-                h_patches, w_patches, padding, settings,
-                hidden_states.device, img_ids.dtype,
-                h_positions, w_positions,
+            _cache[cache_key] = _build_waste_mapping(
+                h_patches, w_patches, settings,
             )
 
-        pad_sources, pad_img_ids = _cache[cache_key]
-        num_padding = pad_sources.shape[0]
+        transformer_options["tiling_waste_idx"] = _cache[cache_key][0]
+        transformer_options["tiling_source_idx"] = _cache[cache_key][1]
 
-        print(f"[DiTTiling] h={h_patches} w={w_patches} padding={padding} "
-              f"orig={num_patches} + pad={num_padding} = {num_patches + num_padding} "
-              f"img_ids range h:[{h_positions[0].item():.1f},{h_positions[-1].item():.1f}] "
-              f"w:[{w_positions[0].item():.1f},{w_positions[-1].item():.1f}] "
-              f"pad_img_ids range h:[{pad_img_ids[0,:,1].min().item():.1f},{pad_img_ids[0,:,1].max().item():.1f}] "
-              f"w:[{pad_img_ids[0,:,2].min().item():.1f},{pad_img_ids[0,:,2].max().item():.1f}]")
+        return data
 
-        # Gather padding hidden states from source positions in original grid
-        pad_hidden = hidden_states[:, pad_sources, :]
+    def double_block(data: dict) -> dict:
+        img = data["img"]
+        transformer_options = data["transformer_options"]
 
-        # Concatenate: original patches first, then padding patches
-        padded_hidden = torch.cat([hidden_states, pad_hidden], dim=1)
-        padded_img_ids = torch.cat([img_ids, pad_img_ids.expand(bsz, -1, -1)], dim=1)
+        waste_idx = transformer_options.get("tiling_waste_idx")
+        source_idx = transformer_options.get("tiling_source_idx")
 
-        return {
-            "img": padded_hidden,
-            "txt": encoder_hidden_states,
-            "img_ids": padded_img_ids,
-            "txt_ids": txt_ids,
-            "transformer_options": transformer_options,
-        }
+        if waste_idx is not None and source_idx is not None:
+            img[:, waste_idx] = img[:, source_idx]
 
-    return tiling_post_input
+        return data
+
+    return post_input, double_block
 
 
-def patch_dit_model(model_patcher, settings: Settings, padding: int = 16):
+def patch_dit_model(model_patcher, settings: Settings):
     """
     Apply DiT tiling patch to a ComfyUI ModelPatcher.
 
-    Works with both standard ModelPatcher and FSDPModelPatcher.
-    Uses set_model_post_input_patch() to inject the tiling hook.
+    Uses post_input hook to capture layout and double_block hook to replace
+    waste patches after each transformer block.
 
     :param model_patcher: ComfyUI ModelPatcher instance
     :param settings: Tiling settings
-    :param padding: Number of patches to pad on each side
     """
-    patch_fn = create_dit_tiling_patch(settings, padding)
-    model_patcher.set_model_post_input_patch(patch_fn)
+    post_input_fn, double_block_fn = create_dit_tiling_patch(settings)
+    model_patcher.set_model_post_input_patch(post_input_fn)
+    model_patcher.set_model_double_block_patch(double_block_fn)

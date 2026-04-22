@@ -2,7 +2,7 @@
 Raylight integration for DiT tiling.
 
 Provides AdvancedTilingRay node that works with raylight's RAY_ACTORS type,
-applying the same post_input hook tiling via @ray_patch on distributed workers.
+applying the same per-layer tiling via @ray_patch on distributed workers.
 Only registers if raylight is installed.
 """
 
@@ -19,7 +19,7 @@ if HAS_RAYLIGHT:
     class AdvancedTilingRay:
         """
         Applies tiling to a raylight RAY_ACTORS model.
-        Uses @ray_patch to inject post_input hook on each distributed worker.
+        Uses @ray_patch to inject per-layer hooks on each distributed worker.
         """
 
         # pylint: disable=invalid-name
@@ -30,10 +30,6 @@ if HAS_RAYLIGHT:
                 "required": {
                     "settings": ("ADVANCED_TILING_SETTINGS",),
                     "ray_actors": ("RAY_ACTORS",),
-                    "padding": (
-                        "INT",
-                        {"default": 16, "min": 4, "max": 64, "step": 1},
-                    ),
                 },
             }
 
@@ -43,9 +39,9 @@ if HAS_RAYLIGHT:
         CATEGORY = "conditioning"
 
         @ray_patch
-        def patch(self, model, settings, padding=16):
-            patch_dit_model(model, settings, padding)
+        def patch(self, model, settings):
+            patch_dit_model(model, settings)
 
-        def run(self, settings, ray_actors, padding=16):
-            self.patch(ray_actors, settings, padding)
+        def run(self, settings, ray_actors):
+            self.patch(ray_actors, settings)
             return (ray_actors,)
