@@ -1,23 +1,26 @@
 """
-DiT model tiling via latent content replacement and per-block hidden state
-replacement.
+DiT model tiling via latent content replacement and noise-level enforcement.
 
-Works with any DiT model that supports the model_function_wrapper,
-post_input, and double_block_patch hooks, including Qwen Image.
+Works with any DiT model that supports the model_function_wrapper and
+post_input hooks, including Qwen Image.
 
-Three mechanisms work together:
+Two mechanisms work on the input side:
 1. Latent content replacement: copies source content to waste positions in
-   the input latent on each denoising step (model wrapper hook).
+   the input latent on each denoising step (so the KSampler preview shows
+   wrapped content).
 2. Position ID fix: replaces waste patches' position IDs with their source
-   positions so RoPE encodes them at the opposite edge (post_input hook).
-3. Per-block hidden state replacement: after each transformer block, replaces
-   waste patches' hidden states with source patches' hidden states
-   (double_block hook). This forces the model to process source content at
-   waste positions at every layer, analogous to how Conv2d wrapping works.
+   positions so RoPE encodes them at the opposite edge.
+
+On the output side, noise-level enforcement corrects the model's prediction:
+3. After the model predicts noise, the output is blended with a hex-remapped
+   version using a feather mask at the hexagonal boundary. This forces the
+   sampler to update boundary patches with content consistent with both sides.
 """
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+import functools
 from torch.nn import Conv2d
 
 from .modes import Settings
@@ -63,20 +66,56 @@ def _build_waste_mapping(
     )
 
 
-def create_latent_tiling_wrapper(settings: Settings, shared: dict):
+@functools.cache
+def _create_feather_mask(
+    width: int, height: int, settings: Settings, blend_width: int,
+) -> torch.Tensor:
     """
-    Create a model function wrapper that copies source content to waste
-    positions in the input latent on each denoising step.
+    Create a feathered mask with smooth transition at the hex boundary.
 
-    Also stores latent dimensions in shared dict for the double_block_patch.
+    Returns a [1, 1, H, W] tensor:
+    - ~1.0 far inside the hexagon (keep model prediction)
+    - ~0.5 at the boundary (blend)
+    - ~0.0 far outside (use remapped prediction)
+
+    :param width: Latent width
+    :param height: Latent height
+    :param settings: Tiling settings
+    :param blend_width: Width of the transition zone in latent pixels
+    """
+    from .advanced_tiling import create_crop_mask
+
+    mask = create_crop_mask(width, height, settings)  # [1, H, W, 1]
+    mask = mask.permute(0, 3, 1, 2)  # [1, 1, H, W]
+
+    if blend_width > 0:
+        kernel_size = blend_width * 2 + 1
+        sigma = blend_width / 2.0
+        coords = torch.arange(kernel_size, dtype=torch.float32) - kernel_size // 2
+        kernel_1d = torch.exp(-coords ** 2 / (2 * sigma ** 2))
+        kernel_2d = kernel_1d[:, None] * kernel_1d[None, :]
+        kernel_2d = kernel_2d / kernel_2d.sum()
+        kernel = kernel_2d.unsqueeze(0).unsqueeze(0)
+        padding = kernel_size // 2
+        mask = F.conv2d(mask, kernel, padding=padding).clamp(0, 1)
+
+    return mask
+
+
+def create_latent_tiling_wrapper(settings: Settings, blend_width: int = 16):
+    """
+    Create a model function wrapper that:
+    1. Replaces waste content in the latent (for preview)
+    2. Runs the model
+    3. Applies noise-level enforcement on the output using a feather mask
 
     :param settings: Tiling settings
-    :param shared: Shared state dict between hooks
-    :return: Wrapper function for set_model_unet_function_wrapper
+    :param blend_width: Width of the feather zone in latent pixels
     """
     from .advanced_tiling import calculate_mapping
 
-    _cache = {}
+    _mapping_cache = {}
+    _mask_cache = {}
 
     def wrapper(apply_model, args):
         x = args["input"]
@@ -87,68 +126,51 @@ def create_latent_tiling_wrapper(settings: Settings, shared: dict):
         else:
             _, _, H, W = x.shape
 
-        shared["H"] = H
-        shared["W"] = W
-
+        # Step 1: Content replacement in latent (for KSampler preview)
         cache_key = (W, H, hash(settings))
-        if cache_key not in _cache:
-            _cache[cache_key] = calculate_mapping(
+        if cache_key not in _mapping_cache:
+            _mapping_cache[cache_key] = calculate_mapping(
                 (W, H), (W, H), settings
             )
-
-        mapping = _cache[cache_key]
+        mapping = _mapping_cache[cache_key]
 
         if is_5d:
             x[:, :, :, mapping[1], mapping[0]] = x[:, :, :, mapping[3], mapping[2]]
         else:
             x[:, :, mapping[1], mapping[0]] = x[:, :, mapping[3], mapping[2]]
 
-        return apply_model(args["input"], args["timestep"], **args["c"])
+        # Step 2: Model prediction
+        output = apply_model(args["input"], args["timestep"], **args["c"])
 
-    return wrapper
+        # Step 3: Noise-level enforcement — blend output with remapped predictions
+        if blend_width > 0:
+            mask_key = (W, H, hash(settings), blend_width)
+            if mask_key not in _mask_cache:
+                _mask_cache[mask_key] = _create_feather_mask(
+                    W, H, settings, blend_width
+                )
 
-
-def create_double_block_patch(settings: Settings, shared: dict):
-    """
-    Create a double_block_patch that replaces waste patches' hidden states
-    with source patches' hidden states after each transformer block.
-
-    This is the DiT equivalent of Conv2d per-layer wrapping: at every layer,
-    the waste region is forced to contain source content, so the model
-    processes wrapped information throughout the network.
-
-    :param settings: Tiling settings
-    :param shared: Shared state dict (expects 'H', 'W' from wrapper)
-    :return: Patch function for set_model_double_block_patch
-    """
-    _cache = {}
-
-    def block_patch(data: dict) -> dict:
-        img = data["img"]
-
-        H = shared.get("H")
-        W = shared.get("W")
-        if H is None or W is None:
-            return data
-
-        num_patches = img.shape[1]
-        patch_size = int(round((H * W / num_patches) ** 0.5))
-        h_patches = H // patch_size
-        w_patches = W // patch_size
-
-        cache_key = (h_patches, w_patches, hash(settings))
-        if cache_key not in _cache:
-            _cache[cache_key] = _build_waste_mapping(
-                h_patches, w_patches, settings,
+            feather = _mask_cache[mask_key].to(
+                device=output.device, dtype=output.dtype
             )
 
-        waste_idx, source_idx = _cache[cache_key]
-        img[:, waste_idx] = img[:, source_idx]
+            # Remapped output: each pixel gets prediction from its hex source
+            remapped = torch.empty_like(output)
+            if is_5d:
+                remapped[:, :, :, mapping[1], mapping[0]] = output[
+                    :, :, :, mapping[3], mapping[2]
+                ]
+            else:
+                remapped[:, :, mapping[1], mapping[0]] = output[
+                    :, :, mapping[3], mapping[2]
+                ]
 
-        data["img"] = img
-        return data
+            # Blend: interior keeps model prediction, boundary transitions
+            output = feather * output + (1 - feather) * remapped
 
-    return block_patch
+        return output
+
+    return wrapper
 
 
 def create_img_ids_patch(settings: Settings):
@@ -187,21 +209,14 @@ def patch_dit_model(model_patcher, settings: Settings):
     """
     Apply DiT tiling patch to a ComfyUI ModelPatcher.
 
-    Three hooks work together:
-    1. Model wrapper: content replacement in latent
-    2. Post_input: position ID fix for waste patches
-    3. Double_block: hidden state replacement for waste patches at every layer
+    Uses content replacement + position ID fix on the input side,
+    and noise-level enforcement on the output side.
 
     :param model_patcher: ComfyUI ModelPatcher instance
     :param settings: Tiling settings
     """
-    shared = {}
-
-    wrapper = create_latent_tiling_wrapper(settings, shared)
+    wrapper = create_latent_tiling_wrapper(settings)
     model_patcher.set_model_unet_function_wrapper(wrapper)
 
     img_ids_patch = create_img_ids_patch(settings)
     model_patcher.set_model_post_input_patch(img_ids_patch)
-
-    block_patch = create_double_block_patch(settings, shared)
-    model_patcher.set_model_double_block_patch(block_patch)
