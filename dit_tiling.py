@@ -123,11 +123,13 @@ def create_double_block_patch(settings: Settings, shared: dict):
     """
     _cache = {}
 
-    def block_patch(img, txt, extra_options):
+    def block_patch(data: dict) -> dict:
+        img = data["img"]
+
         H = shared.get("H")
         W = shared.get("W")
         if H is None or W is None:
-            return img, txt
+            return data
 
         num_patches = img.shape[1]
         patch_size = int(round((H * W / num_patches) ** 0.5))
@@ -143,7 +145,8 @@ def create_double_block_patch(settings: Settings, shared: dict):
         waste_idx, source_idx = _cache[cache_key]
         img[:, waste_idx] = img[:, source_idx]
 
-        return img, txt
+        data["img"] = img
+        return data
 
     return block_patch
 
