@@ -1,16 +1,19 @@
 """
-DiT model tiling via latent content replacement.
+DiT model tiling via latent content replacement and per-block hidden state
+replacement.
 
-Works with any DiT model that supports the post_input transformer_options hook,
-including Qwen Image via both standard ComfyUI and raylight FSDP/USP.
+Works with any DiT model that supports the model_function_wrapper,
+post_input, and double_block_patch hooks, including Qwen Image.
 
-On each denoising step, the input latent's waste region (outside the hexagonal
-tile boundary) is overwritten with content from the opposite edge via hex
-coordinate remapping. This ensures the model sees wrapped content, the VAE
-output shows wrapped content (not noise), and the KSampler preview reflects it.
-
-A post_input hook also replaces the position IDs (img_ids) for waste patches
-to match their source positions, so RoPE encodes them at the opposite edge.
+Three mechanisms work together:
+1. Latent content replacement: copies source content to waste positions in
+   the input latent on each denoising step (model wrapper hook).
+2. Position ID fix: replaces waste patches' position IDs with their source
+   positions so RoPE encodes them at the opposite edge (post_input hook).
+3. Per-block hidden state replacement: after each transformer block, replaces
+   waste patches' hidden states with source patches' hidden states
+   (double_block hook). This forces the model to process source content at
+   waste positions at every layer, analogous to how Conv2d wrapping works.
 """
 
 import torch
@@ -60,15 +63,15 @@ def _build_waste_mapping(
     )
 
 
-def create_latent_tiling_wrapper(settings: Settings):
+def create_latent_tiling_wrapper(settings: Settings, shared: dict):
     """
     Create a model function wrapper that copies source content to waste
     positions in the input latent on each denoising step.
 
-    Modifies the latent in-place so the KSampler preview shows wrapped
-    content at waste positions.
+    Also stores latent dimensions in shared dict for the double_block_patch.
 
     :param settings: Tiling settings
+    :param shared: Shared state dict between hooks
     :return: Wrapper function for set_model_unet_function_wrapper
     """
     from .advanced_tiling import calculate_mapping
@@ -84,6 +87,9 @@ def create_latent_tiling_wrapper(settings: Settings):
         else:
             _, _, H, W = x.shape
 
+        shared["H"] = H
+        shared["W"] = W
+
         cache_key = (W, H, hash(settings))
         if cache_key not in _cache:
             _cache[cache_key] = calculate_mapping(
@@ -92,7 +98,6 @@ def create_latent_tiling_wrapper(settings: Settings):
 
         mapping = _cache[cache_key]
 
-        # Copy source content to waste positions in-place
         if is_5d:
             x[:, :, :, mapping[1], mapping[0]] = x[:, :, :, mapping[3], mapping[2]]
         else:
@@ -101,6 +106,46 @@ def create_latent_tiling_wrapper(settings: Settings):
         return apply_model(args["input"], args["timestep"], **args["c"])
 
     return wrapper
+
+
+def create_double_block_patch(settings: Settings, shared: dict):
+    """
+    Create a double_block_patch that replaces waste patches' hidden states
+    with source patches' hidden states after each transformer block.
+
+    This is the DiT equivalent of Conv2d per-layer wrapping: at every layer,
+    the waste region is forced to contain source content, so the model
+    processes wrapped information throughout the network.
+
+    :param settings: Tiling settings
+    :param shared: Shared state dict (expects 'H', 'W' from wrapper)
+    :return: Patch function for set_model_double_block_patch
+    """
+    _cache = {}
+
+    def block_patch(img, txt, extra_options):
+        H = shared.get("H")
+        W = shared.get("W")
+        if H is None or W is None:
+            return img, txt
+
+        num_patches = img.shape[1]
+        patch_size = int(round((H * W / num_patches) ** 0.5))
+        h_patches = H // patch_size
+        w_patches = W // patch_size
+
+        cache_key = (h_patches, w_patches, hash(settings))
+        if cache_key not in _cache:
+            _cache[cache_key] = _build_waste_mapping(
+                h_patches, w_patches, settings,
+            )
+
+        waste_idx, source_idx = _cache[cache_key]
+        img[:, waste_idx] = img[:, source_idx]
+
+        return img, txt
+
+    return block_patch
 
 
 def create_img_ids_patch(settings: Settings):
@@ -115,7 +160,6 @@ def create_img_ids_patch(settings: Settings):
 
     def post_input(data: dict) -> dict:
         img_ids = data["img_ids"]
-        transformer_options = data["transformer_options"]
 
         h_positions = img_ids[0, :, 1].unique().sort()[0]
         w_positions = img_ids[0, :, 2].unique().sort()[0]
@@ -129,8 +173,6 @@ def create_img_ids_patch(settings: Settings):
             )
 
         waste_idx, source_idx = _cache[cache_key]
-
-        # Replace waste patches' position IDs to match source positions
         img_ids[:, waste_idx] = img_ids[:, source_idx]
 
         return data
@@ -142,15 +184,21 @@ def patch_dit_model(model_patcher, settings: Settings):
     """
     Apply DiT tiling patch to a ComfyUI ModelPatcher.
 
-    Uses a model function wrapper to copy source content to waste positions
-    in the latent on each denoising step, and a post_input hook to fix
-    position IDs for waste patches.
+    Three hooks work together:
+    1. Model wrapper: content replacement in latent
+    2. Post_input: position ID fix for waste patches
+    3. Double_block: hidden state replacement for waste patches at every layer
 
     :param model_patcher: ComfyUI ModelPatcher instance
     :param settings: Tiling settings
     """
-    wrapper = create_latent_tiling_wrapper(settings)
+    shared = {}
+
+    wrapper = create_latent_tiling_wrapper(settings, shared)
     model_patcher.set_model_unet_function_wrapper(wrapper)
 
     img_ids_patch = create_img_ids_patch(settings)
     model_patcher.set_model_post_input_patch(img_ids_patch)
+
+    block_patch = create_double_block_patch(settings, shared)
+    model_patcher.set_model_double_block_patch(block_patch)
