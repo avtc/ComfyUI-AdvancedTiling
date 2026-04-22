@@ -1,24 +1,25 @@
 """
-DiT model tiling via latent content replacement.
+DiT model tiling via latent padding.
 
-Works with any DiT model that supports the post_input transformer_options hook,
+Works with any DiT model that supports the model_function_wrapper hook,
 including Qwen Image via both standard ComfyUI and raylight FSDP/USP.
 
-On each denoising step, the input latent's waste region (outside the hexagonal
-tile boundary) is overwritten with content from the opposite edge via hex
-coordinate remapping. This ensures the model sees wrapped content, the VAE
-output shows wrapped content (not noise), and the KSampler preview reflects it.
+On each denoising step, the input latent is padded to a larger size. The
+padding region is filled with hex-wrapped content from the opposite edge.
+The model processes the padded latent with position IDs computed for the
+larger size — padding patches are genuinely adjacent to the boundary in
+position space. The output is cropped back to the original size.
 
-A post_input hook also replaces the position IDs (img_ids) for waste patches
-to match their source positions, so RoPE encodes them at the opposite edge.
+This is analogous to how Conv2d tiling wraps padding at every layer, but
+applied at the latent level for transformer-based models.
 """
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.nn import Conv2d
 
 from .modes import Settings
-from .modes.hex import hex_tiling
 
 
 def _has_conv2d(model: nn.Module) -> bool:
@@ -26,49 +27,13 @@ def _has_conv2d(model: nn.Module) -> bool:
     return any(isinstance(m, Conv2d) for m in model.modules())
 
 
-def _build_waste_mapping(
-    h_patches: int,
-    w_patches: int,
-    settings: Settings,
-) -> tuple[torch.Tensor, torch.Tensor]:
+def create_latent_tiling_wrapper(settings: Settings, padding: int):
     """
-    Compute waste-to-source index mapping for hex tiling at patch granularity.
-
-    :param h_patches: Number of patch rows
-    :param w_patches: Number of patch columns
-    :param settings: Tiling settings
-    :return: (waste_indices, source_indices) — Long tensors for indexing
-    """
-    waste = []
-    source = []
-
-    for h in range(h_patches):
-        for w in range(w_patches):
-            new_x, new_y = hex_tiling(
-                w, h,
-                (w_patches, h_patches),
-                (w_patches, h_patches),
-                settings,
-            )
-            if new_x != w or new_y != h:
-                waste.append(h * w_patches + w)
-                source.append(new_y * w_patches + new_x)
-
-    return (
-        torch.tensor(waste, dtype=torch.long),
-        torch.tensor(source, dtype=torch.long),
-    )
-
-
-def create_latent_tiling_wrapper(settings: Settings):
-    """
-    Create a model function wrapper that copies source content to waste
-    positions in the input latent on each denoising step.
-
-    Modifies the latent in-place so the KSampler preview shows wrapped
-    content at waste positions.
+    Create a model function wrapper that pads the latent, fills padding
+    with hex-wrapped content, runs the model, and crops the output.
 
     :param settings: Tiling settings
+    :param padding: Latent pixels to add on each side
     :return: Wrapper function for set_model_unet_function_wrapper
     """
     from .advanced_tiling import calculate_mapping
@@ -84,73 +49,59 @@ def create_latent_tiling_wrapper(settings: Settings):
         else:
             _, _, H, W = x.shape
 
-        cache_key = (W, H, hash(settings))
+        # Pad the latent on all sides
+        x_padded = F.pad(x, (padding, padding, padding, padding))
+
+        if is_5d:
+            _, _, _, padded_H, padded_W = x_padded.shape
+        else:
+            _, _, padded_H, padded_W = x_padded.shape
+
+        # Compute hex wrapping mapping for the padded grid
+        cache_key = (W, H, padded_W, padded_H, hash(settings))
         if cache_key not in _cache:
             _cache[cache_key] = calculate_mapping(
-                (W, H), (W, H), settings
+                (W, H), (padded_W, padded_H), settings
             )
-
         mapping = _cache[cache_key]
 
-        # Copy source content to waste positions in-place
+        # Fill padded tensor with wrapped content.
+        # Hexagonal positions: identity (source == dest, no-op).
+        # Waste/padding positions: copies wrapped content from hex source.
         if is_5d:
-            x[:, :, :, mapping[1], mapping[0]] = x[:, :, :, mapping[3], mapping[2]]
+            x_padded[:, :, :, mapping[1], mapping[0]] = x_padded[
+                :, :, :, mapping[3], mapping[2]
+            ]
         else:
-            x[:, :, mapping[1], mapping[0]] = x[:, :, mapping[3], mapping[2]]
+            x_padded[:, :, mapping[1], mapping[0]] = x_padded[
+                :, :, mapping[3], mapping[2]
+            ]
 
-        return apply_model(args["input"], args["timestep"], **args["c"])
+        # Run model on the padded latent
+        result = apply_model(x_padded, args["timestep"], **args["c"])
+
+        # Crop back to original size
+        p = padding
+        if result.ndim == 5:
+            result = result[:, :, :, p : p + H, p : p + W]
+        else:
+            result = result[:, :, p : p + H, p : p + W]
+
+        return result
 
     return wrapper
 
 
-def create_img_ids_patch(settings: Settings):
-    """
-    Create a post_input hook that replaces waste patches' position IDs
-    with their source positions, so RoPE encodes them at the opposite edge.
-
-    :param settings: Tiling settings
-    :return: Post_input hook function
-    """
-    _cache = {}
-
-    def post_input(data: dict) -> dict:
-        img_ids = data["img_ids"]
-        transformer_options = data["transformer_options"]
-
-        h_positions = img_ids[0, :, 1].unique().sort()[0]
-        w_positions = img_ids[0, :, 2].unique().sort()[0]
-        h_patches = h_positions.shape[0]
-        w_patches = w_positions.shape[0]
-
-        cache_key = (h_patches, w_patches, hash(settings))
-        if cache_key not in _cache:
-            _cache[cache_key] = _build_waste_mapping(
-                h_patches, w_patches, settings,
-            )
-
-        waste_idx, source_idx = _cache[cache_key]
-
-        # Replace waste patches' position IDs to match source positions
-        img_ids[:, waste_idx] = img_ids[:, source_idx]
-
-        return data
-
-    return post_input
-
-
-def patch_dit_model(model_patcher, settings: Settings):
+def patch_dit_model(model_patcher, settings: Settings, padding: int = 16):
     """
     Apply DiT tiling patch to a ComfyUI ModelPatcher.
 
-    Uses a model function wrapper to copy source content to waste positions
-    in the latent on each denoising step, and a post_input hook to fix
-    position IDs for waste patches.
+    Pads the latent with hex-wrapped content on each denoising step,
+    forcing the model to attend to wrapped content at the boundary.
 
     :param model_patcher: ComfyUI ModelPatcher instance
     :param settings: Tiling settings
+    :param padding: Latent pixels to add on each side
     """
-    wrapper = create_latent_tiling_wrapper(settings)
+    wrapper = create_latent_tiling_wrapper(settings, padding)
     model_patcher.set_model_unet_function_wrapper(wrapper)
-
-    img_ids_patch = create_img_ids_patch(settings)
-    model_patcher.set_model_post_input_patch(img_ids_patch)
