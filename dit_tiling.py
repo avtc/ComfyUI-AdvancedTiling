@@ -81,6 +81,7 @@ def create_dit_tiling_patch(settings: Settings):
     _cache = {}
 
     def post_input(data: dict) -> dict:
+        img = data["img"]
         img_ids = data["img_ids"]
         transformer_options = data["transformer_options"]
 
@@ -95,8 +96,16 @@ def create_dit_tiling_patch(settings: Settings):
                 h_patches, w_patches, settings,
             )
 
-        transformer_options["tiling_waste_idx"] = _cache[cache_key][0]
-        transformer_options["tiling_source_idx"] = _cache[cache_key][1]
+        waste_idx, source_idx = _cache[cache_key]
+
+        # Replace waste patches' hidden states with source (opposite edge) content
+        img[:, waste_idx] = img[:, source_idx]
+        # Replace waste patches' position IDs to match source positions
+        # so RoPE encodes them at the opposite edge, not their original corner
+        img_ids[:, waste_idx] = img_ids[:, source_idx]
+
+        transformer_options["tiling_waste_idx"] = waste_idx
+        transformer_options["tiling_source_idx"] = source_idx
 
         return data
 
