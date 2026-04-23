@@ -41,44 +41,41 @@ if HAS_RAYLIGHT:
         CATEGORY = "conditioning"
 
         def run(self, settings, ray_actors):
+            # Defined inside run() so cloudpickle serializes it as a nested
+            # function (by value) instead of by module reference.  Module-level
+            # functions get serialized by reference, which requires importing
+            # the module by name on the worker -- but the module name is the
+            # filesystem path (with a hyphen), causing ModuleNotFoundError.
+            def _patch(model, mode, rotation):
+                import importlib.util
+                import os
+                import sys
+
+                _node_dir = os.path.dirname(os.path.abspath(__file__))
+                _pkg = "ComfyUI_AdvancedTiling"
+
+                if _pkg not in sys.modules:
+                    _init = os.path.join(_node_dir, "__init__.py")
+                    spec = importlib.util.spec_from_file_location(
+                        _pkg, _init,
+                        submodule_search_locations=[_node_dir],
+                    )
+                    mod = importlib.util.module_from_spec(spec)
+                    sys.modules[_pkg] = mod
+                    spec.loader.exec_module(mod)
+
+                from ComfyUI_AdvancedTiling.dit_tiling import patch_dit_model
+                from ComfyUI_AdvancedTiling.modes import Settings
+
+                patch_dit_model(model, Settings(mode, rotation))
+                return model
+
             gpu_workers = ray_actors["workers"]
             futures = [
                 actor.model_function_runner.remote(
-                    _remote_tiling_patch, settings.mode, settings.rotation
+                    _patch, settings.mode, settings.rotation
                 )
                 for actor in gpu_workers
             ]
             ray.get(futures)
             return (ray_actors,)
-
-
-    def _remote_tiling_patch(model, mode, rotation):
-        """Standalone tiling patch function for Ray workers.
-
-        Loads the custom node package via importlib to avoid serialization
-        issues with non-standard module paths (e.g. hyphens in directory names).
-
-        Only primitive types (str, float) are passed as arguments so cloudpickle
-        never needs to resolve the custom node module during deserialization.
-        """
-        import importlib.util
-        import os
-        import sys
-
-        _node_dir = os.path.dirname(os.path.abspath(__file__))
-        _pkg = "ComfyUI_AdvancedTiling"
-
-        if _pkg not in sys.modules:
-            _init = os.path.join(_node_dir, "__init__.py")
-            spec = importlib.util.spec_from_file_location(
-                _pkg, _init, submodule_search_locations=[_node_dir],
-            )
-            mod = importlib.util.module_from_spec(spec)
-            sys.modules[_pkg] = mod
-            spec.loader.exec_module(mod)
-
-        from ComfyUI_AdvancedTiling.dit_tiling import patch_dit_model
-        from ComfyUI_AdvancedTiling.modes import Settings
-
-        patch_dit_model(model, Settings(mode, rotation))
-        return model
