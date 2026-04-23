@@ -16,6 +16,34 @@ from .modes.hex_mask import (
 )
 
 
+def _normalize_latent(latent: torch.Tensor) -> tuple[torch.Tensor, tuple[int, ...]]:
+    """
+    Normalize latent to 4D (B, C, H, W) by squeezing singleton temporal dims.
+
+    Video/3D VAEs (e.g. wan) return 5D tensors (1, C, T, H, W).
+    This squeezes singleton dims between channel and spatial to get 4D.
+
+    :return: (4D tensor, original shape for restoration)
+    """
+    original_shape = latent.shape
+    x = latent
+    while x.dim() > 4:
+        # Squeeze the first singleton dim between dim-1 and dim-(ndim-2)
+        squeezed = False
+        for d in range(1, x.dim() - 2):
+            if x.shape[d] == 1:
+                x = x.squeeze(d)
+                squeezed = True
+                break
+        if not squeezed:
+            # No singleton dims to squeeze — merge leading dims
+            x = x.reshape(x.shape[0], -1, x.shape[-2], x.shape[-1])
+            break
+    if x.dim() == 3:
+        x = x.unsqueeze(0)
+    return x, original_shape
+
+
 def _build_neighbor_map(
     width: int, height: int, settings: Settings
 ) -> torch.Tensor:
@@ -56,15 +84,16 @@ def composite_latents(
     Composite center and neighbor latents into a single latent.
 
     Places neighbor content in the waste region around the center hex.
+    Handles both 4D (standard VAE) and 5D (video VAE) inputs.
 
-    :param center_latent: Center tile latent [B, C, H, W]
+    :param center_latent: Center tile latent
     :param neighbor_latents: Dict mapping direction name ("E", "NE", etc.)
-                             to neighbor latent [B, C, H, W]
+                             to neighbor latent
     :param settings: Tiling settings
-    :return: Composited latent [B, C, H, W]
+    :return: Composited latent (same shape as input)
     """
-    result = center_latent.clone()
-    _, _, H, W = result.shape
+    result, original_shape = _normalize_latent(center_latent)
+    B, C, H, W = result.shape
 
     neighbor_map = _build_neighbor_map(W, H, settings)
     direction_to_idx = {name: idx for idx, name in enumerate(NEIGHBOR_DIRECTIONS)}
@@ -76,8 +105,12 @@ def composite_latents(
         if not mask.any():
             continue
 
-        result[:, :, mask] = neighbor_latent[:, :, mask]
+        neighbor_4d, _ = _normalize_latent(neighbor_latent)
+        result[:, :, mask] = neighbor_4d[:, :, mask]
 
+    # Restore original shape if it was >4D
+    if len(original_shape) > 4:
+        result = result.reshape(original_shape)
     return result
 
 
@@ -148,7 +181,9 @@ class AdvancedTilingHexInpaint:
             composited = center_latent
 
         # 4. Generate masks at latent resolution
-        _, C, H_lat, W_lat = composited.shape
+        # Normalize to 4D to extract spatial dims
+        composited_4d, _ = _normalize_latent(composited)
+        _, _, H_lat, W_lat = composited_4d.shape
         H_img, W_img = center_image.shape[1], center_image.shape[2]
 
         border_mask = create_border_mask(W_lat, H_lat, settings, border_width)
