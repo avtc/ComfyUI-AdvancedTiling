@@ -3,22 +3,28 @@ Hex border mask generation with per-neighbor segmentation.
 """
 
 import math
+import functools
+import logging
+
 import torch
 import torch.nn.functional as F
 import numpy as np
 from . import Settings
 from .hex import hex_tiling
 
+logger = logging.getLogger("ComfyUI-AdvancedTiling")
 
 # Neighbor directions for pointy-top hexagon (clockwise from East)
 NEIGHBOR_DIRECTIONS = ["E", "NE", "NW", "W", "SW", "SE"]
 
 
+@functools.cache
 def _build_inside_mask(width: int, height: int, settings: Settings) -> torch.Tensor:
     """
     Build binary mask of pixels inside the hex.
 
-    A pixel is inside if hex_tiling maps it to itself.
+    A pixel is inside if hex_tiling maps it to itself. Cached to avoid
+    redundant computation when both border and neighbor masks are needed.
 
     :return: Bool tensor of shape (height, width)
     """
@@ -43,60 +49,45 @@ def _erode_mask(mask: torch.Tensor, pixels: int) -> torch.Tensor:
         return mask.clone()
 
     kernel_size = 2 * pixels + 1
-    # Use min_pool (negated max_pool) for erosion
     fmask = mask.float().unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
-    # Erosion = -max_pool(-mask) with appropriate padding
     padded = F.pad(fmask, [pixels, pixels, pixels, pixels], mode='constant', value=0)
     eroded = -F.max_pool2d(-padded, kernel_size, stride=1)
     return eroded.squeeze(0).squeeze(0) > 0.5
 
 
-def _pixel_angle_from_center(
-    x: int, y: int, width: int, height: int
-) -> float:
+def _compute_sector_map(width: int, height: int) -> torch.Tensor:
     """
-    Compute angle of pixel from image center in radians [0, 2*pi).
+    Vectorized computation of angular sector for each pixel.
+
+    :return: LongTensor of shape (height, width) with sector indices 0-5
     """
-    dx = x - width / 2.0
-    dy = -(y - height / 2.0)  # Flip Y for standard math coordinates
-    return math.atan2(dy, dx) % (2 * math.pi)
-
-
-def _angle_to_direction(angle: float) -> int:
-    """
-    Map angle [0, 2*pi) to neighbor direction index 0-5.
-
-    For pointy-top hex, sectors are centered on edge midpoints (0°, 60°, ...)
-    with boundaries at vertices (30°, 90°, 150°, ...). The 30° offset aligns
-    sector boundaries with hex vertices.
-
-      E  = 0°     (index 0, sector 330°-30°)
-      NE = 60°    (index 1, sector 30°-90°)
-      NW = 120°   (index 2, sector 90°-150°)
-      W  = 180°   (index 3, sector 150°-210°)
-      SW = 240°   (index 4, sector 210°-270°)
-      SE = 300°   (index 5, sector 270°-330°)
-    """
-    sector = int((angle + math.pi / 6) / (math.pi / 3)) % 6
-    return sector
+    ys, xs = torch.meshgrid(
+        torch.arange(height, dtype=torch.float32),
+        torch.arange(width, dtype=torch.float32),
+        indexing='ij',
+    )
+    dx = xs - width / 2.0
+    dy = -(ys - height / 2.0)  # Flip Y for math coordinates
+    angles = torch.atan2(dy, dx) % (2 * math.pi)
+    # 30° offset aligns sector boundaries with hex vertices
+    return ((angles + math.pi / 6) / (math.pi / 3)).long() % 6
 
 
 def create_border_mask(
-    width: int, height: int, settings: Settings, border_width: float = 0.2
+    width: int, height: int, settings: Settings, border_width: float = 0.2,
+    inside_mask: torch.Tensor = None,
 ) -> torch.Tensor:
     """
     Generate annular border mask for hex inpainting.
-
-    The mask marks pixels that are inside the hex and within border_width
-    of the hex edge. Uses morphological erosion to find the border region.
 
     :param width: Image width
     :param height: Image height
     :param settings: Tiling settings
     :param border_width: Fraction of hex radius for border (0.05-0.45)
+    :param inside_mask: Pre-computed inside mask (H, W) bool, computed if not provided
     :return: Float tensor of shape (1, height, width) with values 0-1
     """
-    inside = _build_inside_mask(width, height, settings)
+    inside = inside_mask if inside_mask is not None else _build_inside_mask(width, height, settings)
     hex_radius = min(width, height) // 2
     erosion_pixels = max(1, int(border_width * hex_radius))
 
@@ -107,7 +98,8 @@ def create_border_mask(
 
 
 def create_neighbor_masks(
-    width: int, height: int, settings: Settings, border_width: float = 0.2
+    width: int, height: int, settings: Settings, border_width: float = 0.2,
+    inside_mask: torch.Tensor = None,
 ) -> torch.Tensor:
     """
     Generate 6 separate border masks, one per neighbor direction.
@@ -119,7 +111,34 @@ def create_neighbor_masks(
     :param height: Image height
     :param settings: Tiling settings
     :param border_width: Fraction of hex radius for border (0.05-0.45)
+    :param inside_mask: Pre-computed inside mask (H, W) bool, computed if not provided
     :return: Float tensor of shape (6, height, width)
+    """
+    inside = inside_mask if inside_mask is not None else _build_inside_mask(width, height, settings)
+    hex_radius = min(width, height) // 2
+    erosion_pixels = max(1, int(border_width * hex_radius))
+
+    eroded = _erode_mask(inside, erosion_pixels)
+    border = inside & ~eroded
+
+    sectors = _compute_sector_map(width, height)
+
+    masks = torch.zeros((6, height, width), dtype=torch.float32)
+    for d in range(6):
+        masks[d] = (border & (sectors == d)).float()
+
+    return masks
+
+
+def create_masks(
+    width: int, height: int, settings: Settings, border_width: float = 0.2,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Compute inside mask, border mask, and neighbor masks in one pass.
+
+    Avoids redundant inside mask computation.
+
+    :return: (inside_mask (H,W) bool, border_mask (1,H,W) float, neighbor_masks (6,H,W) float)
     """
     inside = _build_inside_mask(width, height, settings)
     hex_radius = min(width, height) // 2
@@ -128,15 +147,11 @@ def create_neighbor_masks(
     eroded = _erode_mask(inside, erosion_pixels)
     border = inside & ~eroded
 
-    masks = torch.zeros((6, height, width), dtype=torch.float32)
+    sectors = _compute_sector_map(width, height)
 
-    # Vectorized angle computation for border pixels only
-    border_ys, border_xs = torch.where(border)
-    for idx in range(len(border_xs)):
-        x = border_xs[idx].item()
-        y = border_ys[idx].item()
-        angle = _pixel_angle_from_center(x, y, width, height)
-        direction = _angle_to_direction(angle)
-        masks[direction, y, x] = 1.0
+    border_mask = border.float().unsqueeze(0)
+    neighbor_masks = torch.zeros((6, height, width), dtype=torch.float32)
+    for d in range(6):
+        neighbor_masks[d] = (border & (sectors == d)).float()
 
-    return masks
+    return inside, border_mask, neighbor_masks

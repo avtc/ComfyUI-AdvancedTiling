@@ -1,8 +1,9 @@
 """
-Extended toroidal attention for hex neighbor context injection.
+Hex neighbor attention for inpainting border transitions.
 
-For each boundary patch, injects K/V from the appropriate neighbor tile
-based on which direction the boundary faces, instead of self-wrapping.
+Injects K/V from waste region patches (which hold neighbor content after
+compositing) at boundary positions, reinforcing the neighbor context signal
+during denoising.
 """
 
 import torch
@@ -12,82 +13,82 @@ from .modes.hex_mask import NEIGHBOR_DIRECTIONS
 from .toroidal_attention import _BaseToroidalAttentionPatch, _factorize
 
 
-def _compute_hex_boundary_pairs_with_direction(
+def _compute_hex_boundary_to_waste_pairs(
     h_patches: int,
     w_patches: int,
     settings: Settings,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Like _compute_hex_boundary_pairs but also records direction index (0-5).
+    Find boundary-inside patches adjacent to waste-outside patches.
 
-    Direction is determined by the offset (dh, dw) of the boundary patch
-    relative to the wrapped source.
+    For each patch inside the hex that has a 4-connected neighbor in the
+    waste region, record the boundary patch index and the waste patch index.
+    K/V from the waste patch (neighbor content) will be injected at the
+    boundary patch position.
 
-    :return: (boundary_idx, source_idx, off_h, off_w, direction_idx) as LongTensors
+    :return: (boundary_idx, waste_idx, off_h, off_w) as LongTensors
     """
     from .modes.hex import hex_tiling
-    from .modes.hex_mask import _pixel_angle_from_center, _angle_to_direction
 
     boundary_idx = []
-    source_idx = []
+    waste_idx = []
     offsets_h = []
     offsets_w = []
-    directions = []
 
     for h in range(h_patches):
         for w in range(w_patches):
             src_w, src_h = hex_tiling(
                 w, h, (w_patches, h_patches), (w_patches, h_patches), settings
             )
+            # Skip waste patches — only process inside-hex patches
             if src_w != w or src_h != h:
                 continue
 
             for dh, dw in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
                 nh, nw = h + dh, w + dw
+
+                # Bounds check — out-of-bounds is always waste
+                if nh < 0 or nh >= h_patches or nw < 0 or nw >= w_patches:
+                    continue
+
                 n_src_w, n_src_h = hex_tiling(
                     nw, nh, (w_patches, h_patches), (w_patches, h_patches), settings
                 )
 
+                # If neighbor maps elsewhere, it's a waste patch
                 if n_src_w != nw or n_src_h != nh:
-                    angle = _pixel_angle_from_center(w, h, w_patches, h_patches)
-                    direction = _angle_to_direction(angle)
-
                     boundary_idx.append(h * w_patches + w)
-                    source_idx.append(n_src_h * w_patches + n_src_w)
+                    waste_idx.append(nh * w_patches + nw)
                     offsets_h.append(dh)
                     offsets_w.append(dw)
-                    directions.append(direction)
 
     if not boundary_idx:
         empty = torch.tensor([], dtype=torch.long)
-        return (empty, empty.clone(), empty.clone(), empty.clone(), empty.clone())
+        return (empty, empty.clone(), empty.clone(), empty.clone())
 
     return (
         torch.tensor(boundary_idx, dtype=torch.long),
-        torch.tensor(source_idx, dtype=torch.long),
+        torch.tensor(waste_idx, dtype=torch.long),
         torch.tensor(offsets_h, dtype=torch.long),
         torch.tensor(offsets_w, dtype=torch.long),
-        torch.tensor(directions, dtype=torch.long),
     )
 
 
 class HexNeighborAttentionPatch(_BaseToroidalAttentionPatch):
     """
-    Attention patch that injects K/V from neighbor tiles at boundary patches.
+    Attention patch for hex inpainting that injects K/V from waste region
+    patches (neighbor content) at boundary positions.
 
-    When neighbors are provided in the latent (Hybrid/Masked modes), this
-    works identically to HexToroidalAttentionPatch since neighbors are already
-    in the K/V tensor. For Attention-Only mode, neighbor K/V must be pre-loaded.
+    In Hybrid/Masked modes, the waste region contains composited neighbor
+    content. This patch reinforces that context by injecting extra K/V from
+    waste patches at each attention layer.
     """
 
     def __init__(self, settings: Settings, pe_embedder):
         super().__init__(pe_embedder)
         self.settings = settings
-        self._directions = None
 
     def _compute_boundary_pairs(self, h_patches, w_patches):
-        result = _compute_hex_boundary_pairs_with_direction(
+        return _compute_hex_boundary_to_waste_pairs(
             h_patches, w_patches, self.settings
         )
-        self._directions = result[4]
-        return result[:4]

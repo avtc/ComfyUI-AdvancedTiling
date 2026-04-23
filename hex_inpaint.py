@@ -1,19 +1,27 @@
 """
 Hex tile inpainting: composites center + neighbor latents, patches model
 for natural border transitions.
+
+Uses hex geometry directly (not through settings tiling mode) so that:
+- Masks and compositing always use hex_tiling
+- No Conv2d wrapping is applied (preserves neighbor content in waste region)
+- Attention injects K/V from waste region (neighbor content) at boundaries
 """
 
+import time
+import logging
+import functools
+
 import torch
-import torch.nn as nn
 
 from .modes import Settings
+from .modes.hex import hex_tiling
 from .modes.hex_mask import (
     NEIGHBOR_DIRECTIONS,
-    create_border_mask,
-    create_neighbor_masks,
-    _pixel_angle_from_center,
-    _angle_to_direction,
+    create_masks,
 )
+
+logger = logging.getLogger("ComfyUI-AdvancedTiling")
 
 
 def _normalize_latent(latent: torch.Tensor) -> tuple[torch.Tensor, tuple[int, ...]]:
@@ -28,7 +36,6 @@ def _normalize_latent(latent: torch.Tensor) -> tuple[torch.Tensor, tuple[int, ..
     original_shape = latent.shape
     x = latent
     while x.dim() > 4:
-        # Squeeze the first singleton dim between dim-1 and dim-(ndim-2)
         squeezed = False
         for d in range(1, x.dim() - 2):
             if x.shape[d] == 1:
@@ -36,7 +43,6 @@ def _normalize_latent(latent: torch.Tensor) -> tuple[torch.Tensor, tuple[int, ..
                 squeezed = True
                 break
         if not squeezed:
-            # No singleton dims to squeeze — merge leading dims
             x = x.reshape(x.shape[0], -1, x.shape[-2], x.shape[-1])
             break
     if x.dim() == 3:
@@ -44,34 +50,40 @@ def _normalize_latent(latent: torch.Tensor) -> tuple[torch.Tensor, tuple[int, ..
     return x, original_shape
 
 
+@functools.cache
 def _build_neighbor_map(
     width: int, height: int, settings: Settings
 ) -> torch.Tensor:
     """
     Build a map from pixel position to neighbor direction index.
 
+    Uses hex_tiling directly (not settings.tiling_fn) so the hex geometry
+    is always correct regardless of the settings mode.
+
     For each pixel outside the hex (waste region), assigns a direction
     index (0-5 for E/NE/NW/W/SW/SE). Pixels inside the hex get -1.
 
-    :param width: Latent width
-    :param height: Latent height
-    :param settings: Tiling settings
     :return: LongTensor of shape (height, width) with values -1 to 5
     """
-    from .advanced_tiling import calculate_mapping
+    from .modes.hex_mask import _compute_sector_map
 
-    mapping = calculate_mapping((width, height), (width, height), settings)
-    neighbor_map = torch.full((height, width), -1, dtype=torch.long)
-
+    # Vectorized waste detection using hex_tiling directly
+    mapped_x = torch.zeros((height, width), dtype=torch.long)
+    mapped_y = torch.zeros((height, width), dtype=torch.long)
     for y in range(height):
         for x in range(width):
-            mapped_x = mapping[2][y * width + x]
-            mapped_y = mapping[3][y * width + x]
-            if mapped_x != x or mapped_y != y:
-                angle = _pixel_angle_from_center(x, y, width, height)
-                direction = _angle_to_direction(angle)
-                neighbor_map[y, x] = direction
+            nx, ny = hex_tiling(x, y, (width, height), (width, height), settings)
+            mapped_x[y, x] = nx
+            mapped_y[y, x] = ny
 
+    xs = torch.arange(width).expand(height, width)
+    ys = torch.arange(height).unsqueeze(1).expand(height, width)
+    is_waste = (mapped_x != xs) | (mapped_y != ys)
+
+    sectors = _compute_sector_map(width, height)
+
+    neighbor_map = torch.full((height, width), -1, dtype=torch.long)
+    neighbor_map[is_waste] = sectors[is_waste]
     return neighbor_map
 
 
@@ -84,31 +96,45 @@ def composite_latents(
     Composite center and neighbor latents into a single latent.
 
     Places neighbor content in the waste region around the center hex.
-    Handles both 4D (standard VAE) and 5D (video VAE) inputs.
 
     :param center_latent: Center tile latent
     :param neighbor_latents: Dict mapping direction name ("E", "NE", etc.)
                              to neighbor latent
-    :param settings: Tiling settings
+    :param settings: Tiling settings (rotation only)
     :return: Composited latent (same shape as input)
     """
+    t0 = time.time()
     result, original_shape = _normalize_latent(center_latent)
     B, C, H, W = result.shape
 
+    t1 = time.time()
     neighbor_map = _build_neighbor_map(W, H, settings)
+    t2 = time.time()
+
+    total_waste = (neighbor_map >= 0).sum().item()
+    logger.info(f"composite_latents: waste={total_waste}/{H*W}, "
+                f"shape=({B},{C},{H},{W}), "
+                f"normalize={t1-t0:.3f}s, neighbor_map={t2-t1:.3f}s")
+
     direction_to_idx = {name: idx for idx, name in enumerate(NEIGHBOR_DIRECTIONS)}
 
+    total_pasted = 0
     for direction_name, neighbor_latent in neighbor_latents.items():
         dir_idx = direction_to_idx[direction_name]
         mask = (neighbor_map == dir_idx)  # [H, W] boolean
+        count = mask.sum().item()
 
-        if not mask.any():
+        if count == 0:
+            logger.info(f"  {direction_name}: no waste pixels found")
             continue
 
         neighbor_4d, _ = _normalize_latent(neighbor_latent)
         result[:, :, mask] = neighbor_4d[:, :, mask]
+        total_pasted += count
+        logger.info(f"  {direction_name}: pasted {count} pixels")
 
-    # Restore original shape if it was >4D
+    logger.info(f"  total pasted: {total_pasted}/{total_waste} waste pixels")
+
     if len(original_shape) > 4:
         result = result.reshape(original_shape)
     return result
@@ -118,6 +144,9 @@ class AdvancedTilingHexInpaint:
     """
     Hex tile inpainting node. Composites center + neighbor latents,
     generates border masks, and patches model for natural edge transitions.
+
+    Uses hex geometry directly — does NOT apply Conv2d wrapping or depend
+    on the settings tiling mode. The settings only provide hex rotation.
     """
 
     @classmethod
@@ -162,41 +191,65 @@ class AdvancedTilingHexInpaint:
     CATEGORY = "conditioning"
 
     def run(self, settings, model, vae, center_image, inpaint_mode, border_width, **kwargs):
+        t_start = time.time()
+
         # 1. VAE-encode center image
+        t0 = time.time()
         center_latent = vae.encode(center_image)
+        t1 = time.time()
+        logger.info(f"[HexInpaint] VAE encode center: {t1-t0:.3f}s, "
+                     f"image={center_image.shape}, latent={center_latent.shape}")
 
         # 2. VAE-encode provided neighbor images
         neighbor_latents = {}
         for direction in NEIGHBOR_DIRECTIONS:
             key = f"neighbor_{direction}"
             if key in kwargs and kwargs[key] is not None:
+                t_n = time.time()
                 neighbor_latents[direction] = vae.encode(kwargs[key])
+                logger.info(f"[HexInpaint] VAE encode {direction}: "
+                             f"{time.time()-t_n:.3f}s, latent={neighbor_latents[direction].shape}")
+
+        logger.info(f"[HexInpaint] Neighbors provided: {list(neighbor_latents.keys())}")
 
         # 3. Composite latents (for Masked Denoising and Hybrid modes)
         use_latent_paste = inpaint_mode in ("Masked Denoising", "Hybrid")
 
         if use_latent_paste and neighbor_latents:
+            t2 = time.time()
             composited = composite_latents(center_latent, neighbor_latents, settings)
+            logger.info(f"[HexInpaint] Composite: {time.time()-t2:.3f}s")
         else:
             composited = center_latent
+            if use_latent_paste:
+                logger.info("[HexInpaint] No neighbor images — skipping compositing")
+            else:
+                logger.info(f"[HexInpaint] Mode '{inpaint_mode}' — skipping compositing")
 
-        # 4. Generate masks at latent resolution
-        # Normalize to 4D to extract spatial dims
+        # 4. Generate masks at latent resolution (single pass)
+        t3 = time.time()
         composited_4d, _ = _normalize_latent(composited)
         _, _, H_lat, W_lat = composited_4d.shape
         H_img, W_img = center_image.shape[1], center_image.shape[2]
 
-        border_mask = create_border_mask(W_lat, H_lat, settings, border_width)
-        neighbor_masks = create_neighbor_masks(W_lat, H_lat, settings, border_width)
+        _, border_mask_lat, neighbor_masks_lat = create_masks(
+            W_lat, H_lat, settings, border_width
+        )
+        t4 = time.time()
+        logger.info(f"[HexInpaint] Latent masks ({W_lat}x{H_lat}): {t4-t3:.3f}s, "
+                     f"border_pixels={int(border_mask_lat.sum().item())}")
 
         # 5. Build latent dict with optional noise_mask
         latent_dict = {"samples": composited}
 
         if inpaint_mode in ("Masked Denoising", "Hybrid"):
-            noise_mask = border_mask.unsqueeze(0)  # (1, 1, H_lat, W_lat)
+            noise_mask = border_mask_lat.unsqueeze(0)  # (1, 1, H_lat, W_lat)
             latent_dict["noise_mask"] = noise_mask
+            logger.info(f"[HexInpaint] noise_mask shape={noise_mask.shape}, "
+                         f"coverage={noise_mask.mean().item():.3f}")
 
-        # 6. Patch model
+        # 6. Patch model — inject K/V from waste region (neighbor content)
+        #    at boundary positions. No Conv2d wrapping.
         model_copy = model.clone()
         use_attention = inpaint_mode in ("Attention-Only", "Hybrid")
 
@@ -207,10 +260,17 @@ class AdvancedTilingHexInpaint:
             if hasattr(diff_model, 'pe_embedder'):
                 patch = HexNeighborAttentionPatch(settings, diff_model.pe_embedder)
                 model_copy.set_model_attn1_patch(patch)
+                logger.info("[HexInpaint] Neighbor attention patch applied")
+            else:
+                logger.info("[HexInpaint] No pe_embedder — attention patch skipped")
 
-        # 7. Prepare outputs
-        full_border_mask = create_border_mask(W_img, H_img, settings, border_width)
-        full_neighbor_masks = create_neighbor_masks(W_img, H_img, settings, border_width)
+        # 7. Generate masks at image resolution (for output visualization)
+        t5 = time.time()
+        _, full_border_mask, full_neighbor_masks = create_masks(
+            W_img, H_img, settings, border_width
+        )
+        t6 = time.time()
+        logger.info(f"[HexInpaint] Image masks ({W_img}x{H_img}): {t6-t5:.3f}s")
 
         outputs = [
             model_copy,
@@ -220,4 +280,5 @@ class AdvancedTilingHexInpaint:
         for i in range(len(NEIGHBOR_DIRECTIONS)):
             outputs.append(full_neighbor_masks[i])
 
+        logger.info(f"[HexInpaint] Total: {time.time()-t_start:.3f}s")
         return tuple(outputs)
