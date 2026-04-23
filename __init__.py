@@ -9,17 +9,20 @@ from .advanced_tiling import (
     AdvancedTiling,
     AdvancedTilingVAEDecode,
 )
+from .hex_inpaint import AdvancedTilingHexInpaint
 
 NODE_CLASS_MAPPINGS = {
     "AdvancedTilingSettings": AdvancedTilingSettings,
     "AdvancedTiling": AdvancedTiling,
     "AdvancedTilingVAEDecode": AdvancedTilingVAEDecode,
+    "AdvancedTilingHexInpaint": AdvancedTilingHexInpaint,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "AdvancedTilingSettings": "Advanced Tiling Settings",
     "AdvancedTiling": "Advanced Tiling",
     "AdvancedTilingVAEDecode": "Advanced Tiling VAE Decode",
+    "AdvancedTilingHexInpaint": "Advanced Tiling Hex Inpaint",
 }
 
 try:
