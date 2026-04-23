@@ -129,6 +129,14 @@ class AdvancedTilingSettings:
                     "FLOAT",
                     {"default": 0.0, "min": 0.0, "max": 360.0, "step": 0.01},
                 ),
+                "blend_amount": (
+                    "FLOAT",
+                    {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01},
+                ),
+                "blend_width": (
+                    "INT",
+                    {"default": 64, "min": 0, "max": 512, "step": 1},
+                ),
             },
         }
 
@@ -136,12 +144,12 @@ class AdvancedTilingSettings:
     RETURN_NAMES = ("SETTINGS",)
     FUNCTION = "run"
 
-    def run(self, mode, rotation):
+    def run(self, mode, rotation, blend_amount, blend_width):
         """
         Creates tiling settings from node inputs
         """
 
-        settings = Settings(mode, rotation)
+        settings = Settings(mode, rotation, blend_amount, blend_width)
 
         return (settings,)
 
