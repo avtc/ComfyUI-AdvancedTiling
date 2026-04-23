@@ -124,30 +124,50 @@ class AdvancedTilingSettings:
 
         return {
             "required": {
-                "mode": (list(modes.keys()),),
+                "mode": (list(modes.keys()), {
+                    "tooltip": "Tiling mode. 'None' disables tiling, 'Hexagon' wraps edges in a hexagonal pattern.",
+                }),
                 "rotation": (
                     "FLOAT",
-                    {"default": 0.0, "min": 0.0, "max": 360.0, "step": 0.01},
+                    {
+                        "default": 0.0, "min": 0.0, "max": 360.0, "step": 0.01,
+                        "tooltip": "Rotation angle in degrees for the hex tiling pattern.",
+                    },
                 ),
                 "blend_amount": (
                     "FLOAT",
-                    {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01},
+                    {
+                        "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01,
+                        "tooltip": "Blend strength for inner hex edges (Left, Top-Right, Bottom-Right). 0 = no blending (disabled), 1 = full replacement with hex-remapped prediction. Intermediate values mix the original and remapped outputs.",
+                    },
                 ),
                 "blend_width": (
                     "INT",
-                    {"default": 64, "min": 0, "max": 512, "step": 1},
+                    {
+                        "default": 64, "min": 0, "max": 512, "step": 1,
+                        "tooltip": "How far into the hex interior the blend zone extends (in latent pixels). Only used when blend_amount > 0.",
+                    },
                 ),
                 "latent_wrapping": (
                     "BOOLEAN",
-                    {"default": True},
+                    {
+                        "default": True,
+                        "tooltip": "Copy source content to waste positions in the latent on each denoising step. Shows wrapped content in the KSampler preview instead of noise.",
+                    },
                 ),
                 "position_fix": (
                     "BOOLEAN",
-                    {"default": True},
+                    {
+                        "default": True,
+                        "tooltip": "Set waste patches' position IDs to their source positions so RoPE encodes them at the opposite edge. Pairs well with latent_wrapping.",
+                    },
                 ),
                 "toroidal_attention": (
                     "BOOLEAN",
-                    {"default": True},
+                    {
+                        "default": True,
+                        "tooltip": "Inject wrapped K/V entries into every attention layer so boundary patches see opposite-edge content as spatially adjacent.",
+                    },
                 ),
             },
         }
