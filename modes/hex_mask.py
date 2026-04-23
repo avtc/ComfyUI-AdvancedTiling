@@ -66,15 +66,18 @@ def _angle_to_direction(angle: float) -> int:
     """
     Map angle [0, 2*pi) to neighbor direction index 0-5.
 
-    Pointy-top hex neighbor angles (clockwise from East):
-      E  = 0°     (index 0)
-      NE = 60°    (index 1)
-      NW = 120°   (index 2)
-      W  = 180°   (index 3)
-      SW = 240°   (index 4)
-      SE = 300°   (index 5)
+    For pointy-top hex, sectors are centered on edge midpoints (0°, 60°, ...)
+    with boundaries at vertices (30°, 90°, 150°, ...). The 30° offset aligns
+    sector boundaries with hex vertices.
+
+      E  = 0°     (index 0, sector 330°-30°)
+      NE = 60°    (index 1, sector 30°-90°)
+      NW = 120°   (index 2, sector 90°-150°)
+      W  = 180°   (index 3, sector 150°-210°)
+      SW = 240°   (index 4, sector 210°-270°)
+      SE = 300°   (index 5, sector 270°-330°)
     """
-    sector = int(angle / (math.pi / 3)) % 6
+    sector = int((angle + math.pi / 6) / (math.pi / 3)) % 6
     return sector
 
 
