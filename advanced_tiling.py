@@ -137,6 +137,18 @@ class AdvancedTilingSettings:
                     "INT",
                     {"default": 64, "min": 0, "max": 512, "step": 1},
                 ),
+                "latent_wrapping": (
+                    "BOOLEAN",
+                    {"default": True},
+                ),
+                "position_fix": (
+                    "BOOLEAN",
+                    {"default": True},
+                ),
+                "toroidal_attention": (
+                    "BOOLEAN",
+                    {"default": True},
+                ),
             },
         }
 
@@ -144,12 +156,14 @@ class AdvancedTilingSettings:
     RETURN_NAMES = ("SETTINGS",)
     FUNCTION = "run"
 
-    def run(self, mode, rotation, blend_amount, blend_width):
+    def run(self, mode, rotation, blend_amount, blend_width,
+            latent_wrapping, position_fix, toroidal_attention):
         """
         Creates tiling settings from node inputs
         """
 
-        settings = Settings(mode, rotation, blend_amount, blend_width)
+        settings = Settings(mode, rotation, blend_amount, blend_width,
+                            latent_wrapping, position_fix, toroidal_attention)
 
         return (settings,)
 
