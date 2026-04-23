@@ -18,16 +18,17 @@ class Settings:
         self.rotation = rotation
 
     def __hash__(self):
-        # We don't care about the tiling function, because it's determined by the mode
         return hash((self.mode, self.rotation))
 
 
 from .hex import hex_tiling
 from .none import none_tiling
+from .rect import rect_tiling
 
 modes = {
     "None": none_tiling,
     "Hexagon": hex_tiling,
+    "Rectangular": rect_tiling,
 }
 
 

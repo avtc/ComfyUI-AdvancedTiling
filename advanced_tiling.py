@@ -12,6 +12,7 @@ from torch.nn import Conv2d
 from torch.nn import functional as F
 from torch.nn.modules.utils import _pair
 from .modes import modes, Settings
+from .dit_tiling import patch_dit_model, _has_conv2d
 
 
 @functools.cache
@@ -123,10 +124,15 @@ class AdvancedTilingSettings:
 
         return {
             "required": {
-                "mode": (list(modes.keys()),),
+                "mode": (list(modes.keys()), {
+                    "tooltip": "Tiling mode. 'None' disables tiling, 'Hexagon' wraps edges in a hexagonal pattern, 'Rectangular' wraps right→left and bottom→top.",
+                }),
                 "rotation": (
                     "FLOAT",
-                    {"default": 0.0, "min": 0.0, "max": 360.0, "step": 0.01},
+                    {
+                        "default": 0.0, "min": 0.0, "max": 360.0, "step": 0.01,
+                        "tooltip": "Rotation angle in degrees for the tiling pattern.",
+                    },
                 ),
             },
         }
@@ -147,7 +153,7 @@ class AdvancedTilingSettings:
 
 class AdvancedTiling:
     """
-    Patches Conv2D layers in a model to perform tiling
+    Patches model to perform tiling - supports both UNet (Conv2d) and DiT models
     """
 
     # pylint: disable=invalid-name
@@ -174,8 +180,12 @@ class AdvancedTiling:
         Does the actual patching of the model
         """
 
-        model_copy = copy.deepcopy(model)
-        patch_model(model_copy.model, settings)
+        model_copy = model.clone()
+
+        if _has_conv2d(model_copy.model.diffusion_model):
+            patch_model(model_copy.model, settings)
+        else:
+            patch_dit_model(model_copy, settings)
 
         return (model_copy,)
 
@@ -223,9 +233,14 @@ class AdvancedTilingVAEDecode:
         patch_model(vae_copy.first_stage_model, settings)
         # Decode latents to image
         image = vae_copy.decode(samples["samples"])
+
+        # WanVAE returns 5D (B, T, H, W, C), standard VAE returns 4D (B, H, W, C)
+        if image.ndim == 5:
+            image = image.squeeze(1)
+
         if crop:
             # Crop image based on tiling settings
             mask = create_crop_mask(image.shape[2], image.shape[1], settings)
-            image = torch.cat((image, mask), dim=3)
+            image = torch.cat((image, mask.to(device=image.device)), dim=3)
 
         return (image,)
