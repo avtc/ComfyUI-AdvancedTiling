@@ -178,6 +178,13 @@ class AdvancedTilingHexInpaint:
                         "tooltip": "Feather radius as fraction of border width. Softens inner and inactive-side edges for smoother transitions. 0 = sharp edges.",
                     },
                 ),
+                "feather_sides": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "When enabled, also feathers the side edges of each mask where no active neighbor is present. Disable to feather only the inner edge (toward hex center).",
+                    },
+                ),
                 "skip_same_neighbors": (
                     "BOOLEAN",
                     {
@@ -201,7 +208,7 @@ class AdvancedTilingHexInpaint:
     FUNCTION = "run"
     CATEGORY = "conditioning"
 
-    def run(self, settings, vae, center_image, inpaint_mode, border_width, feather_radius, skip_same_neighbors, **kwargs):
+    def run(self, settings, vae, center_image, inpaint_mode, border_width, feather_radius, feather_sides, skip_same_neighbors, **kwargs):
         t_start = time.time()
 
         # 1. VAE-encode center image
@@ -259,7 +266,7 @@ class AdvancedTilingHexInpaint:
         feather_lat = max(0, round(feather_radius * erosion_lat))
 
         _, border_mask_lat, neighbor_masks_lat = create_feathered_masks(
-            W_lat, H_lat, settings, border_width, feather_lat, active_directions
+            W_lat, H_lat, settings, border_width, feather_lat, feather_sides, active_directions
         )
         t4 = time.time()
         logger.info(f"[HexInpaint] Latent masks ({W_lat}x{H_lat}): {t4-t3:.3f}s, "
@@ -278,7 +285,7 @@ class AdvancedTilingHexInpaint:
         feather_img = max(0, round(feather_radius * erosion_img))
 
         _, full_border_mask, full_neighbor_masks = create_feathered_masks(
-            W_img, H_img, settings, border_width, feather_img, active_directions
+            W_img, H_img, settings, border_width, feather_img, feather_sides, active_directions
         )
         t6 = time.time()
         logger.info(f"[HexInpaint] Image masks ({W_img}x{H_img}): {t6-t5:.3f}s")

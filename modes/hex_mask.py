@@ -230,6 +230,7 @@ def create_feathered_masks(
     settings: Settings,
     border_width: float = 0.2,
     feather_pixels: int = 0,
+    feather_sides: bool = True,
     active_directions: set[int] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
@@ -238,12 +239,15 @@ def create_feathered_masks(
     When *feather_pixels* > 0, applies a soft linear falloff on:
 
     - **Inner edges** (toward hex center): always feathered.
-    - **Side edges**: feathered only when the adjacent sector is *inactive*.
+    - **Side edges**: feathered only when *feather_sides* is True AND the
+      adjacent sector is *inactive*.
     - **Outer edges** (hex boundary): always sharp (value 1).
 
     Inactive directions produce all-zero masks.
 
     :param feather_pixels: Feather radius in pixels (0 = binary masks).
+    :param feather_sides: If False, only inner edges are feathered;
+                          side edges stay sharp regardless of neighbours.
     :param active_directions: Direction indices (0-5) that have a neighbour.
                               ``None`` means all active.
     :return: (inside_mask (H,W) bool, border_mask (1,H,W) float,
@@ -272,18 +276,19 @@ def create_feathered_masks(
             np.clip(dist_to_inner / feather_pixels, 0.0, 1.0),
         )
 
-        # Angular position within each sector (for side feathering)
-        ys, xs = torch.meshgrid(
-            torch.arange(height, dtype=torch.float32),
-            torch.arange(width, dtype=torch.float32),
-            indexing='ij',
-        )
-        dx = xs - width / 2.0
-        dy = -(ys - height / 2.0)  # math coords
-        radius = torch.sqrt(dx * dx + dy * dy)
-        offset_angles = (
-            torch.atan2(dy, dx) % (2 * math.pi) + math.pi / 6
-        ) % (2 * math.pi)
+        # Pre-compute angular data only when side feathering is enabled
+        if feather_sides:
+            ys, xs = torch.meshgrid(
+                torch.arange(height, dtype=torch.float32),
+                torch.arange(width, dtype=torch.float32),
+                indexing='ij',
+            )
+            dx = xs - width / 2.0
+            dy = -(ys - height / 2.0)  # math coords
+            radius = torch.sqrt(dx * dx + dy * dy)
+            offset_angles = (
+                torch.atan2(dy, dx) % (2 * math.pi) + math.pi / 6
+            ) % (2 * math.pi)
 
         for d in active_directions:
             sector_mask = border & (sectors == d)
@@ -292,15 +297,16 @@ def create_feathered_masks(
 
             feather = inner_weight
 
-            # Left boundary — shared with sector (d-1) % 6
-            if (d - 1) % 6 not in active_directions:
-                ang = offset_angles - d * (math.pi / 3)
-                feather = feather * (ang * radius / feather_pixels).clamp(0, 1)
+            if feather_sides:
+                # Left boundary — shared with sector (d-1) % 6
+                if (d - 1) % 6 not in active_directions:
+                    ang = offset_angles - d * (math.pi / 3)
+                    feather = feather * (ang * radius / feather_pixels).clamp(0, 1)
 
-            # Right boundary — shared with sector (d+1) % 6
-            if (d + 1) % 6 not in active_directions:
-                ang = (d + 1) * (math.pi / 3) - offset_angles
-                feather = feather * (ang * radius / feather_pixels).clamp(0, 1)
+                # Right boundary — shared with sector (d+1) % 6
+                if (d + 1) % 6 not in active_directions:
+                    ang = (d + 1) * (math.pi / 3) - offset_angles
+                    feather = feather * (ang * radius / feather_pixels).clamp(0, 1)
 
             neighbor_masks[d] = feather * sector_mask.float()
 
