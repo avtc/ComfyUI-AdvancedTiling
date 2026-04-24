@@ -382,14 +382,17 @@ class LuminaAttentionWrapper:
         xk = self.attn.k_norm(xk)
 
         # --- Apply RoPE to full sequence ---
+        xk_pre = xk  # Save pre-RoPE K for boundary extraction
         xq, xk = apply_rope(xq, xk, freqs_cis)
 
-        # --- Extract boundary source K/V ---
-        src_global = self._source_idx.to(xk.device) + cap_size_0
-        extra_k = xk[:, src_global, :, :]
+        # --- Extract boundary source K/V from PRE-RoPE K ---
+        src_global = self._source_idx.to(xk_pre.device) + cap_size_0
+        extra_k = xk_pre[:, src_global, :, :]
         extra_v = xv[:, src_global, :, :]
 
         # --- Synthetic freqs_cis via RoPE shift composition ---
+        # syn_freqs = R(source) @ R(shift) = R(source + shift)
+        # Applied to pre-RoPE extra_k, giving R(source + shift) @ x_original
         source_global = self._source_idx.to(freqs_cis.device) + cap_size_0
         source_freqs = freqs_cis[:, source_global, :, :, :, :]
 
@@ -405,7 +408,7 @@ class LuminaAttentionWrapper:
         syn_ax2 = torch.matmul(src_ax2, shift_w)
         syn_freqs = torch.cat([src_ax0, syn_ax1, syn_ax2], dim=3)
 
-        # --- Apply RoPE to extra K with synthetic positions ---
+        # --- Apply full synthetic RoPE to pre-RoPE extra K ---
         extra_k = apply_rope1(extra_k, syn_freqs)
 
         # --- Concatenate extra K/V ---
