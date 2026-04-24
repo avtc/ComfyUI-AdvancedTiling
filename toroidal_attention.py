@@ -267,84 +267,209 @@ class RectToroidalAttentionPatch(_BaseToroidalAttentionPatch):
         return _compute_rect_boundary_pairs(h_patches, w_patches)
 
 
-class LuminaToroidalPatch:
-    """double_block patch for Lumina/NextDiT models (e.g. Z-Image).
+# ---------------------------------------------------------------------------
+# Lumina / NextDiT toroidal attention
+# ---------------------------------------------------------------------------
 
-    After each transformer block:
-    1. Replaces waste-position tokens (outside the hex) with their mapped
-       source content, preventing them from polluting boundary attention in
-       subsequent layers.
-    2. Blends boundary tokens with opposite-edge content to approximate
-       toroidal attention.
+class LuminaAttentionWrapper:
+    """Wraps JointAttention.forward() to inject boundary K/V with synthetic RoPE.
 
-    Unlike Flux-style attn1_patch injection, this operates at the block level
-    because Lumina applies RoPE inside JointAttention.forward() where no hook
-    exists.
+    Lumina applies RoPE inside JointAttention.forward(), so there is no
+    external attn1_patch hook.  This wrapper intercepts the forward call,
+    runs QKV + RoPE normally, then injects extra K/V entries for boundary
+    patches with position-correct synthetic freqs_cis computed via RoPE
+    shift composition:  R(virtual) = R(source) @ R(shift).
+
+    Activated only when ``transformer_options["tiling_img_shape"]`` is set
+    (by the model wrapper), so the monkey-patch is a no-op for unrelated
+    model uses.
     """
 
-    def __init__(self, patch_size: int, settings: Settings = None):
+    def __init__(self, attn_module, rope_embedder, patch_size, pad_tokens_multiple, settings=None):
+        self.attn = attn_module
+        self.rope_embedder = rope_embedder
+        self.axes_dim = rope_embedder.axes_dim
+        self.theta = rope_embedder.theta
+        self.patch_size = patch_size
+        self.pad_tokens_multiple = pad_tokens_multiple
+        self.settings = settings
+
+        self._initialized = False
+        self._source_idx = None
+        self._n_extra = 0
+        self._shift_rope_h = None
+        self._shift_rope_w = None
+        self._axis_splits = (self.axes_dim[0] // 2, self.axes_dim[1] // 2)
+
+        self._original_forward = attn_module.forward
+        attn_module.forward = self._wrapped_forward
+
+    def _initialize(self, h_patches, w_patches):
+        from comfy.ldm.flux.math import rope as rope_fn
+
+        if self.settings is not None and self.settings.mode == "Hexagon":
+            b_idx, source_idx, off_h, off_w = _compute_hex_boundary_pairs(
+                h_patches, w_patches, self.settings,
+            )
+        else:
+            b_idx, source_idx, off_h, off_w = _compute_rect_boundary_pairs(
+                h_patches, w_patches,
+            )
+
+        self._source_idx = source_idx
+        self._n_extra = len(source_idx)
+
+        if self._n_extra > 0:
+            boundary_h = b_idx // w_patches
+            boundary_w = b_idx % w_patches
+            source_h = source_idx // w_patches
+            source_w = source_idx % w_patches
+
+            shift_h = (boundary_h.float() + off_h.float() - source_h.float()).unsqueeze(0)
+            shift_w = (boundary_w.float() + off_w.float() - source_w.float()).unsqueeze(0)
+
+            shift_rope_h = rope_fn(shift_h, self.axes_dim[1], self.theta)
+            shift_rope_w = rope_fn(shift_w, self.axes_dim[2], self.theta)
+
+            # Shape: (1, n_extra, 1, axis_dim//2, 2, 2) — add singleton for
+            # broadcasting with the (batch, n_extra, 1, ...) source freqs.
+            self._shift_rope_h = shift_rope_h.unsqueeze(2)
+            self._shift_rope_w = shift_rope_w.unsqueeze(2)
+
+        self._initialized = True
+
+    def _wrapped_forward(self, x, x_mask, freqs_cis, transformer_options={}):
+        img_shape = transformer_options.get("tiling_img_shape")
+        if img_shape is None or x_mask is not None:
+            return self._original_forward(x, x_mask, freqs_cis, transformer_options)
+
+        H, W = img_shape
+        h_patches = H // self.patch_size
+        w_patches = W // self.patch_size
+
+        if not self._initialized:
+            self._initialize(h_patches, w_patches)
+
+        if self._n_extra == 0:
+            return self._original_forward(x, x_mask, freqs_cis, transformer_options)
+
+        from comfy.ldm.flux.math import apply_rope, apply_rope1
+        from comfy.ldm.modules.attention import optimized_attention_masked
+
+        # Image token offset in the full (text+image) sequence
+        n_img = h_patches * w_patches
+        if self.pad_tokens_multiple is not None:
+            n_img_padded = -(-n_img // self.pad_tokens_multiple) * self.pad_tokens_multiple
+        else:
+            n_img_padded = n_img
+        cap_size_0 = freqs_cis.shape[1] - n_img_padded
+
+        # --- QKV projection + QK norm (same as original) ---
+        bsz, seqlen, _ = x.shape
+        xq, xk, xv = torch.split(
+            self.attn.qkv(x),
+            [
+                self.attn.n_local_heads * self.attn.head_dim,
+                self.attn.n_local_kv_heads * self.attn.head_dim,
+                self.attn.n_local_kv_heads * self.attn.head_dim,
+            ],
+            dim=-1,
+        )
+        xq = xq.view(bsz, seqlen, self.attn.n_local_heads, self.attn.head_dim)
+        xk = xk.view(bsz, seqlen, self.attn.n_local_kv_heads, self.attn.head_dim)
+        xv = xv.view(bsz, seqlen, self.attn.n_local_kv_heads, self.attn.head_dim)
+        xq = self.attn.q_norm(xq)
+        xk = self.attn.k_norm(xk)
+
+        # --- Apply RoPE to full sequence ---
+        xq, xk = apply_rope(xq, xk, freqs_cis)
+
+        # --- Extract boundary source K/V ---
+        src_global = self._source_idx.to(xk.device) + cap_size_0
+        extra_k = xk[:, src_global, :, :]
+        extra_v = xv[:, src_global, :, :]
+
+        # --- Synthetic freqs_cis via RoPE shift composition ---
+        source_global = self._source_idx.to(freqs_cis.device) + cap_size_0
+        source_freqs = freqs_cis[:, source_global, :, :, :, :]
+
+        a0, a1 = self._axis_splits
+        src_ax0 = source_freqs[:, :, :, :a0, :, :]
+        src_ax1 = source_freqs[:, :, :, a0:a0 + a1, :, :]
+        src_ax2 = source_freqs[:, :, :, a0 + a1:, :, :]
+
+        shift_h = self._shift_rope_h.to(device=src_ax1.device, dtype=src_ax1.dtype)
+        shift_w = self._shift_rope_w.to(device=src_ax2.device, dtype=src_ax2.dtype)
+
+        syn_ax1 = torch.matmul(src_ax1, shift_h)
+        syn_ax2 = torch.matmul(src_ax2, shift_w)
+        syn_freqs = torch.cat([src_ax0, syn_ax1, syn_ax2], dim=3)
+
+        # --- Apply RoPE to extra K with synthetic positions ---
+        extra_k = apply_rope1(extra_k, syn_freqs)
+
+        # --- Concatenate extra K/V ---
+        xk = torch.cat([xk, extra_k], dim=1)
+        xv = torch.cat([xv, extra_v], dim=1)
+
+        # --- GQA expansion + attention (same as original) ---
+        n_rep = self.attn.n_local_heads // self.attn.n_local_kv_heads
+        if n_rep >= 1:
+            xk = xk.unsqueeze(3).repeat(1, 1, 1, n_rep, 1).flatten(2, 3)
+            xv = xv.unsqueeze(3).repeat(1, 1, 1, n_rep, 1).flatten(2, 3)
+
+        output = optimized_attention_masked(
+            xq.movedim(1, 2), xk.movedim(1, 2), xv.movedim(1, 2),
+            self.attn.n_local_heads, x_mask, skip_reshape=True,
+            transformer_options=transformer_options,
+        )
+        return self.attn.out(output)
+
+
+class LuminaWastePatch:
+    """double_block patch that replaces hex waste-position tokens with their
+    mapped source content after each transformer block, preventing them from
+    polluting boundary attention in subsequent layers."""
+
+    def __init__(self, patch_size: int, settings: Settings):
         self.patch_size = patch_size
         self.settings = settings
         self._initialized = False
-        self._boundary_idx: torch.Tensor | None = None
-        self._source_idx: torch.Tensor | None = None
-        self._n_extra = 0
-        self._waste_idx: torch.Tensor | None = None
-        self._waste_source_idx: torch.Tensor | None = None
+        self._waste_idx = None
+        self._waste_source_idx = None
 
     def _initialize(self, x: torch.Tensor):
         _, _, H, W = x.shape
         h_patches = H // self.patch_size
         w_patches = W // self.patch_size
 
-        is_hex = self.settings is not None and self.settings.mode == "Hexagon"
+        waste_indices = []
+        waste_source_indices = []
+        for h in range(h_patches):
+            for w in range(w_patches):
+                src_w, src_h = hex_tiling(
+                    w, h,
+                    (w_patches, h_patches),
+                    (w_patches, h_patches),
+                    self.settings,
+                )
+                if src_w != w or src_h != h:
+                    waste_indices.append(h * w_patches + w)
+                    waste_source_indices.append(src_h * w_patches + src_w)
 
-        if is_hex:
-            boundary_idx, source_idx, _, _ = _compute_hex_boundary_pairs(
-                h_patches, w_patches, self.settings,
-            )
+        if waste_indices:
+            self._waste_idx = torch.tensor(waste_indices, dtype=torch.long)
+            self._waste_source_idx = torch.tensor(waste_source_indices, dtype=torch.long)
 
-            waste_indices = []
-            waste_source_indices = []
-            for h in range(h_patches):
-                for w in range(w_patches):
-                    src_w, src_h = hex_tiling(
-                        w, h,
-                        (w_patches, h_patches),
-                        (w_patches, h_patches),
-                        self.settings,
-                    )
-                    if src_w != w or src_h != h:
-                        waste_indices.append(h * w_patches + w)
-                        waste_source_indices.append(src_h * w_patches + src_w)
-
-            if waste_indices:
-                self._waste_idx = torch.tensor(waste_indices, dtype=torch.long)
-                self._waste_source_idx = torch.tensor(waste_source_indices, dtype=torch.long)
-        else:
-            boundary_idx, source_idx, _, _ = _compute_rect_boundary_pairs(
-                h_patches, w_patches,
-            )
-
-        self._boundary_idx = boundary_idx
-        self._source_idx = source_idx
-        self._n_extra = len(boundary_idx)
         self._initialized = True
 
     def __call__(self, data: dict) -> dict:
         if not self._initialized:
             self._initialize(data["x"])
 
+        if self._waste_idx is None:
+            return {}
+
         img = data["img"]
-
-        # Replace waste tokens with their hex-mapped source content so
-        # subsequent layers don't see noise at waste positions.
-        if self._waste_idx is not None and len(self._waste_idx) > 0:
-            img[:, self._waste_idx, :] = img[:, self._waste_source_idx, :]
-
-        if self._n_extra > 0:
-            alpha = 0.2
-            blended = (1 - alpha) * img[:, self._boundary_idx, :] + alpha * img[:, self._source_idx, :]
-            img[:, self._boundary_idx, :] = blended
-
+        img[:, self._waste_idx, :] = img[:, self._waste_source_idx, :]
         return {"img": img}
