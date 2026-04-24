@@ -16,7 +16,7 @@ import torch
 from .modes import Settings
 from .modes.hex_mask import (
     NEIGHBOR_DIRECTIONS,
-    create_masks,
+    create_feathered_masks,
 )
 
 logger = logging.getLogger("ComfyUI-AdvancedTiling")
@@ -168,6 +168,16 @@ class AdvancedTilingHexInpaint:
                         "tooltip": "Width of the inpainting border as fraction of hex radius.",
                     },
                 ),
+                "feather_radius": (
+                    "FLOAT",
+                    {
+                        "default": 0.0,
+                        "min": 0.0,
+                        "max": 1.0,
+                        "step": 0.01,
+                        "tooltip": "Feather radius as fraction of border width. Softens inner and inactive-side edges for smoother transitions. 0 = sharp edges.",
+                    },
+                ),
                 "skip_same_neighbors": (
                     "BOOLEAN",
                     {
@@ -191,7 +201,7 @@ class AdvancedTilingHexInpaint:
     FUNCTION = "run"
     CATEGORY = "conditioning"
 
-    def run(self, settings, vae, center_image, inpaint_mode, border_width, skip_same_neighbors, **kwargs):
+    def run(self, settings, vae, center_image, inpaint_mode, border_width, feather_radius, skip_same_neighbors, **kwargs):
         t_start = time.time()
 
         # 1. VAE-encode center image
@@ -222,51 +232,54 @@ class AdvancedTilingHexInpaint:
             composited = center_latent
             logger.info("[HexInpaint] No neighbor images — skipping compositing")
 
-        # 4. Generate masks at latent resolution (single pass)
+        # 4. Determine active directions (have non-matching neighbor)
+        active_directions = set()
+        for i, direction in enumerate(NEIGHBOR_DIRECTIONS):
+            key = f"neighbor_{direction}"
+            if key in kwargs and kwargs[key] is not None:
+                if skip_same_neighbors and torch.allclose(center_image, kwargs[key], atol=1e-6):
+                    logger.info(f"[HexInpaint] Auto-skip {direction}: matches center")
+                else:
+                    active_directions.add(i)
+
+        if active_directions:
+            logger.info(f"[HexInpaint] Active: "
+                         f"{[NEIGHBOR_DIRECTIONS[i] for i in sorted(active_directions)]}")
+        else:
+            logger.info("[HexInpaint] No active directions")
+
+        # 5. Generate masks at latent resolution with feathering
         t3 = time.time()
         composited_4d, _ = _normalize_latent(composited)
         _, _, H_lat, W_lat = composited_4d.shape
         H_img, W_img = center_image.shape[1], center_image.shape[2]
 
-        _, border_mask_lat, neighbor_masks_lat = create_masks(
-            W_lat, H_lat, settings, border_width
+        hex_radius_lat = min(W_lat, H_lat) // 2
+        erosion_lat = max(1, int(border_width * hex_radius_lat))
+        feather_lat = max(0, round(feather_radius * erosion_lat))
+
+        _, border_mask_lat, neighbor_masks_lat = create_feathered_masks(
+            W_lat, H_lat, settings, border_width, feather_lat, active_directions
         )
         t4 = time.time()
         logger.info(f"[HexInpaint] Latent masks ({W_lat}x{H_lat}): {t4-t3:.3f}s, "
-                     f"border_pixels={int(border_mask_lat.sum().item())}")
+                     f"border={int(border_mask_lat.sum().item())}, feather={feather_lat}px")
 
-        # 4.5 Auto-skip matching neighbors
-        matching_indices = set()
-        if skip_same_neighbors:
-            for i, direction in enumerate(NEIGHBOR_DIRECTIONS):
-                key = f"neighbor_{direction}"
-                if key in kwargs and kwargs[key] is not None:
-                    if torch.allclose(center_image, kwargs[key], atol=1e-6):
-                        matching_indices.add(i)
-                        neighbor_masks_lat[i].zero_()
-                        logger.info(f"[HexInpaint] Auto-skip {direction}: matches center")
-
-            if matching_indices:
-                border_mask_lat = neighbor_masks_lat.sum(dim=0, keepdim=True).clamp(0, 1)
-                logger.info(f"[HexInpaint] Skipped {len(matching_indices)} matching neighbors")
-
-        # 5. Build latent dict with noise_mask
+        # 6. Build latent dict with noise_mask
         noise_mask = border_mask_lat.unsqueeze(0)  # (1, 1, H_lat, W_lat)
         latent_dict = {"samples": composited, "noise_mask": noise_mask}
         logger.info(f"[HexInpaint] noise_mask shape={noise_mask.shape}, "
                      f"coverage={noise_mask.mean().item():.3f}")
 
-        # 6. Generate masks at image resolution (for output visualization)
+        # 7. Generate masks at image resolution (for output visualization)
         t5 = time.time()
-        _, full_border_mask, full_neighbor_masks = create_masks(
-            W_img, H_img, settings, border_width
+        hex_radius_img = min(W_img, H_img) // 2
+        erosion_img = max(1, int(border_width * hex_radius_img))
+        feather_img = max(0, round(feather_radius * erosion_img))
+
+        _, full_border_mask, full_neighbor_masks = create_feathered_masks(
+            W_img, H_img, settings, border_width, feather_img, active_directions
         )
-
-        if matching_indices:
-            for idx in matching_indices:
-                full_neighbor_masks[idx].zero_()
-            full_border_mask = full_neighbor_masks.sum(dim=0, keepdim=True).clamp(0, 1)
-
         t6 = time.time()
         logger.info(f"[HexInpaint] Image masks ({W_img}x{H_img}): {t6-t5:.3f}s")
 

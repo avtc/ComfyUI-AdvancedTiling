@@ -63,21 +63,16 @@ def _square_erode(mask: torch.Tensor, pixels: int) -> torch.Tensor:
     return v_eroded.squeeze(1).t().contiguous() > 0.5
 
 
-def _diamond_erode(mask: torch.Tensor, pixels: int) -> torch.Tensor:
+def _manhattan_distance_to_region(region: torch.Tensor) -> np.ndarray:
     """
-    Diagonal (diamond SE) morphological erosion via Manhattan distance transform.
+    Manhattan distance from each pixel to the nearest True pixel in *region*.
 
-    Computes L1 distance from each pixel to the nearest boundary using two
-    forward/backward raster scans. O(H*W) total.
+    Two-pass raster scan. O(H*W).
 
-    :param mask: Bool tensor of shape (H, W)
-    :param pixels: Erosion half-width (Manhattan distance threshold)
-    :return: Eroded bool tensor
+    :param region: Bool tensor of shape (H, W)
+    :return: Float64 array of shape (H, W), 0 inside *region*
     """
-    if pixels <= 0:
-        return mask.clone()
-
-    dist = np.where(mask.numpy(), np.float64(np.inf), 0.0)
+    dist = np.where(region.numpy(), np.float64(0), np.float64(np.inf))
     H, W = dist.shape
 
     for i in range(1, H):
@@ -89,6 +84,21 @@ def _diamond_erode(mask: torch.Tensor, pixels: int) -> torch.Tensor:
     for j in range(W - 2, -1, -1):
         dist[:, j] = np.minimum(dist[:, j], dist[:, j + 1] + 1)
 
+    return dist
+
+
+def _diamond_erode(mask: torch.Tensor, pixels: int) -> torch.Tensor:
+    """
+    Diagonal (diamond SE) morphological erosion via Manhattan distance transform.
+
+    :param mask: Bool tensor of shape (H, W)
+    :param pixels: Erosion half-width (Manhattan distance threshold)
+    :return: Eroded bool tensor
+    """
+    if pixels <= 0:
+        return mask.clone()
+
+    dist = _manhattan_distance_to_region(~mask)
     return torch.from_numpy(dist >= pixels)
 
 
@@ -211,4 +221,88 @@ def create_masks(
     for d in range(6):
         neighbor_masks[d] = (border & (sectors == d)).float()
 
+    return inside, border_mask, neighbor_masks
+
+
+def create_feathered_masks(
+    width: int,
+    height: int,
+    settings: Settings,
+    border_width: float = 0.2,
+    feather_pixels: int = 0,
+    active_directions: set[int] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Compute inside, border, and neighbor masks with directional feathering.
+
+    When *feather_pixels* > 0, applies a soft linear falloff on:
+
+    - **Inner edges** (toward hex center): always feathered.
+    - **Side edges**: feathered only when the adjacent sector is *inactive*.
+    - **Outer edges** (hex boundary): always sharp (value 1).
+
+    Inactive directions produce all-zero masks.
+
+    :param feather_pixels: Feather radius in pixels (0 = binary masks).
+    :param active_directions: Direction indices (0-5) that have a neighbour.
+                              ``None`` means all active.
+    :return: (inside_mask (H,W) bool, border_mask (1,H,W) float,
+              neighbor_masks (6,H,W) float)
+    """
+    inside = _build_inside_mask(width, height, settings)
+    hex_radius = min(width, height) // 2
+    erosion_pixels = max(1, int(border_width * hex_radius))
+    eroded = _erode_mask(inside, erosion_pixels)
+    border = inside & ~eroded
+    sectors = _compute_sector_map(width, height)
+
+    if active_directions is None:
+        active_directions = set(range(6))
+
+    # Binary masks for active directions only
+    neighbor_masks = torch.zeros((6, height, width), dtype=torch.float32)
+    for d in active_directions:
+        neighbor_masks[d] = (border & (sectors == d)).float()
+
+    # Directional feathering
+    if feather_pixels > 0 and active_directions:
+        # Distance from each pixel to the inner (eroded) boundary
+        dist_to_inner = _manhattan_distance_to_region(eroded)
+        inner_weight = torch.from_numpy(
+            np.clip(dist_to_inner / feather_pixels, 0.0, 1.0),
+        )
+
+        # Angular position within each sector (for side feathering)
+        ys, xs = torch.meshgrid(
+            torch.arange(height, dtype=torch.float32),
+            torch.arange(width, dtype=torch.float32),
+            indexing='ij',
+        )
+        dx = xs - width / 2.0
+        dy = -(ys - height / 2.0)  # math coords
+        radius = torch.sqrt(dx * dx + dy * dy)
+        offset_angles = (
+            torch.atan2(dy, dx) % (2 * math.pi) + math.pi / 6
+        ) % (2 * math.pi)
+
+        for d in active_directions:
+            sector_mask = border & (sectors == d)
+            if not sector_mask.any():
+                continue
+
+            feather = inner_weight
+
+            # Left boundary — shared with sector (d-1) % 6
+            if (d - 1) % 6 not in active_directions:
+                ang = offset_angles - d * (math.pi / 3)
+                feather = feather * (ang * radius / feather_pixels).clamp(0, 1)
+
+            # Right boundary — shared with sector (d+1) % 6
+            if (d + 1) % 6 not in active_directions:
+                ang = (d + 1) * (math.pi / 3) - offset_angles
+                feather = feather * (ang * radius / feather_pixels).clamp(0, 1)
+
+            neighbor_masks[d] = feather * sector_mask.float()
+
+    border_mask = neighbor_masks.sum(dim=0, keepdim=True).clamp(0, 1)
     return inside, border_mask, neighbor_masks
