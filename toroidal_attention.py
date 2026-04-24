@@ -199,7 +199,8 @@ class _BaseToroidalAttentionPatch:
         h_center = h_patches // 2
         w_center = w_patches // 2
 
-        syn_ids = torch.zeros(1, self._n_extra, 3, dtype=torch.float32)
+        n_axes = len(self.pe_embedder.axes_dim)
+        syn_ids = torch.zeros(1, self._n_extra, n_axes, dtype=torch.float32)
         syn_ids[0, :, 0] = 0
         syn_ids[0, :, 1] = (boundary_h + off_h).float() - h_center
         syn_ids[0, :, 2] = (boundary_w + off_w).float() - w_center
@@ -234,9 +235,11 @@ class _BaseToroidalAttentionPatch:
         new_v = torch.cat([v, extra_v], dim=2)
 
         synthetic_pe = self._synthetic_pe.to(device=pe.device, dtype=pe.dtype)
+        expand_shape = list(pe.shape)
+        expand_shape[2] = synthetic_pe.shape[2]
         new_pe = torch.cat([
             pe,
-            synthetic_pe.expand(pe.shape[0], -1, -1, -1, -1, -1),
+            synthetic_pe.expand(expand_shape),
         ], dim=2)
 
         return {
