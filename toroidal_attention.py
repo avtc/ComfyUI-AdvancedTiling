@@ -270,10 +270,16 @@ class RectToroidalAttentionPatch(_BaseToroidalAttentionPatch):
 class LuminaToroidalPatch:
     """double_block patch for Lumina/NextDiT models (e.g. Z-Image).
 
-    Blends boundary image tokens with opposite-edge content after each
-    transformer block, approximating toroidal attention.  Unlike Flux-style
-    attn1_patch injection, this operates at the block level because
-    Lumina applies RoPE inside JointAttention.forward() where no hook exists.
+    After each transformer block:
+    1. Replaces waste-position tokens (outside the hex) with their mapped
+       source content, preventing them from polluting boundary attention in
+       subsequent layers.
+    2. Blends boundary tokens with opposite-edge content to approximate
+       toroidal attention.
+
+    Unlike Flux-style attn1_patch injection, this operates at the block level
+    because Lumina applies RoPE inside JointAttention.forward() where no hook
+    exists.
     """
 
     def __init__(self, patch_size: int, settings: Settings = None):
@@ -283,16 +289,38 @@ class LuminaToroidalPatch:
         self._boundary_idx: torch.Tensor | None = None
         self._source_idx: torch.Tensor | None = None
         self._n_extra = 0
+        self._waste_idx: torch.Tensor | None = None
+        self._waste_source_idx: torch.Tensor | None = None
 
     def _initialize(self, x: torch.Tensor):
         _, _, H, W = x.shape
         h_patches = H // self.patch_size
         w_patches = W // self.patch_size
 
-        if self.settings is not None and self.settings.mode == "Hexagon":
+        is_hex = self.settings is not None and self.settings.mode == "Hexagon"
+
+        if is_hex:
             boundary_idx, source_idx, _, _ = _compute_hex_boundary_pairs(
                 h_patches, w_patches, self.settings,
             )
+
+            waste_indices = []
+            waste_source_indices = []
+            for h in range(h_patches):
+                for w in range(w_patches):
+                    src_w, src_h = hex_tiling(
+                        w, h,
+                        (w_patches, h_patches),
+                        (w_patches, h_patches),
+                        self.settings,
+                    )
+                    if src_w != w or src_h != h:
+                        waste_indices.append(h * w_patches + w)
+                        waste_source_indices.append(src_h * w_patches + src_w)
+
+            if waste_indices:
+                self._waste_idx = torch.tensor(waste_indices, dtype=torch.long)
+                self._waste_source_idx = torch.tensor(waste_source_indices, dtype=torch.long)
         else:
             boundary_idx, source_idx, _, _ = _compute_rect_boundary_pairs(
                 h_patches, w_patches,
@@ -307,12 +335,16 @@ class LuminaToroidalPatch:
         if not self._initialized:
             self._initialize(data["x"])
 
-        if self._n_extra == 0:
-            return {}
-
         img = data["img"]
-        alpha = 0.2
-        blended = (1 - alpha) * img[:, self._boundary_idx, :] + alpha * img[:, self._source_idx, :]
-        img[:, self._boundary_idx, :] = blended
+
+        # Replace waste tokens with their hex-mapped source content so
+        # subsequent layers don't see noise at waste positions.
+        if self._waste_idx is not None and len(self._waste_idx) > 0:
+            img[:, self._waste_idx, :] = img[:, self._waste_source_idx, :]
+
+        if self._n_extra > 0:
+            alpha = 0.2
+            blended = (1 - alpha) * img[:, self._boundary_idx, :] + alpha * img[:, self._source_idx, :]
+            img[:, self._boundary_idx, :] = blended
 
         return {"img": img}
