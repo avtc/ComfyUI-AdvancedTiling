@@ -71,7 +71,7 @@ def _create_lumina_wrapper(settings: Settings = None):
     and optionally does latent content wrapping for Hexagon mode."""
     from .advanced_tiling import calculate_mapping
 
-    do_wrapping = settings is not None and settings.mode == "Hexagon"
+    do_wrapping = settings is not None
     _mapping_cache = {}
 
     _wrapper_called = [False]

@@ -297,8 +297,8 @@ class LuminaAttentionWrapper:
         self._initialized = False
         self._source_idx = None
         self._n_extra = 0
-        self._shift_rope_h = None
-        self._shift_rope_w = None
+        self._virtual_rope_h = None
+        self._virtual_rope_w = None
         self._axis_splits = (self.axes_dim[0] // 2, self.axes_dim[1] // 2)
 
         self._original_forward = attn_module.forward
@@ -322,19 +322,18 @@ class LuminaAttentionWrapper:
         if self._n_extra > 0:
             boundary_h = b_idx // w_patches
             boundary_w = b_idx % w_patches
-            source_h = source_idx // w_patches
-            source_w = source_idx % w_patches
 
-            shift_h = (boundary_h.float() + off_h.float() - source_h.float()).unsqueeze(0)
-            shift_w = (boundary_w.float() + off_w.float() - source_w.float()).unsqueeze(0)
+            # Virtual positions: where the wrapped neighbor would be spatially
+            virtual_h = (boundary_h.float() + off_h.float()).unsqueeze(0)
+            virtual_w = (boundary_w.float() + off_w.float()).unsqueeze(0)
 
-            shift_rope_h = rope_fn(shift_h, self.axes_dim[1], self.theta)
-            shift_rope_w = rope_fn(shift_w, self.axes_dim[2], self.theta)
+            # Pre-compute RoPE directly from virtual positions
+            virtual_rope_h = rope_fn(virtual_h, self.axes_dim[1], self.theta)
+            virtual_rope_w = rope_fn(virtual_w, self.axes_dim[2], self.theta)
 
-            # Shape: (1, n_extra, 1, axis_dim//2, 2, 2) — add singleton for
-            # broadcasting with the (batch, n_extra, 1, ...) source freqs.
-            self._shift_rope_h = shift_rope_h.unsqueeze(2)
-            self._shift_rope_w = shift_rope_w.unsqueeze(2)
+            # Shape: (1, n_extra, 1, axis_dim//2, 2, 2)
+            self._virtual_rope_h = virtual_rope_h.unsqueeze(2)
+            self._virtual_rope_w = virtual_rope_w.unsqueeze(2)
 
         self._initialized = True
 
@@ -401,25 +400,20 @@ class LuminaAttentionWrapper:
         extra_k = xk_pre[:, src_global, :, :]
         extra_v = xv[:, src_global, :, :]
 
-        # --- Synthetic freqs_cis via RoPE shift composition ---
-        # syn_freqs = R(source) @ R(shift) = R(source + shift)
-        # Applied to pre-RoPE extra_k, giving R(source + shift) @ x_original
+        # --- Synthetic freqs_cis from virtual positions directly ---
+        # Get temporal axis from source freqs_cis (all image tokens share it)
         source_global = self._source_idx.to(freqs_cis.device) + cap_size_0
         source_freqs = freqs_cis[:, source_global, :, :, :, :]
 
         a0, a1 = self._axis_splits
-        src_ax0 = source_freqs[:, :, :, :a0, :, :]
-        src_ax1 = source_freqs[:, :, :, a0:a0 + a1, :, :]
-        src_ax2 = source_freqs[:, :, :, a0 + a1:, :, :]
+        src_ax0 = source_freqs[:, :, :, :a0, :, :]  # temporal (unchanged)
 
-        shift_h = self._shift_rope_h.to(device=src_ax1.device, dtype=src_ax1.dtype)
-        shift_w = self._shift_rope_w.to(device=src_ax2.device, dtype=src_ax2.dtype)
+        virtual_rope_h = self._virtual_rope_h.to(device=src_ax0.device, dtype=src_ax0.dtype)
+        virtual_rope_w = self._virtual_rope_w.to(device=src_ax0.device, dtype=src_ax0.dtype)
 
-        syn_ax1 = torch.matmul(src_ax1, shift_h)
-        syn_ax2 = torch.matmul(src_ax2, shift_w)
-        syn_freqs = torch.cat([src_ax0, syn_ax1, syn_ax2], dim=3)
+        syn_freqs = torch.cat([src_ax0, virtual_rope_h, virtual_rope_w], dim=3)
 
-        # --- Apply full synthetic RoPE to pre-RoPE extra K ---
+        # --- Apply synthetic RoPE to pre-RoPE extra K ---
         extra_k = apply_rope1(extra_k, syn_freqs)
 
         # --- Concatenate extra K/V ---
