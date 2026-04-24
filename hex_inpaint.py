@@ -15,7 +15,6 @@ import functools
 import torch
 
 from .modes import Settings
-from .modes.hex import hex_tiling
 from .modes.hex_mask import (
     NEIGHBOR_DIRECTIONS,
     create_masks,
@@ -65,20 +64,17 @@ def _build_neighbor_map(
 
     :return: LongTensor of shape (height, width) with values -1 to 5
     """
+    from .modes.hex import hex_tiling_vectorized
     from .modes.hex_mask import _compute_sector_map
 
-    # Vectorized waste detection using hex_tiling directly
-    mapped_x = torch.zeros((height, width), dtype=torch.long)
-    mapped_y = torch.zeros((height, width), dtype=torch.long)
-    for y in range(height):
-        for x in range(width):
-            nx, ny = hex_tiling(x, y, (width, height), (width, height), settings)
-            mapped_x[y, x] = nx
-            mapped_y[y, x] = ny
+    mapped_x, mapped_y = hex_tiling_vectorized(width, height, settings)
+
+    mapped_x_t = torch.from_numpy(mapped_x)
+    mapped_y_t = torch.from_numpy(mapped_y)
 
     xs = torch.arange(width).expand(height, width)
     ys = torch.arange(height).unsqueeze(1).expand(height, width)
-    is_waste = (mapped_x != xs) | (mapped_y != ys)
+    is_waste = (mapped_x_t != xs) | (mapped_y_t != ys)
 
     sectors = _compute_sector_map(width, height)
 
@@ -174,6 +170,13 @@ class AdvancedTilingHexInpaint:
                         "tooltip": "Width of the inpainting border as fraction of hex radius.",
                     },
                 ),
+                "skip_same_neighbors": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "When enabled, automatically skips inpainting borders where the neighbor image is identical to the center image. Useful when surrounding tiles share the same terrain type.",
+                    },
+                ),
             },
             "optional": {
                 f"neighbor_{d}": ("IMAGE", {"tooltip": f"{d} neighbor tile image"})
@@ -190,7 +193,7 @@ class AdvancedTilingHexInpaint:
     FUNCTION = "run"
     CATEGORY = "conditioning"
 
-    def run(self, settings, model, vae, center_image, inpaint_mode, border_width, **kwargs):
+    def run(self, settings, model, vae, center_image, inpaint_mode, border_width, skip_same_neighbors, **kwargs):
         t_start = time.time()
 
         # 1. VAE-encode center image
@@ -239,6 +242,21 @@ class AdvancedTilingHexInpaint:
         logger.info(f"[HexInpaint] Latent masks ({W_lat}x{H_lat}): {t4-t3:.3f}s, "
                      f"border_pixels={int(border_mask_lat.sum().item())}")
 
+        # 4.5 Auto-skip matching neighbors
+        matching_indices = set()
+        if skip_same_neighbors:
+            for i, direction in enumerate(NEIGHBOR_DIRECTIONS):
+                key = f"neighbor_{direction}"
+                if key in kwargs and kwargs[key] is not None:
+                    if torch.allclose(center_image, kwargs[key], atol=1e-6):
+                        matching_indices.add(i)
+                        neighbor_masks_lat[i].zero_()
+                        logger.info(f"[HexInpaint] Auto-skip {direction}: matches center")
+
+            if matching_indices:
+                border_mask_lat = neighbor_masks_lat.sum(dim=0, keepdim=True).clamp(0, 1)
+                logger.info(f"[HexInpaint] Skipped {len(matching_indices)} matching neighbors")
+
         # 5. Build latent dict with optional noise_mask
         latent_dict = {"samples": composited}
 
@@ -269,6 +287,12 @@ class AdvancedTilingHexInpaint:
         _, full_border_mask, full_neighbor_masks = create_masks(
             W_img, H_img, settings, border_width
         )
+
+        if matching_indices:
+            for idx in matching_indices:
+                full_neighbor_masks[idx].zero_()
+            full_border_mask = full_neighbor_masks.sum(dim=0, keepdim=True).clamp(0, 1)
+
         t6 = time.time()
         logger.info(f"[HexInpaint] Image masks ({W_img}x{H_img}): {t6-t5:.3f}s")
 

@@ -10,7 +10,6 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 from . import Settings
-from .hex import hex_tiling
 
 logger = logging.getLogger("ComfyUI-AdvancedTiling")
 
@@ -28,13 +27,15 @@ def _build_inside_mask(width: int, height: int, settings: Settings) -> torch.Ten
 
     :return: Bool tensor of shape (height, width)
     """
-    mask = torch.zeros((height, width), dtype=torch.bool)
-    for y in range(height):
-        for x in range(width):
-            nx, ny = hex_tiling(x, y, (width, height), (width, height), settings)
-            if nx == x and ny == y:
-                mask[y, x] = True
-    return mask
+    from .hex import hex_tiling_vectorized
+
+    mapped_x, mapped_y = hex_tiling_vectorized(width, height, settings)
+
+    xs = np.arange(width, dtype=np.int64)[np.newaxis, :]
+    ys = np.arange(height, dtype=np.int64)[:, np.newaxis]
+
+    is_inside = (mapped_x == xs) & (mapped_y == ys)
+    return torch.from_numpy(is_inside)
 
 
 def _erode_mask(mask: torch.Tensor, pixels: int) -> torch.Tensor:

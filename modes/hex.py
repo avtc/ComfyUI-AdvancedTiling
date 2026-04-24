@@ -226,3 +226,67 @@ def hex_patch_tiling(
     new_h = (new_h + padded_h_patches // 2) % padded_h_patches
     new_w = (new_w + padded_w_patches // 2) % padded_w_patches
     return (new_h, new_w)
+
+
+def hex_tiling_vectorized(
+    width: int,
+    height: int,
+    settings: Settings,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Vectorized hexagonal tiling for all pixels at once.
+
+    Equivalent to calling hex_tiling(x, y, (width, height), (width, height), settings)
+    for every (x, y), but much faster for large grids.
+
+    :param width: Grid width
+    :param height: Grid height
+    :param settings: Tiling settings
+    :return: (mapped_x, mapped_y) as int64 arrays of shape (height, width)
+    """
+    size = min(width, height) // 2
+    inv_matrix = get_inverse_matrix(settings)
+    matrix = get_matrix(settings)
+
+    ys, xs = np.meshgrid(
+        np.arange(height, dtype=np.float64),
+        np.arange(width, dtype=np.float64),
+        indexing='ij',
+    )
+    xs -= width // 2
+    ys -= height // 2
+
+    # pixel_to_hex (vectorized)
+    coords = np.stack([xs.ravel(), ys.ravel()], axis=0)
+    qr = (inv_matrix @ coords) / size
+    q = qr[0].reshape(height, width)
+    r = qr[1].reshape(height, width)
+
+    # cube_round (vectorized)
+    s = -q - r
+    rq = np.rint(q)
+    rr = np.rint(r)
+    rs = np.rint(s)
+
+    q_diff = np.abs(rq - q)
+    r_diff = np.abs(rr - r)
+    s_diff = np.abs(rs - s)
+
+    cond_q = (q_diff > r_diff) & (q_diff > s_diff)
+    cond_r = ~cond_q & (r_diff > s_diff)
+
+    rq = np.where(cond_q, -rr - rs, rq)
+    rr = np.where(cond_r, -rq - rs, rr)
+
+    # Fractional parts
+    frac_q = q - rq
+    frac_r = r - rr
+
+    # hex_to_pixel (vectorized)
+    frac_coords = np.stack([frac_q.ravel(), frac_r.ravel()], axis=0)
+    pixel_coords = (matrix @ frac_coords) * size
+
+    new_x = np.rint(pixel_coords[0].reshape(height, width) + width // 2).astype(np.int64) % width
+    new_y = np.rint(pixel_coords[1].reshape(height, width) + height // 2).astype(np.int64) % height
+
+    return new_x, new_y
