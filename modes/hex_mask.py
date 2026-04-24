@@ -40,7 +40,10 @@ def _build_inside_mask(width: int, height: int, settings: Settings) -> torch.Ten
 
 def _erode_mask(mask: torch.Tensor, pixels: int) -> torch.Tensor:
     """
-    Erode a binary mask by the given number of pixels using max_pool.
+    Erode a binary mask by the given number of pixels using separable max_pool.
+
+    Decomposes the 2D erosion into horizontal + vertical 1D passes, reducing
+    complexity from O(k^2) to O(2k) per pixel.
 
     :param mask: Bool tensor of shape (H, W)
     :param pixels: Erosion radius in pixels
@@ -49,11 +52,20 @@ def _erode_mask(mask: torch.Tensor, pixels: int) -> torch.Tensor:
     if pixels <= 0:
         return mask.clone()
 
-    kernel_size = 2 * pixels + 1
-    fmask = mask.float().unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
-    padded = F.pad(fmask, [pixels, pixels, pixels, pixels], mode='constant', value=0)
-    eroded = -F.max_pool2d(-padded, kernel_size, stride=1)
-    return eroded.squeeze(0).squeeze(0) > 0.5
+    k = 2 * pixels + 1
+    fmask = mask.float()
+
+    # Horizontal pass
+    h_input = fmask.unsqueeze(1)  # (H, 1, W)
+    h_padded = F.pad(h_input, [pixels, pixels], mode='constant', value=0)
+    h_eroded = -F.max_pool1d(-h_padded, k, stride=1)
+
+    # Vertical pass (transpose to treat columns as rows)
+    v_input = h_eroded.squeeze(1).t().contiguous().unsqueeze(1)  # (W, 1, H)
+    v_padded = F.pad(v_input, [pixels, pixels], mode='constant', value=0)
+    v_eroded = -F.max_pool1d(-v_padded, k, stride=1)
+
+    return v_eroded.squeeze(1).t().contiguous() > 0.5
 
 
 def _compute_sector_map(width: int, height: int) -> torch.Tensor:
