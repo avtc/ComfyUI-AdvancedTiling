@@ -239,6 +239,9 @@ def hex_tiling_vectorized(
     Equivalent to calling hex_tiling(x, y, (width, height), (width, height), settings)
     for every (x, y), but much faster for large grids.
 
+    Uses explicit element-wise operations (not matmul) to match the scalar
+    floating point path exactly, avoiding rounding differences at hex boundaries.
+
     :param width: Grid width
     :param height: Grid height
     :param settings: Tiling settings
@@ -248,6 +251,12 @@ def hex_tiling_vectorized(
     inv_matrix = get_inverse_matrix(settings)
     matrix = get_matrix(settings)
 
+    # Unpack matrices for element-wise dot product (avoids matmul float differences)
+    ia, ib = float(inv_matrix[0, 0]), float(inv_matrix[0, 1])
+    ic, id_ = float(inv_matrix[1, 0]), float(inv_matrix[1, 1])
+    ma, mb = float(matrix[0, 0]), float(matrix[0, 1])
+    mc, md = float(matrix[1, 0]), float(matrix[1, 1])
+
     ys, xs = np.meshgrid(
         np.arange(height, dtype=np.float64),
         np.arange(width, dtype=np.float64),
@@ -256,11 +265,9 @@ def hex_tiling_vectorized(
     xs -= width // 2
     ys -= height // 2
 
-    # pixel_to_hex (vectorized)
-    coords = np.stack([xs.ravel(), ys.ravel()], axis=0)
-    qr = (inv_matrix @ coords) / size
-    q = qr[0].reshape(height, width)
-    r = qr[1].reshape(height, width)
+    # pixel_to_hex — same as inv_matrix @ [[x],[y]] / size but element-wise
+    q = (ia * xs + ib * ys) / size
+    r = (ic * xs + id_ * ys) / size
 
     # cube_round (vectorized)
     s = -q - r
@@ -282,11 +289,11 @@ def hex_tiling_vectorized(
     frac_q = q - rq
     frac_r = r - rr
 
-    # hex_to_pixel (vectorized)
-    frac_coords = np.stack([frac_q.ravel(), frac_r.ravel()], axis=0)
-    pixel_coords = (matrix @ frac_coords) * size
+    # hex_to_pixel — same as size * matrix @ [[fq],[fr]] but element-wise
+    px = size * (ma * frac_q + mb * frac_r)
+    py = size * (mc * frac_q + md * frac_r)
 
-    new_x = np.rint(pixel_coords[0].reshape(height, width) + width // 2).astype(np.int64) % width
-    new_y = np.rint(pixel_coords[1].reshape(height, width) + height // 2).astype(np.int64) % height
+    new_x = (np.rint(px).astype(np.int64) + width // 2) % width
+    new_y = (np.rint(py).astype(np.int64) + height // 2) % height
 
     return new_x, new_y
