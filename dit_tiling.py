@@ -66,9 +66,17 @@ def _create_content_wrapper(settings: Settings):
     return wrapper
 
 
+def _is_lumina(diff_model) -> bool:
+    """Check if the model uses Lumina/NextDiT architecture (rope_embedder instead of pe_embedder)."""
+    return hasattr(diff_model, 'rope_embedder') and not hasattr(diff_model, 'pe_embedder')
+
+
 def patch_dit_model(model_patcher, settings: Settings):
     """
     Apply tiling to a DiT model.
+
+    Flux-style models (pe_embedder): attn1_patch for K/V injection.
+    Lumina/NextDiT models (rope_embedder): double_block patch for token blending.
 
     For Hexagon mode: applies toroidal attention + latent content wrapping.
     For Rectangular mode: applies toroidal attention only.
@@ -79,29 +87,45 @@ def patch_dit_model(model_patcher, settings: Settings):
     diff_model = model_patcher.model.diffusion_model
 
     if settings.mode == "Hexagon":
-        from .toroidal_attention import HexToroidalAttentionPatch
+        if _is_lumina(diff_model):
+            from .toroidal_attention import LuminaToroidalPatch
 
-        if not hasattr(diff_model, 'pe_embedder'):
+            patch = LuminaToroidalPatch(diff_model.patch_size, settings)
+            model_patcher.set_model_patch(patch, "double_block")
+
+            wrapper = _create_content_wrapper(settings)
+            model_patcher.set_model_unet_function_wrapper(wrapper)
+
+        elif hasattr(diff_model, 'pe_embedder'):
+            from .toroidal_attention import HexToroidalAttentionPatch
+
+            patch = HexToroidalAttentionPatch(settings, diff_model.pe_embedder)
+            model_patcher.set_model_attn1_patch(patch)
+
+            wrapper = _create_content_wrapper(settings)
+            model_patcher.set_model_unet_function_wrapper(wrapper)
+
+        else:
             raise ValueError(
-                "Model does not have pe_embedder. "
+                "Model does not have pe_embedder or rope_embedder. "
                 "Toroidal attention requires a model with RoPE position embeddings."
             )
-
-        patch = HexToroidalAttentionPatch(settings, diff_model.pe_embedder)
-        model_patcher.set_model_attn1_patch(patch)
-
-        # Latent content wrapping for KSampler preview
-        wrapper = _create_content_wrapper(settings)
-        model_patcher.set_model_unet_function_wrapper(wrapper)
 
     elif settings.mode == "Rectangular":
-        from .toroidal_attention import RectToroidalAttentionPatch
+        if _is_lumina(diff_model):
+            from .toroidal_attention import LuminaToroidalPatch
 
-        if not hasattr(diff_model, 'pe_embedder'):
+            patch = LuminaToroidalPatch(diff_model.patch_size)
+            model_patcher.set_model_patch(patch, "double_block")
+
+        elif hasattr(diff_model, 'pe_embedder'):
+            from .toroidal_attention import RectToroidalAttentionPatch
+
+            patch = RectToroidalAttentionPatch(diff_model.pe_embedder)
+            model_patcher.set_model_attn1_patch(patch)
+
+        else:
             raise ValueError(
-                "Model does not have pe_embedder. "
+                "Model does not have pe_embedder or rope_embedder. "
                 "Toroidal attention requires a model with RoPE position embeddings."
             )
-
-        patch = RectToroidalAttentionPatch(diff_model.pe_embedder)
-        model_patcher.set_model_attn1_patch(patch)

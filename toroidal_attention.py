@@ -265,3 +265,54 @@ class RectToroidalAttentionPatch(_BaseToroidalAttentionPatch):
 
     def _compute_boundary_pairs(self, h_patches, w_patches):
         return _compute_rect_boundary_pairs(h_patches, w_patches)
+
+
+class LuminaToroidalPatch:
+    """double_block patch for Lumina/NextDiT models (e.g. Z-Image).
+
+    Blends boundary image tokens with opposite-edge content after each
+    transformer block, approximating toroidal attention.  Unlike Flux-style
+    attn1_patch injection, this operates at the block level because
+    Lumina applies RoPE inside JointAttention.forward() where no hook exists.
+    """
+
+    def __init__(self, patch_size: int, settings: Settings = None):
+        self.patch_size = patch_size
+        self.settings = settings
+        self._initialized = False
+        self._boundary_idx: torch.Tensor | None = None
+        self._source_idx: torch.Tensor | None = None
+        self._n_extra = 0
+
+    def _initialize(self, x: torch.Tensor):
+        _, _, H, W = x.shape
+        h_patches = H // self.patch_size
+        w_patches = W // self.patch_size
+
+        if self.settings is not None and self.settings.mode == "Hexagon":
+            boundary_idx, source_idx, _, _ = _compute_hex_boundary_pairs(
+                h_patches, w_patches, self.settings,
+            )
+        else:
+            boundary_idx, source_idx, _, _ = _compute_rect_boundary_pairs(
+                h_patches, w_patches,
+            )
+
+        self._boundary_idx = boundary_idx
+        self._source_idx = source_idx
+        self._n_extra = len(boundary_idx)
+        self._initialized = True
+
+    def __call__(self, data: dict) -> dict:
+        if not self._initialized:
+            self._initialize(data["x"])
+
+        if self._n_extra == 0:
+            return {}
+
+        img = data["img"]
+        alpha = 0.2
+        blended = (1 - alpha) * img[:, self._boundary_idx, :] + alpha * img[:, self._source_idx, :]
+        img[:, self._boundary_idx, :] = blended
+
+        return {"img": img}
