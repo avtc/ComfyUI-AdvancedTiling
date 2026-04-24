@@ -1,11 +1,10 @@
 """
-Hex tile inpainting: composites center + neighbor latents, patches model
-for natural border transitions.
+Hex tile inpainting: composites center + neighbor latents with border masks
+for natural edge transitions.
 
 Uses hex geometry directly (not through settings tiling mode) so that:
 - Masks and compositing always use hex_tiling
 - No Conv2d wrapping is applied (preserves neighbor content in waste region)
-- Attention injects K/V from waste region (neighbor content) at boundaries
 """
 
 import time
@@ -139,7 +138,7 @@ def composite_latents(
 class AdvancedTilingHexInpaint:
     """
     Hex tile inpainting node. Composites center + neighbor latents,
-    generates border masks, and patches model for natural edge transitions.
+    generates border masks for natural edge transitions.
 
     Uses hex geometry directly — does NOT apply Conv2d wrapping or depend
     on the settings tiling mode. The settings only provide hex rotation.
@@ -150,14 +149,13 @@ class AdvancedTilingHexInpaint:
         return {
             "required": {
                 "settings": ("ADVANCED_TILING_SETTINGS",),
-                "model": ("MODEL",),
                 "vae": ("VAE",),
                 "center_image": ("IMAGE",),
                 "inpaint_mode": (
-                    ["Masked Denoising", "Attention-Only", "Hybrid"],
+                    ["Masked Denoising"],
                     {
-                        "default": "Hybrid",
-                        "tooltip": "Inpainting mode. 'Hybrid' combines latent pasting + attention. 'Masked Denoising' uses latent paste + noise mask. 'Attention-Only' uses just attention context.",
+                        "default": "Masked Denoising",
+                        "tooltip": "Inpainting mode. 'Masked Denoising' composites neighbor latents into the waste region and applies a noise mask to the border.",
                     },
                 ),
                 "border_width": (
@@ -184,16 +182,16 @@ class AdvancedTilingHexInpaint:
             },
         }
 
-    RETURN_TYPES = ("MODEL", "LATENT", "MASK", "MASK", "MASK", "MASK", "MASK", "MASK", "MASK")
+    RETURN_TYPES = ("LATENT", "MASK", "MASK", "MASK", "MASK", "MASK", "MASK", "MASK")
     RETURN_NAMES = (
-        "MODEL", "LATENT", "MASK",
+        "LATENT", "MASK",
         "neighbor_E", "neighbor_NE", "neighbor_NW",
         "neighbor_W", "neighbor_SW", "neighbor_SE",
     )
     FUNCTION = "run"
     CATEGORY = "conditioning"
 
-    def run(self, settings, model, vae, center_image, inpaint_mode, border_width, skip_same_neighbors, **kwargs):
+    def run(self, settings, vae, center_image, inpaint_mode, border_width, skip_same_neighbors, **kwargs):
         t_start = time.time()
 
         # 1. VAE-encode center image
@@ -215,19 +213,14 @@ class AdvancedTilingHexInpaint:
 
         logger.info(f"[HexInpaint] Neighbors provided: {list(neighbor_latents.keys())}")
 
-        # 3. Composite latents (for Masked Denoising and Hybrid modes)
-        use_latent_paste = inpaint_mode in ("Masked Denoising", "Hybrid")
-
-        if use_latent_paste and neighbor_latents:
+        # 3. Composite latents
+        if neighbor_latents:
             t2 = time.time()
             composited = composite_latents(center_latent, neighbor_latents, settings)
             logger.info(f"[HexInpaint] Composite: {time.time()-t2:.3f}s")
         else:
             composited = center_latent
-            if use_latent_paste:
-                logger.info("[HexInpaint] No neighbor images — skipping compositing")
-            else:
-                logger.info(f"[HexInpaint] Mode '{inpaint_mode}' — skipping compositing")
+            logger.info("[HexInpaint] No neighbor images — skipping compositing")
 
         # 4. Generate masks at latent resolution (single pass)
         t3 = time.time()
@@ -257,32 +250,13 @@ class AdvancedTilingHexInpaint:
                 border_mask_lat = neighbor_masks_lat.sum(dim=0, keepdim=True).clamp(0, 1)
                 logger.info(f"[HexInpaint] Skipped {len(matching_indices)} matching neighbors")
 
-        # 5. Build latent dict with optional noise_mask
-        latent_dict = {"samples": composited}
+        # 5. Build latent dict with noise_mask
+        noise_mask = border_mask_lat.unsqueeze(0)  # (1, 1, H_lat, W_lat)
+        latent_dict = {"samples": composited, "noise_mask": noise_mask}
+        logger.info(f"[HexInpaint] noise_mask shape={noise_mask.shape}, "
+                     f"coverage={noise_mask.mean().item():.3f}")
 
-        if inpaint_mode in ("Masked Denoising", "Hybrid"):
-            noise_mask = border_mask_lat.unsqueeze(0)  # (1, 1, H_lat, W_lat)
-            latent_dict["noise_mask"] = noise_mask
-            logger.info(f"[HexInpaint] noise_mask shape={noise_mask.shape}, "
-                         f"coverage={noise_mask.mean().item():.3f}")
-
-        # 6. Patch model — inject K/V from waste region (neighbor content)
-        #    at boundary positions. No Conv2d wrapping.
-        model_copy = model.clone()
-        use_attention = inpaint_mode in ("Attention-Only", "Hybrid")
-
-        if use_attention:
-            from .hex_neighbor_attention import HexNeighborAttentionPatch
-
-            diff_model = model_copy.model.diffusion_model
-            if hasattr(diff_model, 'pe_embedder'):
-                patch = HexNeighborAttentionPatch(settings, diff_model.pe_embedder)
-                model_copy.set_model_attn1_patch(patch)
-                logger.info("[HexInpaint] Neighbor attention patch applied")
-            else:
-                logger.info("[HexInpaint] No pe_embedder — attention patch skipped")
-
-        # 7. Generate masks at image resolution (for output visualization)
+        # 6. Generate masks at image resolution (for output visualization)
         t5 = time.time()
         _, full_border_mask, full_neighbor_masks = create_masks(
             W_img, H_img, settings, border_width
@@ -296,11 +270,7 @@ class AdvancedTilingHexInpaint:
         t6 = time.time()
         logger.info(f"[HexInpaint] Image masks ({W_img}x{H_img}): {t6-t5:.3f}s")
 
-        outputs = [
-            model_copy,
-            latent_dict,
-            full_border_mask,
-        ]
+        outputs = [latent_dict, full_border_mask]
         for i in range(len(NEIGHBOR_DIRECTIONS)):
             outputs.append(full_neighbor_masks[i])
 
