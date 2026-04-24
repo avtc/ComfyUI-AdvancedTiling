@@ -341,6 +341,9 @@ class LuminaAttentionWrapper:
     def _wrapped_forward(self, x, x_mask, freqs_cis, transformer_options={}):
         img_shape = transformer_options.get("tiling_img_shape")
         if img_shape is None or x_mask is not None:
+            if not hasattr(self, '_debug_logged'):
+                self._debug_logged = True
+                print(f"[ToroidalDebug] SKIP: img_shape={img_shape}, x_mask={'None' if x_mask is None else 'not-None'}")
             return self._original_forward(x, x_mask, freqs_cis, transformer_options)
 
         H, W = img_shape
@@ -349,9 +352,17 @@ class LuminaAttentionWrapper:
 
         if not self._initialized:
             self._initialize(h_patches, w_patches)
+            print(f"[ToroidalDebug] INIT: h={h_patches}, w={w_patches}, n_extra={self._n_extra}, settings={self.settings}")
 
         if self._n_extra == 0:
             return self._original_forward(x, x_mask, freqs_cis, transformer_options)
+
+        if not hasattr(self, '_debug_inject_logged'):
+            self._debug_inject_logged = True
+            n_img = h_patches * w_patches
+            n_img_padded = -(-n_img // self.pad_tokens_multiple) * self.pad_tokens_multiple if self.pad_tokens_multiple else n_img
+            cap_size_0 = freqs_cis.shape[1] - n_img_padded
+            print(f"[ToroidalDebug] INJECT: seq={freqs_cis.shape[1]}, n_img={n_img}, n_img_padded={n_img_padded}, cap_size_0={cap_size_0}, n_extra={self._n_extra}")
 
         from comfy.ldm.flux.math import apply_rope, apply_rope1
         from comfy.ldm.modules.attention import optimized_attention_masked

@@ -74,6 +74,8 @@ def _create_lumina_wrapper(settings: Settings = None):
     do_wrapping = settings is not None and settings.mode == "Hexagon"
     _mapping_cache = {}
 
+    _wrapper_called = [False]
+
     def wrapper(apply_model, args):
         x = args["input"]
         is_5d = x.ndim == 5
@@ -82,6 +84,10 @@ def _create_lumina_wrapper(settings: Settings = None):
             _, _, _, H, W = x.shape
         else:
             _, _, H, W = x.shape
+
+        if not _wrapper_called[0]:
+            _wrapper_called[0] = True
+            print(f"[ToroidalDebug] WRAPPER: H={H}, W={W}, do_wrapping={do_wrapping}")
 
         c = dict(args["c"])
         to = c.get("transformer_options", {})
