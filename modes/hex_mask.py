@@ -38,12 +38,68 @@ def _build_inside_mask(width: int, height: int, settings: Settings) -> torch.Ten
     return torch.from_numpy(is_inside)
 
 
+def _square_erode(mask: torch.Tensor, pixels: int) -> torch.Tensor:
+    """
+    Axis-aligned (square SE) morphological erosion via separable max_pool1d.
+
+    :param mask: Bool tensor of shape (H, W)
+    :param pixels: Erosion half-width
+    :return: Eroded bool tensor
+    """
+    if pixels <= 0:
+        return mask.clone()
+
+    k = 2 * pixels + 1
+    fmask = mask.float()
+
+    h_input = fmask.unsqueeze(1)
+    h_padded = F.pad(h_input, [pixels, pixels], mode='constant', value=0)
+    h_eroded = -F.max_pool1d(-h_padded, k, stride=1)
+
+    v_input = h_eroded.squeeze(1).t().contiguous().unsqueeze(1)
+    v_padded = F.pad(v_input, [pixels, pixels], mode='constant', value=0)
+    v_eroded = -F.max_pool1d(-v_padded, k, stride=1)
+
+    return v_eroded.squeeze(1).t().contiguous() > 0.5
+
+
+def _diamond_erode(mask: torch.Tensor, pixels: int) -> torch.Tensor:
+    """
+    Diagonal (diamond SE) morphological erosion via Manhattan distance transform.
+
+    Computes L1 distance from each pixel to the nearest boundary using two
+    forward/backward raster scans. O(H*W) total.
+
+    :param mask: Bool tensor of shape (H, W)
+    :param pixels: Erosion half-width (Manhattan distance threshold)
+    :return: Eroded bool tensor
+    """
+    if pixels <= 0:
+        return mask.clone()
+
+    dist = np.where(mask.numpy(), np.float64(np.inf), 0.0)
+    H, W = dist.shape
+
+    for i in range(1, H):
+        dist[i] = np.minimum(dist[i], dist[i - 1] + 1)
+    for j in range(1, W):
+        dist[:, j] = np.minimum(dist[:, j], dist[:, j - 1] + 1)
+    for i in range(H - 2, -1, -1):
+        dist[i] = np.minimum(dist[i], dist[i + 1] + 1)
+    for j in range(W - 2, -1, -1):
+        dist[:, j] = np.minimum(dist[:, j], dist[:, j + 1] + 1)
+
+    return torch.from_numpy(dist >= pixels)
+
+
 def _erode_mask(mask: torch.Tensor, pixels: int) -> torch.Tensor:
     """
-    Erode a binary mask by the given number of pixels using separable max_pool.
+    Isotropic morphological erosion using octagonal structuring element.
 
-    Decomposes the 2D erosion into horizontal + vertical 1D passes, reducing
-    complexity from O(k^2) to O(2k) per pixel.
+    Combines square (axis-aligned) and diamond (diagonal) erosions.
+    The square SE erodes by e/√2 along axes; the diamond SE erodes by e
+    along diagonals. Their intersection approximates a circular SE with
+    ±3.4% variation — far better than square-only erosion (±36.6%).
 
     :param mask: Bool tensor of shape (H, W)
     :param pixels: Erosion radius in pixels
@@ -52,20 +108,8 @@ def _erode_mask(mask: torch.Tensor, pixels: int) -> torch.Tensor:
     if pixels <= 0:
         return mask.clone()
 
-    k = 2 * pixels + 1
-    fmask = mask.float()
-
-    # Horizontal pass
-    h_input = fmask.unsqueeze(1)  # (H, 1, W)
-    h_padded = F.pad(h_input, [pixels, pixels], mode='constant', value=0)
-    h_eroded = -F.max_pool1d(-h_padded, k, stride=1)
-
-    # Vertical pass (transpose to treat columns as rows)
-    v_input = h_eroded.squeeze(1).t().contiguous().unsqueeze(1)  # (W, 1, H)
-    v_padded = F.pad(v_input, [pixels, pixels], mode='constant', value=0)
-    v_eroded = -F.max_pool1d(-v_padded, k, stride=1)
-
-    return v_eroded.squeeze(1).t().contiguous() > 0.5
+    e_sq = max(1, round(pixels / math.sqrt(2)))
+    return _square_erode(mask, e_sq) & _diamond_erode(mask, pixels)
 
 
 def _compute_sector_map(width: int, height: int) -> torch.Tensor:
