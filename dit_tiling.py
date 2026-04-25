@@ -124,6 +124,8 @@ def _create_lumina_wrapper(settings: Settings = None):
     do_wrapping = settings is not None
     _mapping_cache = {}
 
+    _wrapper_call_count = 0
+
     def wrapper(apply_model, args):
         if do_wrapping:
             x = args["input"]
@@ -162,6 +164,15 @@ def _create_lumina_wrapper(settings: Settings = None):
             # Store image shape for K/V injection wrappers to read
             settings._current_img_shape = (H, W)
 
+            nonlocal _wrapper_call_count
+            _wrapper_call_count += 1
+            if _wrapper_call_count <= 3:
+                print(f"[TILING-DEBUG] wrapper call #{_wrapper_call_count}: "
+                      f"mode={settings.mode}, H={H}, W={W}, scale={settings.scale}, "
+                      f"mapping={'applied' if mapping is not None else 'None'}, "
+                      f"work=({_compute_working_size(W, H, settings)[0]},{_compute_working_size(W, H, settings)[1]}) "
+                      f"margin=({_compute_working_size(W, H, settings)[2]},{_compute_working_size(W, H, settings)[3]})")
+
         return apply_model(args["input"], args["timestep"], **args["c"])
 
     return wrapper
@@ -184,6 +195,11 @@ def _patch_lumina(model_patcher, diff_model, settings=None):
     each transformer block, preventing garbage accumulation from polluting
     attention for working-area patches.
     """
+    print(f"[TILING-DEBUG] _patch_lumina called: settings={settings}, "
+          f"mode={settings.mode if settings else None}, "
+          f"scale={settings.scale if settings else None}, "
+          f"kv_injection={settings.lumina_kv_injection if settings else None}")
+
     wrapper = _create_lumina_wrapper(settings)
     model_patcher.set_model_unet_function_wrapper(wrapper)
 
@@ -198,11 +214,17 @@ def _patch_lumina(model_patcher, diff_model, settings=None):
             patch_size = diff_model.patch_size
             pad_tokens_multiple = getattr(diff_model, 'pad_tokens_multiple', None)
 
+            n_wrapped = 0
             for layer in diff_model.layers:
                 attn = layer.attention
                 LuminaKVInjectionWrapper(
                     attn, rope_embedder, patch_size, pad_tokens_multiple, settings
                 )
+                n_wrapped += 1
+            print(f"[TILING-DEBUG] K/V injection ENABLED: wrapped {n_wrapped} attention layers, "
+                  f"patch_size={patch_size}, pad_tokens_multiple={pad_tokens_multiple}")
+        else:
+            print(f"[TILING-DEBUG] K/V injection DISABLED")
 
 
 def patch_dit_model(model_patcher, settings: Settings):

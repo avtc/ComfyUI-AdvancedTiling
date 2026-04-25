@@ -170,6 +170,10 @@ class AdvancedTilingSettings:
         if scale == 0.0:
             scale = 1.0 if mode == "Hexagon" else math.sqrt(3) / 2
 
+        print(f"[TILING-DEBUG] AdvancedTilingSettings.run: mode={mode}, rotation={rotation}, "
+              f"scale={scale}, lumina_kv_injection={lumina_kv_injection}, "
+              f"lumina_v_dampen={lumina_v_dampen}, lumina_boundary_blend={lumina_boundary_blend}")
+
         settings = Settings(mode, rotation, scale,
                             lumina_kv_injection=lumina_kv_injection,
                             lumina_v_dampen=lumina_v_dampen,

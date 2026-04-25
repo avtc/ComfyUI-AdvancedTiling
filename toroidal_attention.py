@@ -619,6 +619,8 @@ class LuminaKVInjectionWrapper:
 
         return syn_freqs
 
+    _fwd_call_count = 0
+
     def _wrapped_forward(self, x, x_mask, freqs_cis, transformer_options={}):
         if x_mask is not None:
             return self._original_forward(x, x_mask, freqs_cis, transformer_options)
@@ -632,8 +634,14 @@ class LuminaKVInjectionWrapper:
                 h_patches = H // self.patch_size
                 w_patches = W // self.patch_size
             else:
+                LuminaKVInjectionWrapper._fwd_call_count += 1
+                if LuminaKVInjectionWrapper._fwd_call_count <= 2:
+                    print(f"[TILING-DEBUG] KV-wrapper: NO img_shape, falling back to original forward")
                 return self._original_forward(x, x_mask, freqs_cis, transformer_options)
             self._initialize(h_patches, w_patches)
+            print(f"[TILING-DEBUG] KV-wrapper initialized: h_patches={h_patches}, w_patches={w_patches}, "
+                  f"n_extra={self._n_extra}, n_img={self._n_img}, "
+                  f"freqs_cis_shape={freqs_cis.shape}, seqlen={seqlen}")
 
         if self._n_extra == 0:
             return self._original_forward(x, x_mask, freqs_cis, transformer_options)
@@ -660,6 +668,13 @@ class LuminaKVInjectionWrapper:
         # Extract extra K/V from source positions (PRE-RoPE)
         cap_size = self._compute_cap_size(freqs_cis)
         src_global = self._source_idx.to(xk.device) + cap_size
+
+        LuminaKVInjectionWrapper._fwd_call_count += 1
+        if LuminaKVInjectionWrapper._fwd_call_count <= 2:
+            print(f"[TILING-DEBUG] KV-wrapper injecting: cap_size={cap_size}, "
+                  f"n_extra={self._n_extra}, src_global range=[{src_global.min()},{src_global.max()}], "
+                  f"xk.shape={xk.shape}, freqs_cis.shape={freqs_cis.shape}")
+
         extra_k = xk[:, src_global, :, :].clone()
         extra_v = xv[:, src_global, :, :]
 
