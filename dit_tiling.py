@@ -111,14 +111,11 @@ def _create_content_wrapper(settings: Settings):
 
 def _create_lumina_wrapper(settings: Settings = None):
     """Model wrapper for Lumina: applies latent content wrapping on each
-    denoising step and passes tiling_img_shape via transformer_options.
+    denoising step.
 
     The wrapping provides seamless infinite tiling by filling margin/waste
     positions with content from opposite edges, giving the model spatial
     context at the boundaries.
-
-    tiling_img_shape is needed by LuminaAttentionWrapper to correct waste
-    token position encoding in each attention layer.
 
     :param settings: Tiling settings (None disables wrapping)
     """
@@ -128,21 +125,15 @@ def _create_lumina_wrapper(settings: Settings = None):
     _mapping_cache = {}
 
     def wrapper(apply_model, args):
-        x = args["input"]
-        is_5d = x.ndim == 5
-
-        if is_5d:
-            _, _, _, H, W = x.shape
-        else:
-            _, _, H, W = x.shape
-
-        # Pass tiling_img_shape for attention position correction
-        c = dict(args["c"])
-        to = dict(c.get("transformer_options", {}))
-        to["tiling_img_shape"] = (H, W)
-        c["transformer_options"] = to
-
         if do_wrapping:
+            x = args["input"]
+            is_5d = x.ndim == 5
+
+            if is_5d:
+                _, _, _, H, W = x.shape
+            else:
+                _, _, H, W = x.shape
+
             if settings.mode == "Hexagon":
                 cache_key = (W, H, hash(settings))
                 if cache_key not in _mapping_cache:
@@ -168,7 +159,7 @@ def _create_lumina_wrapper(settings: Settings = None):
                 else:
                     x[:, :, mapping[1], mapping[0]] = x[:, :, mapping[3], mapping[2]]
 
-        return apply_model(args["input"], args["timestep"], **c)
+        return apply_model(args["input"], args["timestep"], **args["c"])
 
     return wrapper
 
@@ -181,33 +172,19 @@ def _is_lumina(diff_model) -> bool:
 def _patch_lumina(model_patcher, diff_model, settings=None):
     """Set up tiling for Lumina/NextDiT models.
 
-    Three mechanisms work together:
-    1. Latent wrapping (model function wrapper): fills waste/margin positions
-       with opposite-edge content for spatial context
-    2. Attention position correction (LuminaAttentionWrapper): replaces
-       freqs_cis for waste tokens with their source position's freqs_cis,
-       eliminating the position-content mismatch that causes boundary noise
-    3. Waste token reset (LuminaWastePatch): resets waste tokens to source
-       content after each block, preventing garbage accumulation
+    Uses latent wrapping (model function wrapper) plus a double_block waste
+    token reset patch. No K/V injection or attention patching — Lumina's
+    multiplicative RoPE makes direct attention patching counterproductive.
+
+    The waste patch resets margin/waste tokens to their source content after
+    each transformer block, preventing garbage accumulation from polluting
+    attention for working-area patches.
     """
     wrapper = _create_lumina_wrapper(settings)
     model_patcher.set_model_unet_function_wrapper(wrapper)
 
     if settings is not None:
-        from comfy.ldm.lumina.model import JointAttention
-        from .toroidal_attention import LuminaAttentionWrapper, LuminaWastePatch
-
-        # Only patch JointAttention in image transformer layers,
-        # not text encoder layers (which also use JointAttention)
-        for layer in diff_model.layers:
-            for module in layer.modules():
-                if isinstance(module, JointAttention):
-                    LuminaAttentionWrapper(
-                        module, diff_model.patch_size,
-                        diff_model.pad_tokens_multiple, settings,
-                    )
-
-        # Reset waste tokens after each block
+        from .toroidal_attention import LuminaWastePatch
         waste_patch = LuminaWastePatch(diff_model.patch_size, settings)
         model_patcher.set_model_double_block_patch(waste_patch)
 
