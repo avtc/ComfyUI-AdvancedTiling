@@ -109,36 +109,44 @@ _rect_boundary_cache: dict = {}
 def _compute_rect_boundary_pairs(
     h_patches: int,
     w_patches: int,
+    margin_h: int = 0,
+    margin_w: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute rectangular boundary pairs for toroidal wrapping.
 
-    For each patch on the edge of the grid, records the boundary patch index,
-    the wrapped source index from the opposite edge, and the direction offset.
+    For each patch on the edge of the working rectangle (inside the margins),
+    records the boundary patch index, the wrapped source index from the
+    opposite edge of the working rectangle, and the direction offset.
 
-    Cached by (h_patches, w_patches).
+    Cached by (h_patches, w_patches, margin_h, margin_w).
 
-    :param h_patches: Number of patch rows
-    :param w_patches: Number of patch columns
+    :param h_patches: Number of patch rows (full grid)
+    :param w_patches: Number of patch columns (full grid)
+    :param margin_h: Margin rows on each side
+    :param margin_w: Margin columns on each side
     :return: (boundary_idx, source_idx, off_h, off_w) as LongTensors
     """
-    cache_key = (h_patches, w_patches)
+    cache_key = (h_patches, w_patches, margin_h, margin_w)
     if cache_key in _rect_boundary_cache:
         return _rect_boundary_cache[cache_key]
+
+    work_h = h_patches - 2 * margin_h
+    work_w = w_patches - 2 * margin_w
 
     boundary_idx = []
     source_idx = []
     offsets_h = []
     offsets_w = []
 
-    for h in range(h_patches):
-        for w in range(w_patches):
+    for h in range(margin_h, margin_h + work_h):
+        for w in range(margin_w, margin_w + work_w):
             for dh, dw in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
                 nh, nw = h + dh, w + dw
 
-                if nh < 0 or nh >= h_patches or nw < 0 or nw >= w_patches:
-                    wrapped_h = nh % h_patches
-                    wrapped_w = nw % w_patches
+                if nh < margin_h or nh >= margin_h + work_h or nw < margin_w or nw >= margin_w + work_w:
+                    wrapped_h = margin_h + (nh - margin_h) % work_h
+                    wrapped_w = margin_w + (nw - margin_w) % work_w
 
                     boundary_idx.append(h * w_patches + w)
                     source_idx.append(wrapped_h * w_patches + wrapped_w)
@@ -167,22 +175,32 @@ def _compute_rect_boundary_pairs(
 class _BaseToroidalAttentionPatch:
     """Shared logic for hex and rectangular toroidal attention patches."""
 
-    def __init__(self, pe_embedder):
+    def __init__(self, pe_embedder, scale=1.0):
         self.pe_embedder = pe_embedder
+        self.scale = scale
         self._initialized = False
         self._boundary_idx = None
         self._source_idx = None
         self._n_extra = 0
         self._synthetic_pe = None
 
-    def _compute_boundary_pairs(self, h_patches, w_patches):
+    def _compute_boundary_pairs(self, h_patches, w_patches, margin_h=0, margin_w=0):
         raise NotImplementedError
+
+    @staticmethod
+    def _compute_margins(h_patches, w_patches, scale):
+        if scale >= 1.0:
+            return 0, 0
+        work_h = max(1, round(h_patches * scale))
+        work_w = max(1, round(w_patches * scale))
+        return (h_patches - work_h) // 2, (w_patches - work_w) // 2
 
     def _initialize(self, n_img: int):
         h_patches, w_patches = _factorize(n_img)
+        margin_h, margin_w = self._compute_margins(h_patches, w_patches, self.scale)
 
         boundary_idx, source_idx, off_h, off_w = self._compute_boundary_pairs(
-            h_patches, w_patches,
+            h_patches, w_patches, margin_h, margin_w,
         )
 
         self._boundary_idx = boundary_idx
@@ -199,7 +217,8 @@ class _BaseToroidalAttentionPatch:
         h_center = h_patches // 2
         w_center = w_patches // 2
 
-        syn_ids = torch.zeros(1, self._n_extra, 3, dtype=torch.float32)
+        n_axes = len(self.pe_embedder.axes_dim)
+        syn_ids = torch.zeros(1, self._n_extra, n_axes, dtype=torch.float32)
         syn_ids[0, :, 0] = 0
         syn_ids[0, :, 1] = (boundary_h + off_h).float() - h_center
         syn_ids[0, :, 2] = (boundary_w + off_w).float() - w_center
@@ -234,9 +253,11 @@ class _BaseToroidalAttentionPatch:
         new_v = torch.cat([v, extra_v], dim=2)
 
         synthetic_pe = self._synthetic_pe.to(device=pe.device, dtype=pe.dtype)
+        expand_shape = list(pe.shape)
+        expand_shape[2] = synthetic_pe.shape[2]
         new_pe = torch.cat([
             pe,
-            synthetic_pe.expand(pe.shape[0], -1, -1, -1, -1, -1),
+            synthetic_pe.expand(expand_shape),
         ], dim=2)
 
         return {
@@ -250,15 +271,100 @@ class HexToroidalAttentionPatch(_BaseToroidalAttentionPatch):
     """attn1_patch for hex tiling: injects wrapped K/V for hex boundary patches."""
 
     def __init__(self, settings: Settings, pe_embedder):
-        super().__init__(pe_embedder)
+        super().__init__(pe_embedder, scale=settings.scale)
         self.settings = settings
 
-    def _compute_boundary_pairs(self, h_patches, w_patches):
+    def _compute_boundary_pairs(self, h_patches, w_patches, margin_h=0, margin_w=0):
         return _compute_hex_boundary_pairs(h_patches, w_patches, self.settings)
 
 
 class RectToroidalAttentionPatch(_BaseToroidalAttentionPatch):
     """attn1_patch for rectangular tiling: injects wrapped K/V from opposite edges."""
 
-    def _compute_boundary_pairs(self, h_patches, w_patches):
-        return _compute_rect_boundary_pairs(h_patches, w_patches)
+    def __init__(self, pe_embedder, scale=1.0):
+        super().__init__(pe_embedder, scale=scale)
+
+    def _compute_boundary_pairs(self, h_patches, w_patches, margin_h=0, margin_w=0):
+        return _compute_rect_boundary_pairs(h_patches, w_patches, margin_h, margin_w)
+
+
+# ---------------------------------------------------------------------------
+# Lumina waste/margin token reset patch
+# ---------------------------------------------------------------------------
+
+class LuminaWastePatch:
+    """double_block patch that replaces waste/margin tokens with their
+    mapped source content after each transformer block, preventing garbage
+    accumulation from polluting attention for working-area patches.
+
+    For Hexagon mode: uses hex_tiling to identify waste positions (outside hex)
+    and their hex source positions.
+    For Rectangular mode: identifies margin positions (outside working rectangle)
+    and maps them to the opposite edge of the working rectangle.
+    """
+
+    def __init__(self, patch_size: int, settings: Settings):
+        self.patch_size = patch_size
+        self.settings = settings
+        self._initialized = False
+        self._waste_idx = None
+        self._waste_source_idx = None
+
+    def _initialize(self, x: torch.Tensor):
+        _, _, H, W = x.shape
+        h_patches = H // self.patch_size
+        w_patches = W // self.patch_size
+
+        waste_indices = []
+        waste_source_indices = []
+
+        if self.settings.mode == "Hexagon":
+            for h in range(h_patches):
+                for w in range(w_patches):
+                    src_w, src_h = hex_tiling(
+                        w, h,
+                        (w_patches, h_patches),
+                        (w_patches, h_patches),
+                        self.settings,
+                    )
+                    if src_w != w or src_h != h:
+                        waste_indices.append(h * w_patches + w)
+                        waste_source_indices.append(src_h * w_patches + src_w)
+        else:  # Rectangular
+            scale = self.settings.scale
+            if scale >= 1.0:
+                work_h, work_w = h_patches, w_patches
+            else:
+                work_h = max(1, round(h_patches * scale))
+                work_w = max(1, round(w_patches * scale))
+            margin_h = (h_patches - work_h) // 2
+            margin_w = (w_patches - work_w) // 2
+
+            for h in range(h_patches):
+                for w in range(w_patches):
+                    is_margin = (
+                        h < margin_h or h >= margin_h + work_h
+                        or w < margin_w or w >= margin_w + work_w
+                    )
+                    if is_margin:
+                        waste_indices.append(h * w_patches + w)
+                        src_h = margin_h + (h - margin_h) % work_h
+                        src_w = margin_w + (w - margin_w) % work_w
+                        waste_source_indices.append(src_h * w_patches + src_w)
+
+        if waste_indices:
+            self._waste_idx = torch.tensor(waste_indices, dtype=torch.long)
+            self._waste_source_idx = torch.tensor(waste_source_indices, dtype=torch.long)
+
+        self._initialized = True
+
+    def __call__(self, data: dict) -> dict:
+        if not self._initialized:
+            self._initialize(data["x"])
+
+        if self._waste_idx is None:
+            return {}
+
+        img = data["img"]
+        img[:, self._waste_idx, :] = img[:, self._waste_source_idx, :]
+        return {"img": img}

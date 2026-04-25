@@ -9,19 +9,24 @@
 ## Implemented tiling modes
 
 - [x] Hexagon
+- [x] Rectangular (toroidal — right edge wraps to left, bottom wraps to top)
 - [x] None (normal generation)
 
 ## Supported models
+
+### UNet-based
 
 - [x] Stable Diffusion 1.5 (also 1.4)
 - [x] Stable Diffusion 2.1 (also 2.0)
 - [x] Stable Diffusion XL (SDXL)
 
-## TODO
+### DiT-based (via toroidal attention patching)
 
-- More tiling modes
-- Optimize VAE decode (first pass is very slow)
-- Support DiT based models (SD3, PixArt-Σ, FLUX.1)
+- [x] FLUX.2 — tested on flux.2-klein-4b
+- [x] Qwen Image — tested on qwen-image-2512 (Q6 GGUF and fp16)
+- [ ] Z-Image / Z-Image Turbo — works with artifacts; wrapping not always consistent, especially at lower scales (~0.87). Less artifacts at higher scales (~0.95).
+
+DiT models are automatically detected and use toroidal attention instead of latent padding for seamless tiling. Lumina/Z-Image models use latent wrapping only (toroidal attention causes boundary noise with multiplicative RoPE).
 
 ## Credits
 
