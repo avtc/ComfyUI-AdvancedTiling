@@ -125,78 +125,13 @@ def _create_content_wrapper(settings: Settings):
     return wrapper
 
 
-def _compute_boundary_blend_indices(W, H, margin_W, margin_H, work_W, work_H, patch_size):
-    """Compute boundary blend mapping: working-area edge pixels → opposite edge pixels.
-
-    For each pixel in a feathered zone at the edge of the working area, compute
-    its corresponding pixel on the opposite edge. Returns destination and source
-    index arrays plus a weight array (1.0 at edge, 0.0 at interior).
-
-    :return: (dest_indices, src_indices, weights) or None if no blending needed
-    """
-    blend_patches = 2
-    blend_px = blend_patches * patch_size
-
-    if blend_px <= 0 or margin_W <= 0 or margin_H <= 0:
-        return None
-
-    dest_y, dest_x, src_y, src_x, weights = [], [], [], [], []
-
-    for y in range(margin_H, margin_H + work_H):
-        for x in range(margin_W, margin_W + work_W):
-            alpha = 0.0
-
-            dist_top = y - margin_H
-            dist_bottom = (margin_H + work_H - 1) - y
-            dist_left = x - margin_W
-            dist_right = (margin_W + work_W - 1) - x
-
-            if dist_top < blend_px:
-                alpha = max(alpha, 1.0 - dist_top / blend_px)
-                sy = margin_H + work_H - 1 - dist_top
-            elif dist_bottom < blend_px:
-                alpha = max(alpha, 1.0 - dist_bottom / blend_px)
-                sy = margin_H + dist_bottom
-            else:
-                sy = y
-
-            if dist_left < blend_px:
-                alpha = max(alpha, 1.0 - dist_left / blend_px)
-                sx = margin_W + work_W - 1 - dist_left
-            elif dist_right < blend_px:
-                alpha = max(alpha, 1.0 - dist_right / blend_px)
-                sx = margin_W + dist_right
-            else:
-                sx = x
-
-            if alpha > 0.0:
-                dest_y.append(y)
-                dest_x.append(x)
-                src_y.append(sy)
-                src_x.append(sx)
-                weights.append(alpha)
-
-    if not dest_y:
-        return None
-
-    return (
-        torch.tensor(dest_y, dtype=torch.long),
-        torch.tensor(dest_x, dtype=torch.long),
-        torch.tensor(src_y, dtype=torch.long),
-        torch.tensor(src_x, dtype=torch.long),
-        torch.tensor(weights, dtype=torch.float32),
-    )
-
-
 def _create_lumina_wrapper(settings: Settings = None, patch_size: int = 1):
-    """Model wrapper for Lumina/Z-Image: latent wrapping + boundary blend.
+    """Model wrapper for Lumina: applies latent content wrapping on each
+    denoising step.
 
-    The wrapping fills margin/waste positions with content from opposite edges,
-    giving the model spatial context at the boundaries.
-
-    If boundary_blend is enabled, after the model forward pass the noise
-    prediction at working-area edges is blended with the opposite edge to
-    smooth position-mismatch artifacts.
+    The wrapping provides seamless infinite tiling by filling margin/waste
+    positions with content from opposite edges, giving the model spatial
+    context at the boundaries.
 
     :param settings: Tiling settings (None disables wrapping)
     :param patch_size: Model patch size for aligning working area to patch boundaries
@@ -205,7 +140,6 @@ def _create_lumina_wrapper(settings: Settings = None, patch_size: int = 1):
 
     do_wrapping = settings is not None
     _mapping_cache = {}
-    _blend_cache = {}
 
     def wrapper(apply_model, args):
         if do_wrapping:
@@ -216,9 +150,6 @@ def _create_lumina_wrapper(settings: Settings = None, patch_size: int = 1):
                 _, _, _, H, W = x.shape
             else:
                 _, _, H, W = x.shape
-
-            # Store timestep for waste patch (timestep_decay)
-            settings._current_timestep = args["timestep"]
 
             if settings.mode == "Hexagon":
                 cache_key = (W, H, hash(settings))
@@ -247,33 +178,6 @@ def _create_lumina_wrapper(settings: Settings = None, patch_size: int = 1):
                 else:
                     x[:, :, mapping[1], mapping[0]] = x[:, :, mapping[3], mapping[2]]
 
-            # Model forward pass
-            result = apply_model(args["input"], args["timestep"], **args["c"])
-
-            # Boundary blend: smooth noise prediction at working-area edges
-            if settings.boundary_blend and settings.mode == "Rectangular" and mapping is not None:
-                blend_key = (W, H, work_W, work_H)
-                if blend_key not in _blend_cache:
-                    _blend_cache[blend_key] = _compute_boundary_blend_indices(
-                        W, H, margin_W, margin_H, work_W, work_H, patch_size,
-                    )
-                blend = _blend_cache[blend_key]
-
-                if blend is not None:
-                    dy, dx, sy, sx, w = blend
-                    w = w.to(result.device).view(1, 1, -1)
-                    if is_5d:
-                        flat_dst = result[:, :, :, dy, dx]
-                        flat_src = result[:, :, :, sy, sx]
-                        blended = flat_dst * (1 - w) + flat_src * w
-                        result[:, :, :, dy, dx] = blended
-                    else:
-                        flat_dst = result[:, :, dy, dx]
-                        flat_src = result[:, :, sy, sx]
-                        blended = flat_dst * (1 - w) + flat_src * w
-                        result[:, :, dy, dx] = blended
-
-            return result
 
         return apply_model(args["input"], args["timestep"], **args["c"])
 
@@ -288,28 +192,22 @@ def _is_lumina(diff_model) -> bool:
 def _patch_lumina(model_patcher, diff_model, settings=None):
     """Set up tiling for Lumina/NextDiT models.
 
-    Mechanisms:
+    Two mechanisms work together:
     1. Latent wrapping (model function wrapper): fills margin/waste positions
        with content from opposite edges on each denoising step.
     2. Waste token reset (double_block_patch): resets waste tokens to their
        source content after each transformer block, preventing garbage
        accumulation from polluting attention for working-area patches.
-    3. Optional rope_fix: replaces freqs_cis at waste positions with source
-       positions' freqs_cis, fixing position-content mismatch for RoPE.
-    4. Optional timestep_decay: scales waste token reset by timestep-dependent
-       factor (full influence early, reduced late).
-    5. Optional boundary_blend: smooths noise prediction at working-area edges
-       by blending with the opposite edge.
     """
     patch_size = diff_model.patch_size
     settings._patch_size = patch_size
 
-    # 1. Latent wrapping (+ boundary_blend if enabled)
+    # 1. Latent wrapping
     wrapper = _create_lumina_wrapper(settings, patch_size=patch_size)
     model_patcher.set_model_unet_function_wrapper(wrapper)
 
     if settings is not None:
-        # 2. Waste token reset (+ rope_fix, timestep_decay if enabled)
+        # 2. Waste token reset
         from .toroidal_attention import LuminaWastePatch
         waste_patch = LuminaWastePatch(patch_size, settings)
         model_patcher.set_model_double_block_patch(waste_patch)

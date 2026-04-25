@@ -149,18 +149,6 @@ class AdvancedTilingSettings:
                         "tooltip": "Working area scale relative to latent size. 0 = auto (Hexagon: 1.0, Rectangular: ~0.87 matching hex width ratio). Lower values create larger margins for better wrapping at the cost of output size.",
                     },
                 ),
-                "rope_fix": ("BOOLEAN", {
-                    "default": False,
-                    "tooltip": "Replace RoPE position encoding of waste/margin tokens with their source position's encoding. Directly fixes position-content mismatch that causes boundary noise.",
-                }),
-                "timestep_decay": ("BOOLEAN", {
-                    "default": False,
-                    "tooltip": "Reduce waste token influence in later denoising steps. Full wrapping in early steps for structure, reduced in late steps to minimize position-mismatch noise during detail refinement.",
-                }),
-                "boundary_blend": ("BOOLEAN", {
-                    "default": False,
-                    "tooltip": "Blend noise prediction at working area boundary with opposite edge. Smooths position-mismatch artifacts at the seam.",
-                }),
             },
         }
 
@@ -168,7 +156,7 @@ class AdvancedTilingSettings:
     RETURN_NAMES = ("SETTINGS",)
     FUNCTION = "run"
 
-    def run(self, mode, rotation, scale, rope_fix, timestep_decay, boundary_blend):
+    def run(self, mode, rotation, scale):
         """
         Creates tiling settings from node inputs
         """
@@ -178,12 +166,7 @@ class AdvancedTilingSettings:
         if scale == 0.0:
             scale = 1.0 if mode == "Hexagon" else math.sqrt(3) / 2
 
-        settings = Settings(
-            mode, rotation, scale,
-            rope_fix=rope_fix,
-            timestep_decay=timestep_decay,
-            boundary_blend=boundary_blend,
-        )
+        settings = Settings(mode, rotation, scale)
 
         return (settings,)
 
