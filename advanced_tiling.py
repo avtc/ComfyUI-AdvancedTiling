@@ -219,7 +219,7 @@ class AdvancedTilingSettings:
                     "FLOAT",
                     {
                         "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01,
-                        "tooltip": "Working area scale relative to latent size. 0 = auto (Hexagon: 1.0, Rectangular: ~0.87 matching hex width ratio). Lower values create larger margins for better wrapping at the cost of output size.",
+                        "tooltip": "Working area scale relative to latent size. 0 = auto: Conv2d/Hexagon → 1.0, DiT Rectangular → 0.875. Lower values create larger margins for latent wrapping.",
                     },
                 ),
             },
@@ -237,7 +237,7 @@ class AdvancedTilingSettings:
         import math
 
         if scale == 0.0:
-            scale = 1.0 if mode == "Hexagon" else math.sqrt(3) / 2
+            scale = -1.0
 
         settings = Settings(mode, rotation, scale)
 
@@ -273,7 +273,17 @@ class AdvancedTiling:
         Does the actual patching of the model
         """
 
+        import math
+
         model_copy = model.clone()
+
+        # Resolve auto-scale: Conv2d=1.0, DiT Rectangular=0.875, DiT Hexagon=1.0
+        if settings.scale < 0.0:
+            is_conv2d = _has_conv2d(model_copy.model.diffusion_model)
+            if is_conv2d or settings.mode == "Hexagon":
+                settings.scale = 1.0
+            else:
+                settings.scale = round(math.sqrt(3) / 2, 3)  # 0.875
 
         if _has_conv2d(model_copy.model.diffusion_model):
             patch_model(model_copy.model, settings)
