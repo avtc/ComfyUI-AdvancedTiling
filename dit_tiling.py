@@ -159,6 +159,14 @@ def _create_lumina_wrapper(settings: Settings = None):
                 else:
                     x[:, :, mapping[1], mapping[0]] = x[:, :, mapping[3], mapping[2]]
 
+            # Pass image shape for K/V injection wrapper initialization
+            c = dict(args["c"])
+            if "transformer_options" not in c:
+                c["transformer_options"] = {}
+            c["transformer_options"]["tiling_img_shape"] = (H, W)
+
+            return apply_model(args["input"], args["timestep"], **c)
+
         return apply_model(args["input"], args["timestep"], **args["c"])
 
     return wrapper
@@ -173,8 +181,9 @@ def _patch_lumina(model_patcher, diff_model, settings=None):
     """Set up tiling for Lumina/NextDiT models.
 
     Uses latent wrapping (model function wrapper) plus a double_block waste
-    token reset patch. No K/V injection or attention patching — Lumina's
-    multiplicative RoPE makes direct attention patching counterproductive.
+    token reset patch. When lumina_kv_injection is enabled, also wraps each
+    JointAttention in diff_model.layers to inject boundary K/V at virtual
+    adjacent positions with correct synthetic freqs_cis.
 
     The waste patch resets margin/waste tokens to their source content after
     each transformer block, preventing garbage accumulation from polluting
@@ -187,6 +196,18 @@ def _patch_lumina(model_patcher, diff_model, settings=None):
         from .toroidal_attention import LuminaWastePatch
         waste_patch = LuminaWastePatch(diff_model.patch_size, settings)
         model_patcher.set_model_double_block_patch(waste_patch)
+
+        if settings.lumina_kv_injection:
+            from .toroidal_attention import LuminaKVInjectionWrapper
+            rope_embedder = diff_model.rope_embedder
+            patch_size = diff_model.patch_size
+            pad_tokens_multiple = getattr(diff_model, 'pad_tokens_multiple', None)
+
+            for layer in diff_model.layers:
+                attn = layer.attention
+                LuminaKVInjectionWrapper(
+                    attn, rope_embedder, patch_size, pad_tokens_multiple, settings
+                )
 
 
 def patch_dit_model(model_patcher, settings: Settings):

@@ -141,6 +141,18 @@ class AdvancedTilingSettings:
                         "tooltip": "Working area scale relative to latent size. 0 = auto (Hexagon: 1.0, Rectangular: ~0.87 matching hex width ratio). Lower values create larger margins for better wrapping at the cost of output size.",
                     },
                 ),
+                "lumina_kv_injection": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Flux-style K/V injection for Lumina/Z-Image models. Injects boundary K/V at virtual adjacent positions with correct RoPE.",
+                }),
+                "lumina_v_dampen": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Scale down V for waste tokens to reduce contamination. Experimental.",
+                }),
+                "lumina_boundary_blend": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Blend boundary working tokens with pre-block values. Experimental.",
+                }),
             },
         }
 
@@ -148,7 +160,7 @@ class AdvancedTilingSettings:
     RETURN_NAMES = ("SETTINGS",)
     FUNCTION = "run"
 
-    def run(self, mode, rotation, scale):
+    def run(self, mode, rotation, scale, lumina_kv_injection, lumina_v_dampen, lumina_boundary_blend):
         """
         Creates tiling settings from node inputs
         """
@@ -158,7 +170,10 @@ class AdvancedTilingSettings:
         if scale == 0.0:
             scale = 1.0 if mode == "Hexagon" else math.sqrt(3) / 2
 
-        settings = Settings(mode, rotation, scale)
+        settings = Settings(mode, rotation, scale,
+                            lumina_kv_injection=lumina_kv_injection,
+                            lumina_v_dampen=lumina_v_dampen,
+                            lumina_boundary_blend=lumina_boundary_blend)
 
         return (settings,)
 

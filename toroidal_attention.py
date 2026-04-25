@@ -512,3 +512,178 @@ class LuminaWastePatch:
         img = data["img"]
         img[:, self._waste_idx, :] = img[:, self._waste_source_idx, :]
         return {"img": img}
+
+
+# ---------------------------------------------------------------------------
+# Lumina K/V injection wrapper (Flux-style)
+# ---------------------------------------------------------------------------
+
+class LuminaKVInjectionWrapper:
+    """Wraps JointAttention.forward() for Flux-style K/V injection.
+
+    After QKV projection + QK norm, extracts extra K/V from source (wrapped)
+    positions and adds them to the sequence with synthetic freqs_cis for
+    virtual adjacent positions. The model's own apply_rope1 handles rotation.
+
+    This mirrors the proven Flux attn1_patch approach: boundary tokens get
+    extra K/V context from the opposite edge, placed at virtual adjacent
+    positions with correct RoPE encoding.
+    """
+
+    def __init__(self, attn_module, rope_embedder, patch_size, pad_tokens_multiple, settings):
+        self.attn = attn_module
+        self.rope_embedder = rope_embedder
+        self.axes_dim = list(rope_embedder.axes_dim)
+        self.theta = rope_embedder.theta
+        self.patch_size = patch_size
+        self.pad_tokens_multiple = pad_tokens_multiple
+        self.settings = settings
+
+        self._initialized = False
+        self._boundary_idx = None
+        self._source_idx = None
+        self._n_extra = 0
+        self._n_img = 0
+        self._virtual_h = None
+        self._virtual_w = None
+
+        self._original_forward = attn_module.forward
+        attn_module.forward = self._wrapped_forward
+
+    def _initialize(self, h_patches, w_patches):
+        self._n_img = h_patches * w_patches
+
+        if self.settings.mode == "Hexagon":
+            boundary_idx, source_idx, off_h, off_w = _compute_hex_boundary_pairs(
+                h_patches, w_patches, self.settings,
+            )
+        else:
+            scale = self.settings.scale
+            if scale < 1.0:
+                work_h = max(1, round(h_patches * scale))
+                work_w = max(1, round(w_patches * scale))
+                margin_h = (h_patches - work_h) // 2
+                margin_w = (w_patches - work_w) // 2
+            else:
+                margin_h, margin_w = 0, 0
+            boundary_idx, source_idx, off_h, off_w = _compute_rect_boundary_pairs(
+                h_patches, w_patches, margin_h, margin_w,
+            )
+
+        self._boundary_idx = boundary_idx
+        self._source_idx = source_idx
+        self._n_extra = len(boundary_idx)
+
+        if self._n_extra > 0:
+            boundary_h = boundary_idx // w_patches
+            boundary_w = boundary_idx % w_patches
+            virtual_h = (boundary_h + off_h).float()
+            virtual_w = (boundary_w + off_w).float()
+            self._virtual_h = virtual_h.unsqueeze(0)  # (1, n_extra)
+            self._virtual_w = virtual_w.unsqueeze(0)  # (1, n_extra)
+
+        self._initialized = True
+
+    def _compute_cap_size(self, freqs_cis):
+        n_img = self._n_img
+        if self.pad_tokens_multiple is not None and n_img > 0:
+            n_img_padded = -(-n_img // self.pad_tokens_multiple) * self.pad_tokens_multiple
+        else:
+            n_img_padded = n_img
+        return freqs_cis.shape[1] - n_img_padded
+
+    def _compute_synthetic_freqs(self, freqs_cis, cap_size):
+        """Generate synthetic freqs_cis for virtual adjacent positions.
+
+        Copies time-axis freqs from boundary tokens (correct start_t),
+        generates spatial freqs using rope() for virtual positions.
+        """
+        from comfy.ldm.flux.math import rope as rope_fn
+
+        boundary_global = self._boundary_idx.to(freqs_cis.device) + cap_size
+        boundary_freqs = freqs_cis[:, boundary_global, :, :, :, :]
+
+        time_pairs = self.axes_dim[0] // 2
+        h_pairs = self.axes_dim[1] // 2
+        w_pairs = self.axes_dim[2] // 2
+
+        virtual_h = self._virtual_h.to(device=freqs_cis.device)
+        virtual_w = self._virtual_w.to(device=freqs_cis.device)
+
+        syn_h = rope_fn(virtual_h, self.axes_dim[1], self.theta)
+        syn_w = rope_fn(virtual_w, self.axes_dim[2], self.theta)
+
+        syn_freqs = boundary_freqs.clone()
+        syn_freqs[:, :, :, time_pairs:time_pairs + h_pairs, :, :] = syn_h.unsqueeze(2).to(syn_freqs)
+        syn_freqs[:, :, :, time_pairs + h_pairs:, :, :] = syn_w.unsqueeze(2).to(syn_freqs)
+
+        return syn_freqs
+
+    def _wrapped_forward(self, x, x_mask, freqs_cis, transformer_options={}):
+        if x_mask is not None:
+            return self._original_forward(x, x_mask, freqs_cis, transformer_options)
+
+        bsz, seqlen, _ = x.shape
+
+        if not self._initialized:
+            img_shape = transformer_options.get("tiling_img_shape")
+            if img_shape is not None:
+                H, W = img_shape
+                h_patches = H // self.patch_size
+                w_patches = W // self.patch_size
+            else:
+                return self._original_forward(x, x_mask, freqs_cis, transformer_options)
+            self._initialize(h_patches, w_patches)
+
+        if self._n_extra == 0:
+            return self._original_forward(x, x_mask, freqs_cis, transformer_options)
+
+        from comfy.ldm.flux.math import apply_rope1
+        from comfy.ldm.modules.attention import optimized_attention_masked
+
+        # QKV projection + reshape + QK norm (same as original)
+        xq, xk, xv = torch.split(
+            self.attn.qkv(x),
+            [
+                self.attn.n_local_heads * self.attn.head_dim,
+                self.attn.n_local_kv_heads * self.attn.head_dim,
+                self.attn.n_local_kv_heads * self.attn.head_dim,
+            ],
+            dim=-1,
+        )
+        xq = xq.view(bsz, seqlen, self.attn.n_local_heads, self.attn.head_dim)
+        xk = xk.view(bsz, seqlen, self.attn.n_local_kv_heads, self.attn.head_dim)
+        xv = xv.view(bsz, seqlen, self.attn.n_local_kv_heads, self.attn.head_dim)
+        xq = self.attn.q_norm(xq)
+        xk = self.attn.k_norm(xk)
+
+        # Extract extra K/V from source positions (PRE-RoPE)
+        cap_size = self._compute_cap_size(freqs_cis)
+        src_global = self._source_idx.to(xk.device) + cap_size
+        extra_k = xk[:, src_global, :, :].clone()
+        extra_v = xv[:, src_global, :, :]
+
+        # Apply RoPE to original Q and K
+        xq = apply_rope1(xq, freqs_cis)
+        xk = apply_rope1(xk, freqs_cis)
+
+        # Apply RoPE to extra K using synthetic freqs
+        syn_freqs = self._compute_synthetic_freqs(freqs_cis, cap_size)
+        extra_k = apply_rope1(extra_k, syn_freqs)
+
+        # Concatenate original + extra K/V
+        xk = torch.cat([xk, extra_k], dim=1)
+        xv = torch.cat([xv, extra_v], dim=1)
+
+        # GQA expansion + attention (same as original)
+        n_rep = self.attn.n_local_heads // self.attn.n_local_kv_heads
+        if n_rep >= 1:
+            xk = xk.unsqueeze(3).repeat(1, 1, 1, n_rep, 1).flatten(2, 3)
+            xv = xv.unsqueeze(3).repeat(1, 1, 1, n_rep, 1).flatten(2, 3)
+
+        output = optimized_attention_masked(
+            xq.movedim(1, 2), xk.movedim(1, 2), xv.movedim(1, 2),
+            self.attn.n_local_heads, x_mask, skip_reshape=True,
+            transformer_options=transformer_options,
+        )
+        return self.attn.out(output)
