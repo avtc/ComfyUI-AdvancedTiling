@@ -45,9 +45,8 @@ if HAS_RAYLIGHT:
 
             # Resolve auto-scale (0.0) — Raylight only supports DiT models,
             # so no Conv2d check needed: Hexagon → 1.0, Rectangular → 0.875.
-            scale = settings.scale
-            if scale == 0.0:
-                scale = 1.0 if settings.mode == "Hexagon" else round(math.sqrt(3) / 2, 3)
+            if settings.scale == 0.0:
+                settings.scale = 1.0 if settings.mode == "Hexagon" else round(math.sqrt(3) / 2, 3)
 
             # Defined inside run() so cloudpickle serializes it as a nested
             # function (by value) instead of by module reference.  Module-level
@@ -81,7 +80,7 @@ if HAS_RAYLIGHT:
             gpu_workers = ray_actors["workers"]
             futures = [
                 actor.model_function_runner.remote(
-                    _patch, settings.mode, settings.rotation, scale
+                    _patch, settings.mode, settings.rotation, settings.scale
                 )
                 for actor in gpu_workers
             ]
