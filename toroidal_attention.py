@@ -289,79 +289,79 @@ class RectToroidalAttentionPatch(_BaseToroidalAttentionPatch):
 
 
 # ---------------------------------------------------------------------------
-# Lumina / NextDiT toroidal attention
+# Lumina / NextDiT attention position correction
 # ---------------------------------------------------------------------------
 
 class LuminaAttentionWrapper:
-    """Wraps JointAttention.forward() to inject boundary K/V with synthetic RoPE.
+    """Wraps JointAttention.forward() to correct waste token position encoding.
 
-    Lumina applies RoPE inside JointAttention.forward(), so there is no
-    external attn1_patch hook.  This wrapper intercepts the forward call,
-    runs QKV + RoPE normally, then injects extra K/V entries for boundary
-    patches with position-correct synthetic freqs_cis.
+    The root cause of boundary artifacts: waste/margin tokens have content from
+    the opposite edge (via latent wrapping) but position encoding for their
+    actual margin position. This mismatch confuses attention — working tokens
+    near the boundary attend to waste tokens and get contaminated by the
+    position-content conflict, producing noise that spreads inward.
 
-    For rectangular mode with scale < 1.0, computes margins so that K/V
-    injection wraps at the working rectangle boundary rather than the full
-    grid edge.
+    Fix: before apply_rope, replace freqs_cis for waste tokens with their
+    source position's freqs_cis. This makes waste tokens' K have the correct
+    position encoding for their content, so working tokens get proper toroidal
+    context without contamination.
 
-    Activated only when ``transformer_options["tiling_img_shape"]`` is set
-    (by the model wrapper), so the monkey-patch is a no-op for unrelated
-    model uses.
+    Unlike the previous K/V injection approach (which added extra tokens at
+    virtual adjacent positions with very strong attention signal), this modifies
+    existing waste tokens in-place. The attention signal is moderate (distance
+    = opposite edge), not overwhelming.
+
+    Activated only when transformer_options["tiling_img_shape"] is set.
     """
 
-    def __init__(self, attn_module, rope_embedder, patch_size, pad_tokens_multiple, settings=None):
+    def __init__(self, attn_module, patch_size, pad_tokens_multiple, settings):
         self.attn = attn_module
-        self.rope_embedder = rope_embedder
-        self.axes_dim = rope_embedder.axes_dim
-        self.theta = rope_embedder.theta
         self.patch_size = patch_size
         self.pad_tokens_multiple = pad_tokens_multiple
         self.settings = settings
-        self.scale = settings.scale if settings else 1.0
 
         self._initialized = False
-        self._source_idx = None
-        self._n_extra = 0
-        self._virtual_rope_h = None
-        self._virtual_rope_w = None
-        self._axis_splits = (self.axes_dim[0] // 2, self.axes_dim[1] // 2)
+        self._waste_local = None
+        self._source_local = None
 
         self._original_forward = attn_module.forward
         attn_module.forward = self._wrapped_forward
 
     def _initialize(self, h_patches, w_patches):
-        from comfy.ldm.flux.math import rope as rope_fn
+        waste_indices = []
+        source_indices = []
 
-        if self.settings is not None and self.settings.mode == "Hexagon":
-            b_idx, source_idx, off_h, off_w = _compute_hex_boundary_pairs(
-                h_patches, w_patches, self.settings,
-            )
+        if self.settings.mode == "Hexagon":
+            for h in range(h_patches):
+                for w in range(w_patches):
+                    src_w, src_h = hex_tiling(
+                        w, h,
+                        (w_patches, h_patches),
+                        (w_patches, h_patches),
+                        self.settings,
+                    )
+                    if src_w != w or src_h != h:
+                        waste_indices.append(h * w_patches + w)
+                        source_indices.append(src_h * w_patches + src_w)
         else:
-            margin_h, margin_w = _BaseToroidalAttentionPatch._compute_margins(
-                h_patches, w_patches, self.scale,
-            )
-            b_idx, source_idx, off_h, off_w = _compute_rect_boundary_pairs(
-                h_patches, w_patches, margin_h, margin_w,
-            )
+            scale = self.settings.scale
+            if scale < 1.0:
+                work_h = max(1, round(h_patches * scale))
+                work_w = max(1, round(w_patches * scale))
+                margin_h = (h_patches - work_h) // 2
+                margin_w = (w_patches - work_w) // 2
+                for h in range(h_patches):
+                    for w in range(w_patches):
+                        if (h < margin_h or h >= margin_h + work_h
+                                or w < margin_w or w >= margin_w + work_w):
+                            waste_indices.append(h * w_patches + w)
+                            src_h = margin_h + (h - margin_h) % work_h
+                            src_w = margin_w + (w - margin_w) % work_w
+                            source_indices.append(src_h * w_patches + src_w)
 
-        self._source_idx = source_idx
-        self._n_extra = len(source_idx)
-
-        if self._n_extra > 0:
-            boundary_h = b_idx // w_patches
-            boundary_w = b_idx % w_patches
-
-            # Virtual positions: where the wrapped neighbor would be spatially
-            virtual_h = (boundary_h.float() + off_h.float()).unsqueeze(0)
-            virtual_w = (boundary_w.float() + off_w.float()).unsqueeze(0)
-
-            # Pre-compute RoPE directly from virtual positions
-            virtual_rope_h = rope_fn(virtual_h, self.axes_dim[1], self.theta)
-            virtual_rope_w = rope_fn(virtual_w, self.axes_dim[2], self.theta)
-
-            # Shape: (1, n_extra, 1, axis_dim//2, 2, 2)
-            self._virtual_rope_h = virtual_rope_h.unsqueeze(2)
-            self._virtual_rope_w = virtual_rope_w.unsqueeze(2)
+        if waste_indices:
+            self._waste_local = torch.tensor(waste_indices, dtype=torch.long)
+            self._source_local = torch.tensor(source_indices, dtype=torch.long)
 
         self._initialized = True
 
@@ -377,22 +377,15 @@ class LuminaAttentionWrapper:
         if not self._initialized:
             self._initialize(h_patches, w_patches)
 
-        if self._n_extra == 0:
+        if self._waste_local is None:
             return self._original_forward(x, x_mask, freqs_cis, transformer_options)
 
-        from comfy.ldm.flux.math import apply_rope, apply_rope1
+        from comfy.ldm.flux.math import apply_rope
         from comfy.ldm.modules.attention import optimized_attention_masked
 
-        # Image token offset in the full (text+image) sequence
-        n_img = h_patches * w_patches
-        if self.pad_tokens_multiple is not None:
-            n_img_padded = -(-n_img // self.pad_tokens_multiple) * self.pad_tokens_multiple
-        else:
-            n_img_padded = n_img
-        cap_size_0 = freqs_cis.shape[1] - n_img_padded
-
-        # --- QKV projection + QK norm (same as original) ---
         bsz, seqlen, _ = x.shape
+
+        # QKV projection + reshape + QK norm (same as original)
         xq, xk, xv = torch.split(
             self.attn.qkv(x),
             [
@@ -408,36 +401,24 @@ class LuminaAttentionWrapper:
         xq = self.attn.q_norm(xq)
         xk = self.attn.k_norm(xk)
 
-        # --- Apply RoPE to full sequence ---
-        xk_pre = xk  # Save pre-RoPE K for boundary extraction
-        xq, xk = apply_rope(xq, xk, freqs_cis)
+        # Replace freqs_cis for waste tokens with their source position's freqs_cis
+        n_img = h_patches * w_patches
+        if self.pad_tokens_multiple is not None:
+            n_img_padded = -(-n_img // self.pad_tokens_multiple) * self.pad_tokens_multiple
+        else:
+            n_img_padded = n_img
+        cap_size = seqlen - n_img_padded
 
-        # --- Extract boundary source K/V from PRE-RoPE K ---
-        src_global = self._source_idx.to(xk_pre.device) + cap_size_0
-        extra_k = xk_pre[:, src_global, :, :]
-        extra_v = xv[:, src_global, :, :]
+        waste_global = self._waste_local.to(freqs_cis.device) + cap_size
+        source_global = self._source_local.to(freqs_cis.device) + cap_size
 
-        # --- Synthetic freqs_cis from virtual positions directly ---
-        # Get temporal axis from source freqs_cis (all image tokens share it)
-        source_global = self._source_idx.to(freqs_cis.device) + cap_size_0
-        source_freqs = freqs_cis[:, source_global, :, :, :, :]
+        modified_freqs = freqs_cis.clone()
+        modified_freqs[:, waste_global] = freqs_cis[:, source_global]
 
-        a0, a1 = self._axis_splits
-        src_ax0 = source_freqs[:, :, :, :a0, :, :]  # temporal (unchanged)
+        # Apply RoPE with corrected freqs_cis
+        xq, xk = apply_rope(xq, xk, modified_freqs)
 
-        virtual_rope_h = self._virtual_rope_h.to(device=src_ax0.device, dtype=src_ax0.dtype)
-        virtual_rope_w = self._virtual_rope_w.to(device=src_ax0.device, dtype=src_ax0.dtype)
-
-        syn_freqs = torch.cat([src_ax0, virtual_rope_h, virtual_rope_w], dim=3)
-
-        # --- Apply synthetic RoPE to pre-RoPE extra K ---
-        extra_k = apply_rope1(extra_k, syn_freqs)
-
-        # --- Concatenate extra K/V ---
-        xk = torch.cat([xk, extra_k], dim=1)
-        xv = torch.cat([xv, extra_v], dim=1)
-
-        # --- GQA expansion + attention (same as original) ---
+        # GQA expansion + attention (same as original)
         n_rep = self.attn.n_local_heads // self.attn.n_local_kv_heads
         if n_rep >= 1:
             xk = xk.unsqueeze(3).repeat(1, 1, 1, n_rep, 1).flatten(2, 3)
