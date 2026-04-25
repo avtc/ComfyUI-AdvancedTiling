@@ -311,7 +311,7 @@ class LuminaAttentionWrapper:
     existing waste tokens in-place. The attention signal is moderate (distance
     = opposite edge), not overwhelming.
 
-    Activated only when transformer_options["tiling_img_shape"] is set.
+    Activated only when settings._current_img_shape is set (by the model wrapper).
     """
 
     def __init__(self, attn_module, patch_size, pad_tokens_multiple, settings):
@@ -323,6 +323,7 @@ class LuminaAttentionWrapper:
         self._initialized = False
         self._waste_local = None
         self._source_local = None
+        self._init_logged = False
 
         self._original_forward = attn_module.forward
         attn_module.forward = self._wrapped_forward
@@ -366,8 +367,11 @@ class LuminaAttentionWrapper:
         self._initialized = True
 
     def _wrapped_forward(self, x, x_mask, freqs_cis, transformer_options={}):
-        img_shape = transformer_options.get("tiling_img_shape")
-        if img_shape is None or x_mask is not None:
+        if x_mask is not None:
+            return self._original_forward(x, x_mask, freqs_cis, transformer_options)
+
+        img_shape = getattr(self.settings, '_current_img_shape', None)
+        if img_shape is None:
             return self._original_forward(x, x_mask, freqs_cis, transformer_options)
 
         H, W = img_shape
@@ -376,6 +380,11 @@ class LuminaAttentionWrapper:
 
         if not self._initialized:
             self._initialize(h_patches, w_patches)
+
+        if not self._init_logged and self._waste_local is not None:
+            self._init_logged = True
+            print(f"[TILING-DEBUG] pos-correction first call: patches=({w_patches}x{h_patches}), "
+                  f"waste_tokens={len(self._waste_local)}, freqs_cis_shape={freqs_cis.shape}")
 
         if self._waste_local is None:
             return self._original_forward(x, x_mask, freqs_cis, transformer_options)

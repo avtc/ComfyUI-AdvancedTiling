@@ -204,48 +204,43 @@ def _is_lumina(diff_model) -> bool:
 def _patch_lumina(model_patcher, diff_model, settings=None):
     """Set up tiling for Lumina/NextDiT models.
 
-    Uses latent wrapping (model function wrapper) plus a double_block waste
-    token reset patch. When lumina_kv_injection is enabled, also wraps each
-    JointAttention in diff_model.layers to inject boundary K/V at virtual
-    adjacent positions with correct synthetic freqs_cis.
-
-    The waste patch resets margin/waste tokens to their source content after
-    each transformer block, preventing garbage accumulation from polluting
-    attention for working-area patches.
+    Three mechanisms work together:
+    1. Latent wrapping (model function wrapper): fills margin/waste positions
+       with content from opposite edges on each denoising step.
+    2. Waste token reset (double_block_patch): resets waste tokens to their
+       source content after each transformer block, preventing garbage
+       accumulation from polluting attention for working-area patches.
+    3. Position correction (attention wrapper): replaces freqs_cis for waste
+       tokens with their source position's freqs_cis, eliminating the
+       position-content mismatch that causes boundary noise in RoPE models.
     """
-    print(f"[TILING-DEBUG] _patch_lumina called: mode={settings.mode if settings else None}, "
+    print(f"[TILING-DEBUG] _patch_lumina: mode={settings.mode if settings else None}, "
           f"scale={settings.scale if settings else None}, "
-          f"patch_size={diff_model.patch_size}, "
-          f"kv_injection={settings.lumina_kv_injection if settings else None}")
+          f"patch_size={diff_model.patch_size}")
 
     patch_size = diff_model.patch_size
     settings._patch_size = patch_size
 
+    # 1. Latent wrapping
     wrapper = _create_lumina_wrapper(settings, patch_size=patch_size)
     model_patcher.set_model_unet_function_wrapper(wrapper)
 
     if settings is not None:
+        # 2. Waste token reset
         from .toroidal_attention import LuminaWastePatch
-        waste_patch = LuminaWastePatch(diff_model.patch_size, settings)
+        waste_patch = LuminaWastePatch(patch_size, settings)
         model_patcher.set_model_double_block_patch(waste_patch)
 
-        if settings.lumina_kv_injection:
-            from .toroidal_attention import LuminaKVInjectionWrapper
-            rope_embedder = diff_model.rope_embedder
-            patch_size = diff_model.patch_size
-            pad_tokens_multiple = getattr(diff_model, 'pad_tokens_multiple', None)
-
-            n_wrapped = 0
-            for layer in diff_model.layers:
-                attn = layer.attention
-                LuminaKVInjectionWrapper(
-                    attn, rope_embedder, patch_size, pad_tokens_multiple, settings
-                )
-                n_wrapped += 1
-            print(f"[TILING-DEBUG] K/V injection ENABLED: wrapped {n_wrapped} attention layers, "
-                  f"patch_size={patch_size}, pad_tokens_multiple={pad_tokens_multiple}")
-        else:
-            print(f"[TILING-DEBUG] K/V injection DISABLED")
+        # 3. Position correction for waste tokens
+        from .toroidal_attention import LuminaAttentionWrapper
+        pad_tokens_multiple = getattr(diff_model, 'pad_tokens_multiple', None)
+        n_wrapped = 0
+        for layer in diff_model.layers:
+            attn = layer.attention
+            LuminaAttentionWrapper(attn, patch_size, pad_tokens_multiple, settings)
+            n_wrapped += 1
+        print(f"[TILING-DEBUG] Position correction: wrapped {n_wrapped} attention layers, "
+              f"patch_size={patch_size}, pad_tokens_multiple={pad_tokens_multiple}")
 
 
 def patch_dit_model(model_patcher, settings: Settings):
