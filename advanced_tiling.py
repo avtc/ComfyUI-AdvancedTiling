@@ -225,8 +225,8 @@ class AdvancedTilingSettings:
 
         import math
 
-        if scale == 0.0:
-            scale = -1.0
+        # scale=0.0 is the auto sentinel — resolved in AdvancedTiling.run()
+        # once the model type is known.
 
         settings = Settings(mode, rotation, scale)
 
@@ -266,8 +266,8 @@ class AdvancedTiling:
 
         model_copy = model.clone()
 
-        # Resolve auto-scale: Conv2d=1.0, DiT Rectangular=0.875, DiT Hexagon=1.0
-        if settings.scale < 0.0:
+        # Resolve auto-scale (0.0): Conv2d=1.0, DiT Rectangular=0.875, DiT Hexagon=1.0
+        if settings.scale == 0.0:
             is_conv2d = _has_conv2d(model_copy.model.diffusion_model)
             if is_conv2d or settings.mode == "Hexagon":
                 settings.scale = 1.0
