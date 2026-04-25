@@ -4,7 +4,6 @@ Main advanced tiling implementation
 
 from typing import Optional
 import functools
-import copy
 
 import torch
 from torch import Tensor
@@ -243,12 +242,28 @@ class AdvancedTilingVAEDecode:
         operates at the working rectangle boundary.
         """
 
-        from .dit_tiling import _compute_working_size
+        # Patch VAE in-place instead of deepcopy (avoids copying ~167MB of weights).
+        # Save original state so we can restore after decode.
+        conv_layers = [
+            layer for layer in vae.first_stage_model.modules()
+            if isinstance(layer, Conv2d)
+        ]
+        saved = [
+            (layer, layer._conv_forward, getattr(layer, 'tiling_settings', None))
+            for layer in conv_layers
+        ]
+        patch_model(vae.first_stage_model, settings)
 
-        vae_copy = copy.deepcopy(vae)
-        # Enable tiling
-        patch_model(vae_copy.first_stage_model, settings)
+        try:
+            return self._decode_and_crop(settings, samples, vae, crop)
+        finally:
+            # Restore original Conv2d forward methods and remove tiling_settings
+            for layer, orig_forward, _ in saved:
+                layer._conv_forward = orig_forward
+                if hasattr(layer, 'tiling_settings'):
+                    del layer.tiling_settings
 
+    def _decode_and_crop(self, settings, samples, vae, crop):
         latent = samples["samples"]
         is_5d = latent.ndim == 5
 
@@ -261,6 +276,7 @@ class AdvancedTilingVAEDecode:
         # before VAE decoding so Conv2d wrapping operates at working rect boundary.
         # Use patch-aligned dimensions for consistency with the model wrapper.
         if crop and settings.mode == "Rectangular" and settings.scale < 1.0:
+            from .dit_tiling import _compute_working_size
             patch_size = getattr(settings, '_patch_size', 1)
             work_W, work_H, margin_W, margin_H = _compute_working_size(
                 W_lat, H_lat, settings, patch_size=patch_size,
@@ -271,7 +287,7 @@ class AdvancedTilingVAEDecode:
                 latent = latent[:, :, margin_H:margin_H + work_H, margin_W:margin_W + work_W]
 
         # Decode latents to image
-        image = vae_copy.decode(latent)
+        image = vae.decode(latent)
 
         # WanVAE returns 5D (B, T, H, W, C), standard VAE returns 4D (B, H, W, C)
         if image.ndim == 5:
