@@ -4,7 +4,6 @@ Main advanced tiling implementation
 
 from typing import Optional
 import functools
-import time
 
 import torch
 from torch import Tensor
@@ -65,9 +64,6 @@ def calculate_mapping(
 
     pw, ph = padded_size
     ow, oh = original_size
-    n_pixels = pw * ph
-
-    t0 = time.perf_counter()
 
     if settings.mode == "Rectangular":
         pad_x = (pw - ow) // 2
@@ -103,9 +99,6 @@ def calculate_mapping(
         empty = torch.tensor([], dtype=torch.long)
         result = (empty, empty.clone(), empty.clone(), empty.clone())
 
-    elapsed = time.perf_counter() - t0
-    n_remap = len(result[0])
-    print(f"[Tiling] calculate_mapping {padded_size} ({n_pixels} px, {settings.mode}): {elapsed:.3f}s ({n_remap} remapped)")
     return result
 
 
@@ -118,8 +111,6 @@ def create_crop_mask(width: int, height: int, settings: Settings):
     :param settings: Tiling settings
     :return: Cropped image
     """
-
-    t0 = time.perf_counter()
 
     if settings.mode == "Hexagon":
         import numpy as np
@@ -138,8 +129,6 @@ def create_crop_mask(width: int, height: int, settings: Settings):
         # Rectangular/None: all pixels are in the mask
         mask = torch.ones((1, height, width, 1), dtype=torch.float32)
 
-    elapsed = time.perf_counter() - t0
-    print(f"[Tiling] create_crop_mask {width}x{height} ({settings.mode}): {elapsed:.3f}s")
     return mask
 
 
@@ -334,11 +323,8 @@ class AdvancedTilingVAEDecode:
         operates at the working rectangle boundary.
         """
 
-        t_total = time.perf_counter()
-
         # Patch VAE in-place instead of deepcopy (avoids copying ~167MB of weights).
         # Save original state so we can restore after decode.
-        t0 = time.perf_counter()
         conv_layers = [
             layer for layer in vae.first_stage_model.modules()
             if isinstance(layer, Conv2d)
@@ -348,19 +334,15 @@ class AdvancedTilingVAEDecode:
             for layer in conv_layers
         ]
         patch_model(vae.first_stage_model, settings)
-        print(f"[Tiling VAE] Patch {len(conv_layers)} Conv2d layers: {time.perf_counter() - t0:.4f}s")
 
         try:
             result = self._decode_and_crop(settings, samples, vae, crop)
         finally:
-            t0 = time.perf_counter()
             for layer, orig_forward, _ in saved:
                 layer._conv_forward = orig_forward
                 if hasattr(layer, 'tiling_settings'):
                     del layer.tiling_settings
-            print(f"[Tiling VAE] Restore: {time.perf_counter() - t0:.4f}s")
 
-        print(f"[Tiling VAE] Total: {time.perf_counter() - t_total:.3f}s")
         return result
 
     def _decode_and_crop(self, settings, samples, vae, crop):
@@ -381,16 +363,13 @@ class AdvancedTilingVAEDecode:
             work_W, work_H, margin_W, margin_H = _compute_working_size(
                 W_lat, H_lat, settings, patch_size=patch_size,
             )
-            print(f"[Tiling VAE] Latent crop: {W_lat}x{H_lat} -> {work_W}x{work_H} (margin {margin_W},{margin_H})")
             if is_5d:
                 latent = latent[:, :, :, margin_H:margin_H + work_H, margin_W:margin_W + work_W]
             else:
                 latent = latent[:, :, margin_H:margin_H + work_H, margin_W:margin_W + work_W]
 
         # Decode latents to image
-        t0 = time.perf_counter()
         image = vae.decode(latent)
-        print(f"[Tiling VAE] VAE decode ({W_lat}x{H_lat} latent): {time.perf_counter() - t0:.3f}s")
 
         # WanVAE returns 5D (B, T, H, W, C), standard VAE returns 4D (B, H, W, C)
         if image.ndim == 5:
@@ -398,7 +377,6 @@ class AdvancedTilingVAEDecode:
 
         if crop:
             if settings.mode == "Hexagon":
-                t0 = time.perf_counter()
                 img_h, img_w = image.shape[1], image.shape[2]
                 mask = create_crop_mask(img_w, img_h, settings)
                 mask_2d = mask[0, :, :, 0]
@@ -424,6 +402,5 @@ class AdvancedTilingVAEDecode:
                 image = image[:, sq_rmin:sq_rmax + 1, sq_cmin:sq_cmax + 1, :]
                 cropped_mask = mask[:, sq_rmin:sq_rmax + 1, sq_cmin:sq_cmax + 1, :]
                 image = torch.cat((image, cropped_mask.to(device=image.device)), dim=3)
-                print(f"[Tiling VAE] Hex crop ({img_w}x{img_h} -> {hex_h}x{hex_h}): {time.perf_counter() - t0:.3f}s")
 
         return (image,)
