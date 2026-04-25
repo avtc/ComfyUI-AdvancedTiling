@@ -41,12 +41,20 @@ if HAS_RAYLIGHT:
         CATEGORY = "conditioning"
 
         def run(self, settings, ray_actors):
+            import math
+
+            # Resolve auto-scale (0.0) — Raylight only supports DiT models,
+            # so no Conv2d check needed: Hexagon → 1.0, Rectangular → 0.875.
+            scale = settings.scale
+            if scale == 0.0:
+                scale = 1.0 if settings.mode == "Hexagon" else round(math.sqrt(3) / 2, 3)
+
             # Defined inside run() so cloudpickle serializes it as a nested
             # function (by value) instead of by module reference.  Module-level
             # functions get serialized by reference, which requires importing
             # the module by name on the worker -- but the module name is the
             # filesystem path (with a hyphen), causing ModuleNotFoundError.
-            def _patch(model, mode, rotation):
+            def _patch(model, mode, rotation, scale):
                 import importlib.util
                 import os
                 import sys
@@ -67,13 +75,13 @@ if HAS_RAYLIGHT:
                 from ComfyUI_AdvancedTiling.dit_tiling import patch_dit_model
                 from ComfyUI_AdvancedTiling.modes import Settings
 
-                patch_dit_model(model, Settings(mode, rotation))
+                patch_dit_model(model, Settings(mode, rotation, scale))
                 return model
 
             gpu_workers = ray_actors["workers"]
             futures = [
                 actor.model_function_runner.remote(
-                    _patch, settings.mode, settings.rotation
+                    _patch, settings.mode, settings.rotation, scale
                 )
                 for actor in gpu_workers
             ]
