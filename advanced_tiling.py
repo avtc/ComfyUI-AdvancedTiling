@@ -141,18 +141,6 @@ class AdvancedTilingSettings:
                         "tooltip": "Working area scale relative to latent size. 0 = auto (Hexagon: 1.0, Rectangular: ~0.87 matching hex width ratio). Lower values create larger margins for better wrapping at the cost of output size.",
                     },
                 ),
-                "lumina_kv_injection": ("BOOLEAN", {
-                    "default": True,
-                    "tooltip": "Flux-style K/V injection for Lumina/Z-Image models. Injects boundary K/V at virtual adjacent positions with correct RoPE.",
-                }),
-                "lumina_v_dampen": ("BOOLEAN", {
-                    "default": False,
-                    "tooltip": "Scale down V for waste tokens to reduce contamination. Experimental.",
-                }),
-                "lumina_boundary_blend": ("BOOLEAN", {
-                    "default": False,
-                    "tooltip": "Blend boundary working tokens with pre-block values. Experimental.",
-                }),
             },
         }
 
@@ -160,7 +148,7 @@ class AdvancedTilingSettings:
     RETURN_NAMES = ("SETTINGS",)
     FUNCTION = "run"
 
-    def run(self, mode, rotation, scale, lumina_kv_injection, lumina_v_dampen, lumina_boundary_blend):
+    def run(self, mode, rotation, scale):
         """
         Creates tiling settings from node inputs
         """
@@ -170,14 +158,7 @@ class AdvancedTilingSettings:
         if scale == 0.0:
             scale = 1.0 if mode == "Hexagon" else math.sqrt(3) / 2
 
-        print(f"[TILING-DEBUG] AdvancedTilingSettings.run: mode={mode}, rotation={rotation}, "
-              f"scale={scale}, lumina_kv_injection={lumina_kv_injection}, "
-              f"lumina_v_dampen={lumina_v_dampen}, lumina_boundary_blend={lumina_boundary_blend}")
-
-        settings = Settings(mode, rotation, scale,
-                            lumina_kv_injection=lumina_kv_injection,
-                            lumina_v_dampen=lumina_v_dampen,
-                            lumina_boundary_blend=lumina_boundary_blend)
+        settings = Settings(mode, rotation, scale)
 
         return (settings,)
 
@@ -247,8 +228,7 @@ class AdvancedTilingVAEDecode:
             }
         }
 
-    RETURN_TYPES = ("IMAGE", "INT", "INT")
-    RETURN_NAMES = ("IMAGE", "crop_width", "crop_height")
+    RETURN_TYPES = ("IMAGE",)
     FUNCTION = "run"
     CATEGORY = "latent"
 
@@ -261,12 +241,6 @@ class AdvancedTilingVAEDecode:
         For Rectangular mode with scale < 1.0: crops the latent to the centered
         working rectangle before VAE decoding, so the VAE's Conv2d wrapping
         operates at the working rectangle boundary.
-
-        :param settings: Tiling settings
-        :param samples: Latent samples
-        :param vae: VAE model
-        :param crop: Whether to crop the image
-        :return: (image, crop_width, crop_height)
         """
 
         from .dit_tiling import _compute_working_size
@@ -303,12 +277,10 @@ class AdvancedTilingVAEDecode:
         if image.ndim == 5:
             image = image.squeeze(1)
 
-        crop_w = image.shape[2]
-        crop_h = image.shape[1]
-
         if crop:
             if settings.mode == "Hexagon":
-                mask = create_crop_mask(crop_w, crop_h, settings)
+                img_h, img_w = image.shape[1], image.shape[2]
+                mask = create_crop_mask(img_w, img_h, settings)
                 mask_2d = mask[0, :, :, 0]
                 rows = torch.any(mask_2d, dim=1)
                 cols = torch.any(mask_2d, dim=0)
@@ -324,15 +296,13 @@ class AdvancedTilingVAEDecode:
                 half = hex_h // 2
                 sq_rmin = max(0, center_r - half)
                 sq_cmin = max(0, center_c - half)
-                sq_rmax = min(crop_h, sq_rmin + hex_h) - 1
-                sq_cmax = min(crop_w, sq_cmin + hex_h) - 1
+                sq_rmax = min(img_h, sq_rmin + hex_h) - 1
+                sq_cmax = min(img_w, sq_cmin + hex_h) - 1
                 sq_rmin = sq_rmax + 1 - hex_h
                 sq_cmin = sq_cmax + 1 - hex_h
 
                 image = image[:, sq_rmin:sq_rmax + 1, sq_cmin:sq_cmax + 1, :]
                 cropped_mask = mask[:, sq_rmin:sq_rmax + 1, sq_cmin:sq_cmax + 1, :]
                 image = torch.cat((image, cropped_mask.to(device=image.device)), dim=3)
-                crop_w = hex_h
-                crop_h = hex_h
 
-        return (image, crop_w, crop_h)
+        return (image,)

@@ -12,15 +12,11 @@ class Settings:
     For representing tiling settings
     """
 
-    def __init__(self, mode, rotation, scale=1.0,
-                 lumina_kv_injection=True, lumina_v_dampen=False, lumina_boundary_blend=False):
+    def __init__(self, mode, rotation, scale=1.0):
         self.mode = mode
         self.tiling_fn = modes[mode]
         self.rotation = rotation
         self.scale = scale
-        self.lumina_kv_injection = lumina_kv_injection
-        self.lumina_v_dampen = lumina_v_dampen
-        self.lumina_boundary_blend = lumina_boundary_blend
 
     def __hash__(self):
         return hash((self.mode, self.rotation, self.scale))

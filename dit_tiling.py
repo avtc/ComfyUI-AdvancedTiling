@@ -204,20 +204,13 @@ def _is_lumina(diff_model) -> bool:
 def _patch_lumina(model_patcher, diff_model, settings=None):
     """Set up tiling for Lumina/NextDiT models.
 
-    Three mechanisms work together:
+    Two mechanisms work together:
     1. Latent wrapping (model function wrapper): fills margin/waste positions
        with content from opposite edges on each denoising step.
     2. Waste token reset (double_block_patch): resets waste tokens to their
        source content after each transformer block, preventing garbage
        accumulation from polluting attention for working-area patches.
-    3. Position correction (attention wrapper): replaces freqs_cis for waste
-       tokens with their source position's freqs_cis, eliminating the
-       position-content mismatch that causes boundary noise in RoPE models.
     """
-    print(f"[TILING-DEBUG] _patch_lumina: mode={settings.mode if settings else None}, "
-          f"scale={settings.scale if settings else None}, "
-          f"patch_size={diff_model.patch_size}")
-
     patch_size = diff_model.patch_size
     settings._patch_size = patch_size
 
@@ -230,17 +223,6 @@ def _patch_lumina(model_patcher, diff_model, settings=None):
         from .toroidal_attention import LuminaWastePatch
         waste_patch = LuminaWastePatch(patch_size, settings)
         model_patcher.set_model_double_block_patch(waste_patch)
-
-        # 3. Position correction for waste tokens
-        from .toroidal_attention import LuminaAttentionWrapper
-        pad_tokens_multiple = getattr(diff_model, 'pad_tokens_multiple', None)
-        n_wrapped = 0
-        for layer in diff_model.layers:
-            attn = layer.attention
-            LuminaAttentionWrapper(attn, patch_size, pad_tokens_multiple, settings)
-            n_wrapped += 1
-        print(f"[TILING-DEBUG] Position correction: wrapped {n_wrapped} attention layers, "
-              f"patch_size={patch_size}, pad_tokens_multiple={pad_tokens_multiple}")
 
 
 def patch_dit_model(model_patcher, settings: Settings):
