@@ -407,7 +407,7 @@ class LuminaAttentionWrapper:
             n_img_padded = -(-n_img // self.pad_tokens_multiple) * self.pad_tokens_multiple
         else:
             n_img_padded = n_img
-        cap_size = seqlen - n_img_padded
+        cap_size = freqs_cis.shape[1] - n_img_padded
 
         waste_global = self._waste_local.to(freqs_cis.device) + cap_size
         source_global = self._source_local.to(freqs_cis.device) + cap_size
