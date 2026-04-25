@@ -257,13 +257,21 @@ class AdvancedTilingVAEDecode:
         patch_model(vae_copy.first_stage_model, settings)
 
         latent = samples["samples"]
+        is_5d = latent.ndim == 5
+
+        if is_5d:
+            _, _, _, H_lat, W_lat = latent.shape
+        else:
+            _, _, H_lat, W_lat = latent.shape
 
         # For rectangular mode with scale < 1.0, crop latent to working rectangle
         # before VAE decoding so Conv2d wrapping operates at working rect boundary
         if crop and settings.mode == "Rectangular" and settings.scale < 1.0:
-            _, _, H_lat, W_lat = latent.shape
             work_W, work_H, margin_W, margin_H = _compute_working_size(W_lat, H_lat, settings)
-            latent = latent[:, :, margin_H:margin_H + work_H, margin_W:margin_W + work_W]
+            if is_5d:
+                latent = latent[:, :, :, margin_H:margin_H + work_H, margin_W:margin_W + work_W]
+            else:
+                latent = latent[:, :, margin_H:margin_H + work_H, margin_W:margin_W + work_W]
 
         # Decode latents to image
         image = vae_copy.decode(latent)
@@ -277,8 +285,19 @@ class AdvancedTilingVAEDecode:
 
         if crop:
             if settings.mode == "Hexagon":
-                # Crop image based on tiling settings (hex mask as alpha)
-                mask = create_crop_mask(image.shape[2], image.shape[1], settings)
-                image = torch.cat((image, mask.to(device=image.device)), dim=3)
+                mask = create_crop_mask(crop_w, crop_h, settings)
+                # Crop to bounding rectangle of hex mask
+                mask_2d = mask[0, :, :, 0]
+                rows = torch.any(mask_2d, dim=1)
+                cols = torch.any(mask_2d, dim=0)
+                row_indices = torch.where(rows)[0]
+                col_indices = torch.where(cols)[0]
+                rmin, rmax = row_indices[0].item(), row_indices[-1].item()
+                cmin, cmax = col_indices[0].item(), col_indices[-1].item()
+                image = image[:, rmin:rmax + 1, cmin:cmax + 1, :]
+                cropped_mask = mask[:, rmin:rmax + 1, cmin:cmax + 1, :]
+                image = torch.cat((image, cropped_mask.to(device=image.device)), dim=3)
+                crop_w = cmax - cmin + 1
+                crop_h = rmax - rmin + 1
 
         return (image, crop_w, crop_h)
