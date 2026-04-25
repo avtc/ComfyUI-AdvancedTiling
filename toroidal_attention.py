@@ -626,7 +626,7 @@ class LuminaKVInjectionWrapper:
         bsz, seqlen, _ = x.shape
 
         if not self._initialized:
-            img_shape = transformer_options.get("tiling_img_shape")
+            img_shape = getattr(self.settings, '_current_img_shape', None)
             if img_shape is not None:
                 H, W = img_shape
                 h_patches = H // self.patch_size

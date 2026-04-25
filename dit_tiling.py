@@ -159,13 +159,8 @@ def _create_lumina_wrapper(settings: Settings = None):
                 else:
                     x[:, :, mapping[1], mapping[0]] = x[:, :, mapping[3], mapping[2]]
 
-            # Pass image shape for K/V injection wrapper initialization
-            c = dict(args["c"])
-            if "transformer_options" not in c:
-                c["transformer_options"] = {}
-            c["transformer_options"]["tiling_img_shape"] = (H, W)
-
-            return apply_model(args["input"], args["timestep"], **c)
+            # Store image shape for K/V injection wrappers to read
+            settings._current_img_shape = (H, W)
 
         return apply_model(args["input"], args["timestep"], **args["c"])
 
