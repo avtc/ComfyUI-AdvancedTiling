@@ -79,8 +79,9 @@ def calculate_mapping(
         src_y = grid_y.flatten()
         new_x = (src_x - pad_x) % ow + pad_x
         new_y = (src_y - pad_y) % oh + pad_y
-        result = (tuple(src_x.tolist()), tuple(src_y.tolist()),
-                  tuple(new_x.tolist()), tuple(new_y.tolist()))
+        # Only keep pixels that actually change position
+        non_id = (src_x != new_x) | (src_y != new_y)
+        result = (src_x[non_id], src_y[non_id], new_x[non_id], new_y[non_id])
 
     elif settings.mode == "Hexagon":
         import numpy as np
@@ -92,20 +93,19 @@ def calculate_mapping(
 
         src_x = np.tile(np.arange(pw, dtype=np.int64), ph)
         src_y = np.repeat(np.arange(ph, dtype=np.int64), pw)
-        result = (tuple(src_x.tolist()), tuple(src_y.tolist()),
-                  tuple(new_x.tolist()), tuple(new_y.tolist()))
+        # Only keep pixels that actually change position
+        non_id = (src_x != new_x) | (src_y != new_y)
+        result = (torch.from_numpy(src_x[non_id]), torch.from_numpy(src_y[non_id]),
+                  torch.from_numpy(new_x[non_id]), torch.from_numpy(new_y[non_id]))
 
     else:
-        # None mode: identity
-        xs = torch.arange(pw)
-        ys = torch.arange(ph)
-        grid_x, grid_y = torch.meshgrid(xs, ys, indexing='xy')
-        flat_x = tuple(grid_x.flatten().tolist())
-        flat_y = tuple(grid_y.flatten().tolist())
-        result = (flat_x, flat_y, flat_x, flat_y)
+        # None mode: no remapping needed
+        empty = torch.tensor([], dtype=torch.long)
+        result = (empty, empty.clone(), empty.clone(), empty.clone())
 
     elapsed = time.perf_counter() - t0
-    print(f"[Tiling] calculate_mapping {padded_size} ({n_pixels} px, {settings.mode}): {elapsed:.3f}s")
+    n_remap = len(result[0])
+    print(f"[Tiling] calculate_mapping {padded_size} ({n_pixels} px, {settings.mode}): {elapsed:.3f}s ({n_remap} remapped)")
     return result
 
 
