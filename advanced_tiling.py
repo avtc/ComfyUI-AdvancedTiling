@@ -286,7 +286,6 @@ class AdvancedTilingVAEDecode:
         if crop:
             if settings.mode == "Hexagon":
                 mask = create_crop_mask(crop_w, crop_h, settings)
-                # Crop to bounding rectangle of hex mask
                 mask_2d = mask[0, :, :, 0]
                 rows = torch.any(mask_2d, dim=1)
                 cols = torch.any(mask_2d, dim=0)
@@ -294,10 +293,23 @@ class AdvancedTilingVAEDecode:
                 col_indices = torch.where(cols)[0]
                 rmin, rmax = row_indices[0].item(), row_indices[-1].item()
                 cmin, cmax = col_indices[0].item(), col_indices[-1].item()
-                image = image[:, rmin:rmax + 1, cmin:cmax + 1, :]
-                cropped_mask = mask[:, rmin:rmax + 1, cmin:cmax + 1, :]
+
+                # Crop to square based on hex height, centered on hex center
+                hex_h = rmax - rmin + 1
+                center_r = (rmin + rmax) // 2
+                center_c = (cmin + cmax) // 2
+                half = hex_h // 2
+                sq_rmin = max(0, center_r - half)
+                sq_cmin = max(0, center_c - half)
+                sq_rmax = min(crop_h, sq_rmin + hex_h) - 1
+                sq_cmax = min(crop_w, sq_cmin + hex_h) - 1
+                sq_rmin = sq_rmax + 1 - hex_h
+                sq_cmin = sq_cmax + 1 - hex_h
+
+                image = image[:, sq_rmin:sq_rmax + 1, sq_cmin:sq_cmax + 1, :]
+                cropped_mask = mask[:, sq_rmin:sq_rmax + 1, sq_cmin:sq_cmax + 1, :]
                 image = torch.cat((image, cropped_mask.to(device=image.device)), dim=3)
-                crop_w = cmax - cmin + 1
-                crop_h = rmax - rmin + 1
+                crop_w = hex_h
+                crop_h = hex_h
 
         return (image, crop_w, crop_h)
