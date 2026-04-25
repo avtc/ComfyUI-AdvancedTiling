@@ -176,13 +176,21 @@ def _is_lumina(diff_model) -> bool:
 def _patch_lumina(model_patcher, diff_model, settings=None):
     """Set up tiling for Lumina/NextDiT models.
 
-    Uses latent wrapping only (no K/V injection). Lumina's multiplicative
-    RoPE makes K/V injection counterproductive — the correct rotation gives
-    injected K/V too strong an attention signal, amplifying noise at boundaries.
-    Latent wrapping alone provides sufficient toroidal context.
+    Uses latent wrapping (model function wrapper) plus a double_block waste
+    token reset patch. No K/V injection — Lumina's multiplicative RoPE makes
+    it counterproductive.
+
+    The waste patch resets margin/waste tokens to their source content after
+    each transformer block, preventing garbage accumulation from polluting
+    attention for working-area patches.
     """
     wrapper = _create_lumina_wrapper(settings)
     model_patcher.set_model_unet_function_wrapper(wrapper)
+
+    if settings is not None:
+        from .toroidal_attention import LuminaWastePatch
+        waste_patch = LuminaWastePatch(diff_model.patch_size, settings)
+        model_patcher.set_model_double_block_patch(waste_patch)
 
 
 def patch_dit_model(model_patcher, settings: Settings):

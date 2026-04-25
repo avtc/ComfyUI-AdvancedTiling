@@ -449,3 +449,85 @@ class LuminaAttentionWrapper:
             transformer_options=transformer_options,
         )
         return self.attn.out(output)
+
+
+# ---------------------------------------------------------------------------
+# Lumina waste/margin token reset patch
+# ---------------------------------------------------------------------------
+
+class LuminaWastePatch:
+    """double_block patch that replaces waste/margin tokens with their
+    mapped source content after each transformer block, preventing garbage
+    accumulation from polluting attention for working-area patches.
+
+    For Hexagon mode: uses hex_tiling to identify waste positions (outside hex)
+    and their hex source positions.
+    For Rectangular mode: identifies margin positions (outside working rectangle)
+    and maps them to the opposite edge of the working rectangle.
+    """
+
+    def __init__(self, patch_size: int, settings: Settings):
+        self.patch_size = patch_size
+        self.settings = settings
+        self._initialized = False
+        self._waste_idx = None
+        self._waste_source_idx = None
+
+    def _initialize(self, x: torch.Tensor):
+        _, _, H, W = x.shape
+        h_patches = H // self.patch_size
+        w_patches = W // self.patch_size
+
+        waste_indices = []
+        waste_source_indices = []
+
+        if self.settings.mode == "Hexagon":
+            for h in range(h_patches):
+                for w in range(w_patches):
+                    src_w, src_h = hex_tiling(
+                        w, h,
+                        (w_patches, h_patches),
+                        (w_patches, h_patches),
+                        self.settings,
+                    )
+                    if src_w != w or src_h != h:
+                        waste_indices.append(h * w_patches + w)
+                        waste_source_indices.append(src_h * w_patches + src_w)
+        else:  # Rectangular
+            scale = self.settings.scale
+            if scale >= 1.0:
+                work_h, work_w = h_patches, w_patches
+            else:
+                work_h = max(1, round(h_patches * scale))
+                work_w = max(1, round(w_patches * scale))
+            margin_h = (h_patches - work_h) // 2
+            margin_w = (w_patches - work_w) // 2
+
+            for h in range(h_patches):
+                for w in range(w_patches):
+                    is_margin = (
+                        h < margin_h or h >= margin_h + work_h
+                        or w < margin_w or w >= margin_w + work_w
+                    )
+                    if is_margin:
+                        waste_indices.append(h * w_patches + w)
+                        src_h = margin_h + (h - margin_h) % work_h
+                        src_w = margin_w + (w - margin_w) % work_w
+                        waste_source_indices.append(src_h * w_patches + src_w)
+
+        if waste_indices:
+            self._waste_idx = torch.tensor(waste_indices, dtype=torch.long)
+            self._waste_source_idx = torch.tensor(waste_source_indices, dtype=torch.long)
+
+        self._initialized = True
+
+    def __call__(self, data: dict) -> dict:
+        if not self._initialized:
+            self._initialize(data["x"])
+
+        if self._waste_idx is None:
+            return {}
+
+        img = data["img"]
+        img[:, self._waste_idx, :] = img[:, self._waste_source_idx, :]
+        return {"img": img}
