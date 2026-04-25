@@ -86,6 +86,7 @@ def composite_latents(
     center_latent: torch.Tensor,
     neighbor_latents: dict[str, torch.Tensor],
     settings: Settings,
+    rotation_steps: int = 0,
 ) -> torch.Tensor:
     """
     Composite center and neighbor latents into a single latent.
@@ -96,6 +97,7 @@ def composite_latents(
     :param neighbor_latents: Dict mapping direction name ("E", "NE", etc.)
                              to neighbor latent
     :param settings: Tiling settings (rotation only)
+    :param rotation_steps: Rotate direction mapping by N steps clockwise
     :return: Composited latent (same shape as input)
     """
     t0 = time.time()
@@ -111,12 +113,14 @@ def composite_latents(
                 f"shape=({B},{C},{H},{W}), "
                 f"normalize={t1-t0:.3f}s, neighbor_map={t2-t1:.3f}s")
 
+    n = len(NEIGHBOR_DIRECTIONS)
     direction_to_idx = {name: idx for idx, name in enumerate(NEIGHBOR_DIRECTIONS)}
 
     total_pasted = 0
     for direction_name, neighbor_latent in neighbor_latents.items():
         dir_idx = direction_to_idx[direction_name]
-        mask = (neighbor_map == dir_idx)  # [H, W] boolean
+        target_idx = (dir_idx + rotation_steps) % n
+        mask = (neighbor_map == target_idx)  # [H, W] boolean
         count = mask.sum().item()
 
         if count == 0:
@@ -192,6 +196,15 @@ class AdvancedTilingHexInpaint:
                         "tooltip": "When enabled, automatically skips inpainting borders where the neighbor image is identical to the center image. Useful when surrounding tiles share the same terrain type.",
                     },
                 ),
+                "rotate_mapping": (
+                    "INT",
+                    {
+                        "default": 0,
+                        "min": -5,
+                        "max": 5,
+                        "tooltip": "Rotate neighbor image assignments by N steps clockwise. +1: E input → NE region, SE → E. -1: counter-clockwise. Useful when neighbor tiles come from a differently-oriented grid.",
+                    },
+                ),
             },
             "optional": {
                 f"neighbor_{d}": ("IMAGE", {"tooltip": f"{d} neighbor tile image"})
@@ -208,8 +221,14 @@ class AdvancedTilingHexInpaint:
     FUNCTION = "run"
     CATEGORY = "conditioning"
 
-    def run(self, settings, vae, center_image, inpaint_mode, border_width, feather_radius, feather_sides, skip_same_neighbors, **kwargs):
+    def run(self, settings, vae, center_image, inpaint_mode, border_width, feather_radius, feather_sides, skip_same_neighbors, rotate_mapping=0, **kwargs):
         t_start = time.time()
+
+        n = len(NEIGHBOR_DIRECTIONS)
+        rotation_steps = rotate_mapping % n
+
+        if rotation_steps:
+            logger.info(f"[HexInpaint] Mapping rotated by {rotation_steps} steps CW")
 
         # 1. VAE-encode center image
         t0 = time.time()
@@ -220,20 +239,24 @@ class AdvancedTilingHexInpaint:
 
         # 2. VAE-encode provided neighbor images
         neighbor_latents = {}
+        neighbor_images = {}
         for direction in NEIGHBOR_DIRECTIONS:
             key = f"neighbor_{direction}"
             if key in kwargs and kwargs[key] is not None:
                 t_n = time.time()
                 neighbor_latents[direction] = vae.encode(kwargs[key])
+                neighbor_images[direction] = kwargs[key]
                 logger.info(f"[HexInpaint] VAE encode {direction}: "
                              f"{time.time()-t_n:.3f}s, latent={neighbor_latents[direction].shape}")
 
         logger.info(f"[HexInpaint] Neighbors provided: {list(neighbor_latents.keys())}")
 
-        # 3. Composite latents
+        # 3. Composite latents with rotated direction mapping
         if neighbor_latents:
             t2 = time.time()
-            composited = composite_latents(center_latent, neighbor_latents, settings)
+            composited = composite_latents(
+                center_latent, neighbor_latents, settings, rotation_steps
+            )
             logger.info(f"[HexInpaint] Composite: {time.time()-t2:.3f}s")
         else:
             composited = center_latent
@@ -242,12 +265,11 @@ class AdvancedTilingHexInpaint:
         # 4. Determine active directions (have non-matching neighbor)
         active_directions = set()
         for i, direction in enumerate(NEIGHBOR_DIRECTIONS):
-            key = f"neighbor_{direction}"
-            if key in kwargs and kwargs[key] is not None:
-                if skip_same_neighbors and torch.allclose(center_image, kwargs[key], atol=1e-6):
+            if direction in neighbor_images:
+                if skip_same_neighbors and torch.allclose(center_image, neighbor_images[direction], atol=1e-6):
                     logger.info(f"[HexInpaint] Auto-skip {direction}: matches center")
                 else:
-                    active_directions.add(i)
+                    active_directions.add((i + rotation_steps) % n)
 
         if active_directions:
             logger.info(f"[HexInpaint] Active: "
