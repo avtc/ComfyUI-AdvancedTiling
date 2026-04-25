@@ -110,11 +110,12 @@ def _create_content_wrapper(settings: Settings):
 
 
 def _create_lumina_wrapper(settings: Settings = None):
-    """Model wrapper for Lumina: stores image shape in transformer_options
-    and does latent content wrapping.
+    """Model wrapper for Lumina: applies latent content wrapping on each
+    denoising step.
 
-    Combined with toroidal attention, the wrapping provides seamless infinite
-    tiling by giving the model spatial context at the edges.
+    The wrapping provides seamless infinite tiling by filling margin/waste
+    positions with content from opposite edges, giving the model spatial
+    context at the boundaries.
 
     For Hexagon mode: fills waste positions with hex source content.
     For Rectangular mode: fills margins with content from opposite edges of
@@ -128,20 +129,15 @@ def _create_lumina_wrapper(settings: Settings = None):
     _mapping_cache = {}
 
     def wrapper(apply_model, args):
-        x = args["input"]
-        is_5d = x.ndim == 5
-
-        if is_5d:
-            _, _, _, H, W = x.shape
-        else:
-            _, _, H, W = x.shape
-
-        c = dict(args["c"])
-        to = c.get("transformer_options", {})
-        to["tiling_img_shape"] = (H, W)
-        c["transformer_options"] = to
-
         if do_wrapping:
+            x = args["input"]
+            is_5d = x.ndim == 5
+
+            if is_5d:
+                _, _, _, H, W = x.shape
+            else:
+                _, _, H, W = x.shape
+
             if settings.mode == "Hexagon":
                 cache_key = (W, H, hash(settings))
                 if cache_key not in _mapping_cache:
@@ -167,7 +163,7 @@ def _create_lumina_wrapper(settings: Settings = None):
                 else:
                     x[:, :, mapping[1], mapping[0]] = x[:, :, mapping[3], mapping[2]]
 
-        return apply_model(args["input"], args["timestep"], **c)
+        return apply_model(args["input"], args["timestep"], **args["c"])
 
     return wrapper
 
@@ -177,24 +173,14 @@ def _is_lumina(diff_model) -> bool:
     return hasattr(diff_model, 'rope_embedder') and not hasattr(diff_model, 'pe_embedder')
 
 
-def _patch_lumina_attention(model_patcher, diff_model, settings=None):
-    """Apply attention-level K/V injection for Lumina/NextDiT models.
+def _patch_lumina(model_patcher, diff_model, settings=None):
+    """Set up tiling for Lumina/NextDiT models.
 
-    Wraps each JointAttention.forward() in the main layers to inject boundary
-    K/V with synthetic RoPE position encodings.  The wrapper is a no-op unless
-    ``transformer_options["tiling_img_shape"]`` is set (by the model wrapper).
+    Uses latent wrapping only (no K/V injection). Lumina's multiplicative
+    RoPE makes K/V injection counterproductive — the correct rotation gives
+    injected K/V too strong an attention signal, amplifying noise at boundaries.
+    Latent wrapping alone provides sufficient toroidal context.
     """
-    from .toroidal_attention import LuminaAttentionWrapper
-
-    rope_embedder = diff_model.rope_embedder
-    patch_size = diff_model.patch_size
-    pad_tokens_multiple = getattr(diff_model, 'pad_tokens_multiple', None)
-
-    for layer in diff_model.layers:
-        LuminaAttentionWrapper(
-            layer.attention, rope_embedder, patch_size, pad_tokens_multiple, settings,
-        )
-
     wrapper = _create_lumina_wrapper(settings)
     model_patcher.set_model_unet_function_wrapper(wrapper)
 
@@ -203,12 +189,9 @@ def patch_dit_model(model_patcher, settings: Settings):
     """
     Apply tiling to a DiT model.
 
-    Flux-style models (pe_embedder): attn1_patch for K/V injection.
-    Lumina/NextDiT models (rope_embedder): JointAttention forward wrapper
-    for K/V injection with synthetic RoPE.
-
-    Both modes apply toroidal attention (K/V injection) combined with latent
-    wrapping (filling margins/waste with opposite-edge content on each step).
+    Flux-style models (pe_embedder): attn1_patch for K/V injection + latent wrapping.
+    Lumina/NextDiT models (rope_embedder): latent wrapping only (K/V injection
+    causes boundary noise with multiplicative RoPE).
 
     For Hexagon mode: uses hex coordinate mapping for waste positions.
     For Rectangular mode: uses scale-based margins centered in the latent.
@@ -220,7 +203,7 @@ def patch_dit_model(model_patcher, settings: Settings):
 
     if settings.mode == "Hexagon":
         if _is_lumina(diff_model):
-            _patch_lumina_attention(model_patcher, diff_model, settings)
+            _patch_lumina(model_patcher, diff_model, settings)
 
         elif hasattr(diff_model, 'pe_embedder'):
             from .toroidal_attention import HexToroidalAttentionPatch
@@ -239,7 +222,7 @@ def patch_dit_model(model_patcher, settings: Settings):
 
     elif settings.mode == "Rectangular":
         if _is_lumina(diff_model):
-            _patch_lumina_attention(model_patcher, diff_model, settings)
+            _patch_lumina(model_patcher, diff_model, settings)
 
         elif hasattr(diff_model, 'pe_embedder'):
             from .toroidal_attention import RectToroidalAttentionPatch
