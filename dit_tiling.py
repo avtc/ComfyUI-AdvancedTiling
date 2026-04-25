@@ -1,18 +1,24 @@
 """
 DiT model tiling via toroidal attention and latent wrapping.
 
+Applies toroidal attention (K/V injection at boundary patches) combined with
+latent wrapping (filling margin/waste positions with content from opposite edges
+on each denoising step). The combination provides seamless infinite tiling:
+- Toroidal attention makes boundary patches attend to opposite-edge content
+- Latent wrapping provides spatial context at the edges for the model
+
 For Hexagon mode:
-- Toroidal attention: injects wrapped-neighbor K/V entries into every attention
-  layer, making boundary patches structurally "see" opposite-edge content as
-  spatially adjacent.
-- Latent wrapping: copies source content to waste positions in the input latent
-  on each denoising step (for KSampler preview).
+- Toroidal attention + latent wrapping using hex coordinate mapping
+- Waste positions (outside hex) filled with hex source content
 
 For Rectangular mode:
-- Toroidal attention: injects wrapped K/V entries from opposite edges (right<->left,
-  top<->bottom).
+- Toroidal attention + latent wrapping using scale-based margins
+- The working rectangle is centered in the latent with margins on all sides
+- Margin positions filled with content from opposite edges of working rectangle
+- VAE decoder crops output to the working rectangle
 """
 
+import math
 import torch
 import torch.nn as nn
 from torch.nn import Conv2d
@@ -25,13 +31,36 @@ def _has_conv2d(model: nn.Module) -> bool:
     return any(isinstance(m, Conv2d) for m in model.modules())
 
 
+def _compute_working_size(W, H, settings):
+    """Compute working area dimensions from scale, centered in the latent.
+
+    :param W: Latent width in pixels
+    :param H: Latent height in pixels
+    :param settings: Tiling settings with scale
+    :return: (work_W, work_H, margin_W, margin_H)
+    """
+    scale = settings.scale
+    if scale >= 1.0:
+        return W, H, 0, 0
+
+    work_W = max(1, round(W * scale))
+    work_H = max(1, round(H * scale))
+    margin_W = (W - work_W) // 2
+    margin_H = (H - work_H) // 2
+    return work_W, work_H, margin_W, margin_H
+
+
 def _create_content_wrapper(settings: Settings):
     """
-    Create a model function wrapper that copies source content to waste
-    positions in the latent on each denoising step. This makes the KSampler
-    preview show wrapped content instead of noise.
+    Create a model function wrapper that fills margin/waste positions with
+    content from opposite edges on each denoising step.
 
-    Only used for Hexagon mode.
+    Combined with toroidal attention, this provides seamless infinite tiling
+    by giving the model spatial context at the edges.
+
+    For Hexagon mode: fills waste positions (outside hex) with hex source content.
+    For Rectangular mode: fills margins with content from opposite edges of the
+    working rectangle (centered in the latent).
 
     :param settings: Tiling settings
     """
@@ -48,53 +77,7 @@ def _create_content_wrapper(settings: Settings):
         else:
             _, _, H, W = x.shape
 
-        cache_key = (W, H, hash(settings))
-        if cache_key not in _mapping_cache:
-            _mapping_cache[cache_key] = calculate_mapping(
-                (W, H), (W, H), settings
-            )
-        mapping = _mapping_cache[cache_key]
-
-        # Content replacement in latent
-        if is_5d:
-            x[:, :, :, mapping[1], mapping[0]] = x[:, :, :, mapping[3], mapping[2]]
-        else:
-            x[:, :, mapping[1], mapping[0]] = x[:, :, mapping[3], mapping[2]]
-
-        return apply_model(args["input"], args["timestep"], **args["c"])
-
-    return wrapper
-
-
-def _create_lumina_wrapper(settings: Settings = None):
-    """Model wrapper for Lumina: stores image shape in transformer_options
-    and optionally does latent content wrapping for Hexagon mode."""
-    from .advanced_tiling import calculate_mapping
-
-    do_wrapping = settings is not None
-    _mapping_cache = {}
-
-    _wrapper_called = [False]
-
-    def wrapper(apply_model, args):
-        x = args["input"]
-        is_5d = x.ndim == 5
-
-        if is_5d:
-            _, _, _, H, W = x.shape
-        else:
-            _, _, H, W = x.shape
-
-        if not _wrapper_called[0]:
-            _wrapper_called[0] = True
-            print(f"[ToroidalDebug] WRAPPER: H={H}, W={W}, do_wrapping={do_wrapping}")
-
-        c = dict(args["c"])
-        to = c.get("transformer_options", {})
-        to["tiling_img_shape"] = (H, W)
-        c["transformer_options"] = to
-
-        if do_wrapping:
+        if settings.mode == "Hexagon":
             cache_key = (W, H, hash(settings))
             if cache_key not in _mapping_cache:
                 _mapping_cache[cache_key] = calculate_mapping(
@@ -106,6 +89,83 @@ def _create_lumina_wrapper(settings: Settings = None):
                 x[:, :, :, mapping[1], mapping[0]] = x[:, :, :, mapping[3], mapping[2]]
             else:
                 x[:, :, mapping[1], mapping[0]] = x[:, :, mapping[3], mapping[2]]
+        else:
+            work_W, work_H, margin_W, margin_H = _compute_working_size(W, H, settings)
+            if margin_W > 0 or margin_H > 0:
+                cache_key = (W, H, settings.scale)
+                if cache_key not in _mapping_cache:
+                    _mapping_cache[cache_key] = calculate_mapping(
+                        (work_W, work_H), (W, H), settings
+                    )
+                mapping = _mapping_cache[cache_key]
+
+                if is_5d:
+                    x[:, :, :, mapping[1], mapping[0]] = x[:, :, :, mapping[3], mapping[2]]
+                else:
+                    x[:, :, mapping[1], mapping[0]] = x[:, :, mapping[3], mapping[2]]
+
+        return apply_model(args["input"], args["timestep"], **args["c"])
+
+    return wrapper
+
+
+def _create_lumina_wrapper(settings: Settings = None):
+    """Model wrapper for Lumina: stores image shape in transformer_options
+    and does latent content wrapping.
+
+    Combined with toroidal attention, the wrapping provides seamless infinite
+    tiling by giving the model spatial context at the edges.
+
+    For Hexagon mode: fills waste positions with hex source content.
+    For Rectangular mode: fills margins with content from opposite edges of
+    the working rectangle (centered in the latent).
+
+    :param settings: Tiling settings (None disables wrapping)
+    """
+    from .advanced_tiling import calculate_mapping
+
+    do_wrapping = settings is not None
+    _mapping_cache = {}
+
+    def wrapper(apply_model, args):
+        x = args["input"]
+        is_5d = x.ndim == 5
+
+        if is_5d:
+            _, _, _, H, W = x.shape
+        else:
+            _, _, H, W = x.shape
+
+        c = dict(args["c"])
+        to = c.get("transformer_options", {})
+        to["tiling_img_shape"] = (H, W)
+        c["transformer_options"] = to
+
+        if do_wrapping:
+            if settings.mode == "Hexagon":
+                cache_key = (W, H, hash(settings))
+                if cache_key not in _mapping_cache:
+                    _mapping_cache[cache_key] = calculate_mapping(
+                        (W, H), (W, H), settings
+                    )
+                mapping = _mapping_cache[cache_key]
+            else:
+                work_W, work_H, margin_W, margin_H = _compute_working_size(W, H, settings)
+                if margin_W > 0 or margin_H > 0:
+                    cache_key = (W, H, settings.scale)
+                    if cache_key not in _mapping_cache:
+                        _mapping_cache[cache_key] = calculate_mapping(
+                            (work_W, work_H), (W, H), settings
+                        )
+                    mapping = _mapping_cache[cache_key]
+                else:
+                    mapping = None
+
+            if mapping is not None:
+                if is_5d:
+                    x[:, :, :, mapping[1], mapping[0]] = x[:, :, :, mapping[3], mapping[2]]
+                else:
+                    x[:, :, mapping[1], mapping[0]] = x[:, :, mapping[3], mapping[2]]
 
         return apply_model(args["input"], args["timestep"], **c)
 
@@ -145,10 +205,13 @@ def patch_dit_model(model_patcher, settings: Settings):
 
     Flux-style models (pe_embedder): attn1_patch for K/V injection.
     Lumina/NextDiT models (rope_embedder): JointAttention forward wrapper
-    for K/V injection with synthetic RoPE via shift composition.
+    for K/V injection with synthetic RoPE.
 
-    For Hexagon mode: applies toroidal attention + latent content wrapping.
-    For Rectangular mode: applies toroidal attention only.
+    Both modes apply toroidal attention (K/V injection) combined with latent
+    wrapping (filling margins/waste with opposite-edge content on each step).
+
+    For Hexagon mode: uses hex coordinate mapping for waste positions.
+    For Rectangular mode: uses scale-based margins centered in the latent.
 
     :param model_patcher: ComfyUI ModelPatcher instance
     :param settings: Tiling settings
@@ -158,11 +221,6 @@ def patch_dit_model(model_patcher, settings: Settings):
     if settings.mode == "Hexagon":
         if _is_lumina(diff_model):
             _patch_lumina_attention(model_patcher, diff_model, settings)
-
-            # Waste token replacement for hex mode
-            from .toroidal_attention import LuminaWastePatch
-            waste_patch = LuminaWastePatch(diff_model.patch_size, settings)
-            model_patcher.set_model_patch(waste_patch, "double_block")
 
         elif hasattr(diff_model, 'pe_embedder'):
             from .toroidal_attention import HexToroidalAttentionPatch
@@ -181,13 +239,16 @@ def patch_dit_model(model_patcher, settings: Settings):
 
     elif settings.mode == "Rectangular":
         if _is_lumina(diff_model):
-            _patch_lumina_attention(model_patcher, diff_model)
+            _patch_lumina_attention(model_patcher, diff_model, settings)
 
         elif hasattr(diff_model, 'pe_embedder'):
             from .toroidal_attention import RectToroidalAttentionPatch
 
-            patch = RectToroidalAttentionPatch(diff_model.pe_embedder)
+            patch = RectToroidalAttentionPatch(diff_model.pe_embedder, scale=settings.scale)
             model_patcher.set_model_attn1_patch(patch)
+
+            wrapper = _create_content_wrapper(settings)
+            model_patcher.set_model_unet_function_wrapper(wrapper)
 
         else:
             raise ValueError(

@@ -109,36 +109,44 @@ _rect_boundary_cache: dict = {}
 def _compute_rect_boundary_pairs(
     h_patches: int,
     w_patches: int,
+    margin_h: int = 0,
+    margin_w: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute rectangular boundary pairs for toroidal wrapping.
 
-    For each patch on the edge of the grid, records the boundary patch index,
-    the wrapped source index from the opposite edge, and the direction offset.
+    For each patch on the edge of the working rectangle (inside the margins),
+    records the boundary patch index, the wrapped source index from the
+    opposite edge of the working rectangle, and the direction offset.
 
-    Cached by (h_patches, w_patches).
+    Cached by (h_patches, w_patches, margin_h, margin_w).
 
-    :param h_patches: Number of patch rows
-    :param w_patches: Number of patch columns
+    :param h_patches: Number of patch rows (full grid)
+    :param w_patches: Number of patch columns (full grid)
+    :param margin_h: Margin rows on each side
+    :param margin_w: Margin columns on each side
     :return: (boundary_idx, source_idx, off_h, off_w) as LongTensors
     """
-    cache_key = (h_patches, w_patches)
+    cache_key = (h_patches, w_patches, margin_h, margin_w)
     if cache_key in _rect_boundary_cache:
         return _rect_boundary_cache[cache_key]
+
+    work_h = h_patches - 2 * margin_h
+    work_w = w_patches - 2 * margin_w
 
     boundary_idx = []
     source_idx = []
     offsets_h = []
     offsets_w = []
 
-    for h in range(h_patches):
-        for w in range(w_patches):
+    for h in range(margin_h, margin_h + work_h):
+        for w in range(margin_w, margin_w + work_w):
             for dh, dw in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
                 nh, nw = h + dh, w + dw
 
-                if nh < 0 or nh >= h_patches or nw < 0 or nw >= w_patches:
-                    wrapped_h = nh % h_patches
-                    wrapped_w = nw % w_patches
+                if nh < margin_h or nh >= margin_h + work_h or nw < margin_w or nw >= margin_w + work_w:
+                    wrapped_h = margin_h + (nh - margin_h) % work_h
+                    wrapped_w = margin_w + (nw - margin_w) % work_w
 
                     boundary_idx.append(h * w_patches + w)
                     source_idx.append(wrapped_h * w_patches + wrapped_w)
@@ -167,22 +175,32 @@ def _compute_rect_boundary_pairs(
 class _BaseToroidalAttentionPatch:
     """Shared logic for hex and rectangular toroidal attention patches."""
 
-    def __init__(self, pe_embedder):
+    def __init__(self, pe_embedder, scale=1.0):
         self.pe_embedder = pe_embedder
+        self.scale = scale
         self._initialized = False
         self._boundary_idx = None
         self._source_idx = None
         self._n_extra = 0
         self._synthetic_pe = None
 
-    def _compute_boundary_pairs(self, h_patches, w_patches):
+    def _compute_boundary_pairs(self, h_patches, w_patches, margin_h=0, margin_w=0):
         raise NotImplementedError
+
+    @staticmethod
+    def _compute_margins(h_patches, w_patches, scale):
+        if scale >= 1.0:
+            return 0, 0
+        work_h = max(1, round(h_patches * scale))
+        work_w = max(1, round(w_patches * scale))
+        return (h_patches - work_h) // 2, (w_patches - work_w) // 2
 
     def _initialize(self, n_img: int):
         h_patches, w_patches = _factorize(n_img)
+        margin_h, margin_w = self._compute_margins(h_patches, w_patches, self.scale)
 
         boundary_idx, source_idx, off_h, off_w = self._compute_boundary_pairs(
-            h_patches, w_patches,
+            h_patches, w_patches, margin_h, margin_w,
         )
 
         self._boundary_idx = boundary_idx
@@ -253,18 +271,21 @@ class HexToroidalAttentionPatch(_BaseToroidalAttentionPatch):
     """attn1_patch for hex tiling: injects wrapped K/V for hex boundary patches."""
 
     def __init__(self, settings: Settings, pe_embedder):
-        super().__init__(pe_embedder)
+        super().__init__(pe_embedder, scale=settings.scale)
         self.settings = settings
 
-    def _compute_boundary_pairs(self, h_patches, w_patches):
+    def _compute_boundary_pairs(self, h_patches, w_patches, margin_h=0, margin_w=0):
         return _compute_hex_boundary_pairs(h_patches, w_patches, self.settings)
 
 
 class RectToroidalAttentionPatch(_BaseToroidalAttentionPatch):
     """attn1_patch for rectangular tiling: injects wrapped K/V from opposite edges."""
 
-    def _compute_boundary_pairs(self, h_patches, w_patches):
-        return _compute_rect_boundary_pairs(h_patches, w_patches)
+    def __init__(self, pe_embedder, scale=1.0):
+        super().__init__(pe_embedder, scale=scale)
+
+    def _compute_boundary_pairs(self, h_patches, w_patches, margin_h=0, margin_w=0):
+        return _compute_rect_boundary_pairs(h_patches, w_patches, margin_h, margin_w)
 
 
 # ---------------------------------------------------------------------------
@@ -277,8 +298,11 @@ class LuminaAttentionWrapper:
     Lumina applies RoPE inside JointAttention.forward(), so there is no
     external attn1_patch hook.  This wrapper intercepts the forward call,
     runs QKV + RoPE normally, then injects extra K/V entries for boundary
-    patches with position-correct synthetic freqs_cis computed via RoPE
-    shift composition:  R(virtual) = R(source) @ R(shift).
+    patches with position-correct synthetic freqs_cis.
+
+    For rectangular mode with scale < 1.0, computes margins so that K/V
+    injection wraps at the working rectangle boundary rather than the full
+    grid edge.
 
     Activated only when ``transformer_options["tiling_img_shape"]`` is set
     (by the model wrapper), so the monkey-patch is a no-op for unrelated
@@ -293,6 +317,7 @@ class LuminaAttentionWrapper:
         self.patch_size = patch_size
         self.pad_tokens_multiple = pad_tokens_multiple
         self.settings = settings
+        self.scale = settings.scale if settings else 1.0
 
         self._initialized = False
         self._source_idx = None
@@ -312,8 +337,11 @@ class LuminaAttentionWrapper:
                 h_patches, w_patches, self.settings,
             )
         else:
+            margin_h, margin_w = _BaseToroidalAttentionPatch._compute_margins(
+                h_patches, w_patches, self.scale,
+            )
             b_idx, source_idx, off_h, off_w = _compute_rect_boundary_pairs(
-                h_patches, w_patches,
+                h_patches, w_patches, margin_h, margin_w,
             )
 
         self._source_idx = source_idx
@@ -340,9 +368,6 @@ class LuminaAttentionWrapper:
     def _wrapped_forward(self, x, x_mask, freqs_cis, transformer_options={}):
         img_shape = transformer_options.get("tiling_img_shape")
         if img_shape is None or x_mask is not None:
-            if not hasattr(self, '_debug_logged'):
-                self._debug_logged = True
-                print(f"[ToroidalDebug] SKIP: img_shape={img_shape}, x_mask={'None' if x_mask is None else 'not-None'}")
             return self._original_forward(x, x_mask, freqs_cis, transformer_options)
 
         H, W = img_shape
@@ -351,17 +376,9 @@ class LuminaAttentionWrapper:
 
         if not self._initialized:
             self._initialize(h_patches, w_patches)
-            print(f"[ToroidalDebug] INIT: h={h_patches}, w={w_patches}, n_extra={self._n_extra}, settings={self.settings}")
 
         if self._n_extra == 0:
             return self._original_forward(x, x_mask, freqs_cis, transformer_options)
-
-        if not hasattr(self, '_debug_inject_logged'):
-            self._debug_inject_logged = True
-            n_img = h_patches * w_patches
-            n_img_padded = -(-n_img // self.pad_tokens_multiple) * self.pad_tokens_multiple if self.pad_tokens_multiple else n_img
-            cap_size_0 = freqs_cis.shape[1] - n_img_padded
-            print(f"[ToroidalDebug] INJECT: seq={freqs_cis.shape[1]}, n_img={n_img}, n_img_padded={n_img_padded}, cap_size_0={cap_size_0}, n_extra={self._n_extra}")
 
         from comfy.ldm.flux.math import apply_rope, apply_rope1
         from comfy.ldm.modules.attention import optimized_attention_masked
@@ -432,52 +449,3 @@ class LuminaAttentionWrapper:
             transformer_options=transformer_options,
         )
         return self.attn.out(output)
-
-
-class LuminaWastePatch:
-    """double_block patch that replaces hex waste-position tokens with their
-    mapped source content after each transformer block, preventing them from
-    polluting boundary attention in subsequent layers."""
-
-    def __init__(self, patch_size: int, settings: Settings):
-        self.patch_size = patch_size
-        self.settings = settings
-        self._initialized = False
-        self._waste_idx = None
-        self._waste_source_idx = None
-
-    def _initialize(self, x: torch.Tensor):
-        _, _, H, W = x.shape
-        h_patches = H // self.patch_size
-        w_patches = W // self.patch_size
-
-        waste_indices = []
-        waste_source_indices = []
-        for h in range(h_patches):
-            for w in range(w_patches):
-                src_w, src_h = hex_tiling(
-                    w, h,
-                    (w_patches, h_patches),
-                    (w_patches, h_patches),
-                    self.settings,
-                )
-                if src_w != w or src_h != h:
-                    waste_indices.append(h * w_patches + w)
-                    waste_source_indices.append(src_h * w_patches + src_w)
-
-        if waste_indices:
-            self._waste_idx = torch.tensor(waste_indices, dtype=torch.long)
-            self._waste_source_idx = torch.tensor(waste_source_indices, dtype=torch.long)
-
-        self._initialized = True
-
-    def __call__(self, data: dict) -> dict:
-        if not self._initialized:
-            self._initialize(data["x"])
-
-        if self._waste_idx is None:
-            return {}
-
-        img = data["img"]
-        img[:, self._waste_idx, :] = img[:, self._waste_source_idx, :]
-        return {"img": img}

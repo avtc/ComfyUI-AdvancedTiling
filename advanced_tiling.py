@@ -12,7 +12,7 @@ from torch.nn import Conv2d
 from torch.nn import functional as F
 from torch.nn.modules.utils import _pair
 from .modes import modes, Settings
-from .dit_tiling import patch_dit_model, _has_conv2d
+from .dit_tiling import patch_dit_model, _has_conv2d, _create_content_wrapper
 
 
 @functools.cache
@@ -134,6 +134,13 @@ class AdvancedTilingSettings:
                         "tooltip": "Rotation angle in degrees for the tiling pattern.",
                     },
                 ),
+                "scale": (
+                    "FLOAT",
+                    {
+                        "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01,
+                        "tooltip": "Working area scale relative to latent size. 0 = auto (Hexagon: 1.0, Rectangular: ~0.87 matching hex width ratio). Lower values create larger margins for better wrapping at the cost of output size.",
+                    },
+                ),
             },
         }
 
@@ -141,12 +148,17 @@ class AdvancedTilingSettings:
     RETURN_NAMES = ("SETTINGS",)
     FUNCTION = "run"
 
-    def run(self, mode, rotation):
+    def run(self, mode, rotation, scale):
         """
         Creates tiling settings from node inputs
         """
 
-        settings = Settings(mode, rotation)
+        import math
+
+        if scale == 0.0:
+            scale = 1.0 if mode == "Hexagon" else math.sqrt(3) / 2
+
+        settings = Settings(mode, rotation, scale)
 
         return (settings,)
 
@@ -184,6 +196,10 @@ class AdvancedTiling:
 
         if _has_conv2d(model_copy.model.diffusion_model):
             patch_model(model_copy.model, settings)
+
+            if settings.mode == "Rectangular" and settings.scale < 1.0:
+                wrapper = _create_content_wrapper(settings)
+                model_copy.set_model_unet_function_wrapper(wrapper)
         else:
             patch_dit_model(model_copy, settings)
 
@@ -192,7 +208,7 @@ class AdvancedTiling:
 
 class AdvancedTilingVAEDecode:
     """
-    Input types for the node
+    Decode latents with tiling-aware VAE and optionally crop to working area.
     """
 
     # pylint: disable=invalid-name
@@ -212,7 +228,8 @@ class AdvancedTilingVAEDecode:
             }
         }
 
-    RETURN_TYPES = ("IMAGE",)
+    RETURN_TYPES = ("IMAGE", "INT", "INT")
+    RETURN_NAMES = ("IMAGE", "crop_width", "crop_height")
     FUNCTION = "run"
     CATEGORY = "latent"
 
@@ -221,26 +238,47 @@ class AdvancedTilingVAEDecode:
         Decode latents to image with tiling
         Optionally crop the image based on tiling settings
 
+        For Hexagon mode: applies alpha mask for hex-shaped cropping.
+        For Rectangular mode with scale < 1.0: crops the latent to the centered
+        working rectangle before VAE decoding, so the VAE's Conv2d wrapping
+        operates at the working rectangle boundary.
+
         :param settings: Tiling settings
         :param samples: Latent samples
         :param vae: VAE model
         :param crop: Whether to crop the image
-        :return: Final image
+        :return: (image, crop_width, crop_height)
         """
+
+        from .dit_tiling import _compute_working_size
 
         vae_copy = copy.deepcopy(vae)
         # Enable tiling
         patch_model(vae_copy.first_stage_model, settings)
+
+        latent = samples["samples"]
+
+        # For rectangular mode with scale < 1.0, crop latent to working rectangle
+        # before VAE decoding so Conv2d wrapping operates at working rect boundary
+        if crop and settings.mode == "Rectangular" and settings.scale < 1.0:
+            _, _, H_lat, W_lat = latent.shape
+            work_W, work_H, margin_W, margin_H = _compute_working_size(W_lat, H_lat, settings)
+            latent = latent[:, :, margin_H:margin_H + work_H, margin_W:margin_W + work_W]
+
         # Decode latents to image
-        image = vae_copy.decode(samples["samples"])
+        image = vae_copy.decode(latent)
 
         # WanVAE returns 5D (B, T, H, W, C), standard VAE returns 4D (B, H, W, C)
         if image.ndim == 5:
             image = image.squeeze(1)
 
-        if crop:
-            # Crop image based on tiling settings
-            mask = create_crop_mask(image.shape[2], image.shape[1], settings)
-            image = torch.cat((image, mask.to(device=image.device)), dim=3)
+        crop_w = image.shape[2]
+        crop_h = image.shape[1]
 
-        return (image,)
+        if crop:
+            if settings.mode == "Hexagon":
+                # Crop image based on tiling settings (hex mask as alpha)
+                mask = create_crop_mask(image.shape[2], image.shape[1], settings)
+                image = torch.cat((image, mask.to(device=image.device)), dim=3)
+
+        return (image, crop_w, crop_h)
