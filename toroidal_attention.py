@@ -293,14 +293,17 @@ class RectToroidalAttentionPatch(_BaseToroidalAttentionPatch):
 # ---------------------------------------------------------------------------
 
 class LuminaWastePatch:
-    """double_block patch that replaces waste/margin tokens with their
-    mapped source content after each transformer block, preventing garbage
-    accumulation from polluting attention for working-area patches.
+    """double_block patch for Lumina/Z-Image models.
 
-    For Hexagon mode: uses hex_tiling to identify waste positions (outside hex)
-    and their hex source positions.
-    For Rectangular mode: identifies margin positions (outside working rectangle)
-    and maps them to the opposite edge of the working rectangle.
+    After each transformer block:
+    1. Resets waste tokens to their source content (prevents garbage accumulation)
+    2. If rope_fix: replaces freqs_cis at waste positions with source positions'
+       freqs_cis (fixes position-content mismatch for RoPE)
+    3. If timestep_decay: scales the waste reset by a timestep-dependent factor
+       (full influence early, reduced late)
+
+    freqs_cis is modified in-place on the shared tensor, so subsequent layers
+    see the corrected position encoding.
     """
 
     def __init__(self, patch_size: int, settings: Settings):
@@ -358,6 +361,18 @@ class LuminaWastePatch:
 
         self._initialized = True
 
+    def _get_decay_factor(self) -> float:
+        """Compute timestep decay factor: 1.0 early, 0.0 late."""
+        t = getattr(self.settings, '_current_timestep', None)
+        if t is None:
+            return 1.0
+        # t is typically a tensor; get scalar value
+        if isinstance(t, torch.Tensor):
+            t = t.float().mean().item()
+        # Normalize: assume typical range ~0-1000
+        # Clamp to [0, 1] where 1 = start of denoising, 0 = end
+        return max(0.0, min(1.0, t / 1000.0))
+
     def __call__(self, data: dict) -> dict:
         if not self._initialized:
             self._initialize(data["x"])
@@ -365,6 +380,36 @@ class LuminaWastePatch:
         if self._waste_idx is None:
             return {}
 
+        result = {}
+
         img = data["img"]
-        img[:, self._waste_idx, :] = img[:, self._waste_source_idx, :]
-        return {"img": img}
+        waste_idx = self._waste_idx.to(img.device)
+        source_idx = self._waste_source_idx.to(img.device)
+
+        # Waste token reset (with optional timestep decay)
+        if self.settings.timestep_decay:
+            decay = self._get_decay_factor()
+            source_vals = img[:, source_idx, :]
+            # Blend: full source at decay=1, original waste at decay=0
+            img[:, waste_idx, :] = img[:, waste_idx, :] * (1 - decay) + source_vals * decay
+        else:
+            img[:, waste_idx, :] = img[:, source_idx, :]
+
+        result["img"] = img
+
+        # RoPE fix: replace freqs_cis at waste positions with source positions
+        if self.settings.rope_fix:
+            pe = data["pe"]
+            if pe is not None:
+                # pe shape: [batch, head_dim, n_img_tokens] (ComfyUI Lumina format)
+                # or [batch, n_img_tokens, head_dim] (Z-Image format)
+                # Modify in-place so subsequent layers see the correction
+                if pe.shape[-1] > 64:
+                    # ComfyUI format: [batch, head_dim, seq_len] — last dim is tokens
+                    pe[..., waste_idx] = pe[..., source_idx]
+                else:
+                    # Z-Image format: [batch, seq_len, head_dim] — second dim is tokens
+                    pe[:, waste_idx, :] = pe[:, source_idx, :]
+                result["pe"] = pe
+
+        return result
