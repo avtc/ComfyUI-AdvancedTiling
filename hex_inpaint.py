@@ -119,7 +119,7 @@ def composite_latents(
     total_pasted = 0
     for direction_name, neighbor_latent in neighbor_latents.items():
         dir_idx = direction_to_idx[direction_name]
-        target_idx = (dir_idx + rotation_steps) % n
+        target_idx = (dir_idx - rotation_steps) % n
         mask = (neighbor_map == target_idx)  # [H, W] boolean
         count = mask.sum().item()
 
@@ -202,7 +202,7 @@ class AdvancedTilingHexInpaint:
                         "default": 0,
                         "min": -5,
                         "max": 5,
-                        "tooltip": "Rotate neighbor image assignments by N steps clockwise. +1: E input → NE region, SE → E. -1: counter-clockwise. Useful when neighbor tiles come from a differently-oriented grid.",
+                        "tooltip": "Rotate neighbor image assignments by N steps clockwise. +1: E input → SE region, NE → E. -1: counter-clockwise. Useful when neighbor tiles come from a differently-oriented grid.",
                     },
                 ),
             },
@@ -269,7 +269,7 @@ class AdvancedTilingHexInpaint:
                 if skip_same_neighbors and torch.allclose(center_image, neighbor_images[direction], atol=1e-6):
                     logger.info(f"[HexInpaint] Auto-skip {direction}: matches center")
                 else:
-                    active_directions.add((i + rotation_steps) % n)
+                    active_directions.add((i - rotation_steps) % n)
 
         if active_directions:
             logger.info(f"[HexInpaint] Active: "
