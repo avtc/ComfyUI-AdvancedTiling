@@ -197,13 +197,15 @@ def _patch_lumina(model_patcher, diff_model, settings=None):
         from comfy.ldm.lumina.model import JointAttention
         from .toroidal_attention import LuminaAttentionWrapper, LuminaWastePatch
 
-        # Patch all JointAttention modules for position correction
-        for module in diff_model.modules():
-            if isinstance(module, JointAttention):
-                LuminaAttentionWrapper(
-                    module, diff_model.patch_size,
-                    diff_model.pad_tokens_multiple, settings,
-                )
+        # Only patch JointAttention in image transformer layers,
+        # not text encoder layers (which also use JointAttention)
+        for layer in diff_model.layers:
+            for module in layer.modules():
+                if isinstance(module, JointAttention):
+                    LuminaAttentionWrapper(
+                        module, diff_model.patch_size,
+                        diff_model.pad_tokens_multiple, settings,
+                    )
 
         # Reset waste tokens after each block
         waste_patch = LuminaWastePatch(diff_model.patch_size, settings)
