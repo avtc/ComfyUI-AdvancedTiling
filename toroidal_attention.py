@@ -532,9 +532,6 @@ class LuminaKVInjectionWrapper:
 
     def __init__(self, attn_module, rope_embedder, patch_size, pad_tokens_multiple, settings):
         self.attn = attn_module
-        self.rope_embedder = rope_embedder
-        self.axes_dim = list(rope_embedder.axes_dim)
-        self.theta = rope_embedder.theta
         self.patch_size = patch_size
         self.pad_tokens_multiple = pad_tokens_multiple
         self.settings = settings
@@ -544,14 +541,15 @@ class LuminaKVInjectionWrapper:
         self._source_idx = None
         self._n_extra = 0
         self._n_img = 0
-        self._virtual_h = None
-        self._virtual_w = None
+        self._virtual_idx = None
 
         self._original_forward = attn_module.forward
         attn_module.forward = self._wrapped_forward
 
     def _initialize(self, h_patches, w_patches):
         self._n_img = h_patches * w_patches
+        self._h_patches = h_patches
+        self._w_patches = w_patches
 
         if self.settings.mode == "Hexagon":
             boundary_idx, source_idx, off_h, off_w = _compute_hex_boundary_pairs(
@@ -577,10 +575,11 @@ class LuminaKVInjectionWrapper:
         if self._n_extra > 0:
             boundary_h = boundary_idx // w_patches
             boundary_w = boundary_idx % w_patches
-            virtual_h = (boundary_h + off_h).float()
-            virtual_w = (boundary_w + off_w).float()
-            self._virtual_h = virtual_h.unsqueeze(0)  # (1, n_extra)
-            self._virtual_w = virtual_w.unsqueeze(0)  # (1, n_extra)
+            # Virtual adjacent position: one step beyond boundary (toroidal wrap)
+            virtual_h = (boundary_h + off_h) % h_patches
+            virtual_w = (boundary_w + off_w) % w_patches
+            # Linear index into the image token grid
+            self._virtual_idx = virtual_h * w_patches + virtual_w  # (n_extra,)
 
         self._initialized = True
 
@@ -592,32 +591,15 @@ class LuminaKVInjectionWrapper:
             n_img_padded = n_img
         return freqs_cis.shape[1] - n_img_padded
 
-    def _compute_synthetic_freqs(self, freqs_cis, cap_size):
-        """Generate synthetic freqs_cis for virtual adjacent positions.
+    def _lookup_virtual_freqs(self, freqs_cis, cap_size):
+        """Look up actual freqs_cis for virtual adjacent positions.
 
-        Copies time-axis freqs from boundary tokens (correct start_t),
-        generates spatial freqs using rope() for virtual positions.
+        Instead of generating synthetic freqs with rope(), directly indexes
+        into the model's own freqs_cis tensor at the virtual positions.
+        This guarantees exact match with what the model expects.
         """
-        from comfy.ldm.flux.math import rope as rope_fn
-
-        boundary_global = self._boundary_idx.to(freqs_cis.device) + cap_size
-        boundary_freqs = freqs_cis[:, boundary_global, :, :, :, :]
-
-        time_pairs = self.axes_dim[0] // 2
-        h_pairs = self.axes_dim[1] // 2
-        w_pairs = self.axes_dim[2] // 2
-
-        virtual_h = self._virtual_h.to(device=freqs_cis.device)
-        virtual_w = self._virtual_w.to(device=freqs_cis.device)
-
-        syn_h = rope_fn(virtual_h, self.axes_dim[1], self.theta)
-        syn_w = rope_fn(virtual_w, self.axes_dim[2], self.theta)
-
-        syn_freqs = boundary_freqs.clone()
-        syn_freqs[:, :, :, time_pairs:time_pairs + h_pairs, :, :] = syn_h.unsqueeze(2).to(syn_freqs)
-        syn_freqs[:, :, :, time_pairs + h_pairs:, :, :] = syn_w.unsqueeze(2).to(syn_freqs)
-
-        return syn_freqs
+        virtual_global = self._virtual_idx.to(freqs_cis.device) + cap_size
+        return freqs_cis[:, virtual_global, :, :, :, :]
 
     _fwd_call_count = 0
 
@@ -683,7 +665,7 @@ class LuminaKVInjectionWrapper:
         xk = apply_rope1(xk, freqs_cis)
 
         # Apply RoPE to extra K using synthetic freqs
-        syn_freqs = self._compute_synthetic_freqs(freqs_cis, cap_size)
+        syn_freqs = self._lookup_virtual_freqs(freqs_cis, cap_size)
         extra_k = apply_rope1(extra_k, syn_freqs)
 
         # Concatenate original + extra K/V
