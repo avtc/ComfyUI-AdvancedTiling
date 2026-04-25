@@ -284,9 +284,13 @@ class AdvancedTilingVAEDecode:
             _, _, H_lat, W_lat = latent.shape
 
         # For rectangular mode with scale < 1.0, crop latent to working rectangle
-        # before VAE decoding so Conv2d wrapping operates at working rect boundary
+        # before VAE decoding so Conv2d wrapping operates at working rect boundary.
+        # Use patch-aligned dimensions for consistency with the model wrapper.
         if crop and settings.mode == "Rectangular" and settings.scale < 1.0:
-            work_W, work_H, margin_W, margin_H = _compute_working_size(W_lat, H_lat, settings)
+            patch_size = getattr(settings, '_patch_size', 1)
+            work_W, work_H, margin_W, margin_H = _compute_working_size(
+                W_lat, H_lat, settings, patch_size=patch_size,
+            )
             if is_5d:
                 latent = latent[:, :, :, margin_H:margin_H + work_H, margin_W:margin_W + work_W]
             else:

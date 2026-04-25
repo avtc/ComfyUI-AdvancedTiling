@@ -500,6 +500,18 @@ class LuminaWastePatch:
             self._waste_idx = torch.tensor(waste_indices, dtype=torch.long)
             self._waste_source_idx = torch.tensor(waste_source_indices, dtype=torch.long)
 
+        if self.settings.mode == "Hexagon":
+            print(f"[TILING-DEBUG] waste-patch init: latent=({W}x{H}), "
+                  f"patches=({w_patches}x{h_patches}), patch_size={self.patch_size}, "
+                  f"mode=Hexagon, waste_tokens={len(waste_indices)}")
+        else:
+            print(f"[TILING-DEBUG] waste-patch init: latent=({W}x{H}), "
+                  f"patches=({w_patches}x{h_patches}), patch_size={self.patch_size}, "
+                  f"scale={self.settings.scale}, "
+                  f"work=({work_w}x{work_h}) patches=({work_w * self.patch_size}x{work_h * self.patch_size}) px, "
+                  f"margin=({margin_w}x{margin_h}) patches=({margin_w * self.patch_size}x{margin_h * self.patch_size}) px, "
+                  f"waste_tokens={len(waste_indices)}")
+
         self._initialized = True
 
     def __call__(self, data: dict) -> dict:

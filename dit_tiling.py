@@ -31,17 +31,33 @@ def _has_conv2d(model: nn.Module) -> bool:
     return any(isinstance(m, Conv2d) for m in model.modules())
 
 
-def _compute_working_size(W, H, settings):
+def _compute_working_size(W, H, settings, patch_size=1):
     """Compute working area dimensions from scale, centered in the latent.
+
+    When patch_size > 1, computes at the patch level and converts to pixel
+    coordinates, ensuring alignment with patch boundaries. This prevents
+    misalignment between pixel-level latent wrapping and patch-level operations
+    (waste token reset, attention).
 
     :param W: Latent width in pixels
     :param H: Latent height in pixels
     :param settings: Tiling settings with scale
-    :return: (work_W, work_H, margin_W, margin_H)
+    :param patch_size: Model patch size (1 = no alignment, for UNet/Conv2d)
+    :return: (work_W, work_H, margin_W, margin_H) in pixel coordinates
     """
     scale = settings.scale
     if scale >= 1.0:
         return W, H, 0, 0
+
+    if patch_size > 1:
+        h_patches = H // patch_size
+        w_patches = W // patch_size
+        work_h = max(1, round(h_patches * scale))
+        work_w = max(1, round(w_patches * scale))
+        margin_h = (h_patches - work_h) // 2
+        margin_w = (w_patches - work_w) // 2
+        return (work_w * patch_size, work_h * patch_size,
+                margin_w * patch_size, margin_h * patch_size)
 
     work_W = max(1, round(W * scale))
     work_H = max(1, round(H * scale))
@@ -109,7 +125,7 @@ def _create_content_wrapper(settings: Settings):
     return wrapper
 
 
-def _create_lumina_wrapper(settings: Settings = None):
+def _create_lumina_wrapper(settings: Settings = None, patch_size: int = 1):
     """Model wrapper for Lumina: applies latent content wrapping on each
     denoising step.
 
@@ -118,12 +134,12 @@ def _create_lumina_wrapper(settings: Settings = None):
     context at the boundaries.
 
     :param settings: Tiling settings (None disables wrapping)
+    :param patch_size: Model patch size for aligning working area to patch boundaries
     """
     from .advanced_tiling import calculate_mapping
 
     do_wrapping = settings is not None
     _mapping_cache = {}
-
     _wrapper_call_count = 0
 
     def wrapper(apply_model, args):
@@ -144,9 +160,11 @@ def _create_lumina_wrapper(settings: Settings = None):
                     )
                 mapping = _mapping_cache[cache_key]
             else:
-                work_W, work_H, margin_W, margin_H = _compute_working_size(W, H, settings)
+                work_W, work_H, margin_W, margin_H = _compute_working_size(
+                    W, H, settings, patch_size=patch_size,
+                )
                 if margin_W > 0 or margin_H > 0:
-                    cache_key = (W, H, settings.scale)
+                    cache_key = (W, H, work_W, work_H)
                     if cache_key not in _mapping_cache:
                         _mapping_cache[cache_key] = calculate_mapping(
                             (work_W, work_H), (W, H), settings
@@ -161,17 +179,17 @@ def _create_lumina_wrapper(settings: Settings = None):
                 else:
                     x[:, :, mapping[1], mapping[0]] = x[:, :, mapping[3], mapping[2]]
 
-            # Store image shape for K/V injection wrappers to read
             settings._current_img_shape = (H, W)
 
             nonlocal _wrapper_call_count
             _wrapper_call_count += 1
             if _wrapper_call_count <= 3:
-                print(f"[TILING-DEBUG] wrapper call #{_wrapper_call_count}: "
-                      f"mode={settings.mode}, H={H}, W={W}, scale={settings.scale}, "
-                      f"mapping={'applied' if mapping is not None else 'None'}, "
-                      f"work=({_compute_working_size(W, H, settings)[0]},{_compute_working_size(W, H, settings)[1]}) "
-                      f"margin=({_compute_working_size(W, H, settings)[2]},{_compute_working_size(W, H, settings)[3]})")
+                h_patches = H // patch_size if patch_size > 1 else H
+                w_patches = W // patch_size if patch_size > 1 else W
+                print(f"[TILING-DEBUG] wrapper #{_wrapper_call_count}: "
+                      f"mode={settings.mode}, latent=({W}x{H}), "
+                      f"patches=({w_patches}x{h_patches}), patch_size={patch_size}, "
+                      f"scale={settings.scale}, mapping={'yes' if mapping is not None else 'no'}")
 
         return apply_model(args["input"], args["timestep"], **args["c"])
 
@@ -195,12 +213,15 @@ def _patch_lumina(model_patcher, diff_model, settings=None):
     each transformer block, preventing garbage accumulation from polluting
     attention for working-area patches.
     """
-    print(f"[TILING-DEBUG] _patch_lumina called: settings={settings}, "
-          f"mode={settings.mode if settings else None}, "
+    print(f"[TILING-DEBUG] _patch_lumina called: mode={settings.mode if settings else None}, "
           f"scale={settings.scale if settings else None}, "
+          f"patch_size={diff_model.patch_size}, "
           f"kv_injection={settings.lumina_kv_injection if settings else None}")
 
-    wrapper = _create_lumina_wrapper(settings)
+    patch_size = diff_model.patch_size
+    settings._patch_size = patch_size
+
+    wrapper = _create_lumina_wrapper(settings, patch_size=patch_size)
     model_patcher.set_model_unet_function_wrapper(wrapper)
 
     if settings is not None:
