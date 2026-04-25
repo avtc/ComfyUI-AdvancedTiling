@@ -140,7 +140,6 @@ def _create_lumina_wrapper(settings: Settings = None, patch_size: int = 1):
 
     do_wrapping = settings is not None
     _mapping_cache = {}
-    _wrapper_call_count = 0
 
     def wrapper(apply_model, args):
         if do_wrapping:
@@ -179,17 +178,6 @@ def _create_lumina_wrapper(settings: Settings = None, patch_size: int = 1):
                 else:
                     x[:, :, mapping[1], mapping[0]] = x[:, :, mapping[3], mapping[2]]
 
-            settings._current_img_shape = (H, W)
-
-            nonlocal _wrapper_call_count
-            _wrapper_call_count += 1
-            if _wrapper_call_count <= 3:
-                h_patches = H // patch_size if patch_size > 1 else H
-                w_patches = W // patch_size if patch_size > 1 else W
-                print(f"[TILING-DEBUG] wrapper #{_wrapper_call_count}: "
-                      f"mode={settings.mode}, latent=({W}x{H}), "
-                      f"patches=({w_patches}x{h_patches}), patch_size={patch_size}, "
-                      f"scale={settings.scale}, mapping={'yes' if mapping is not None else 'no'}")
 
         return apply_model(args["input"], args["timestep"], **args["c"])
 
