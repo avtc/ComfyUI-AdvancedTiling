@@ -15,6 +15,41 @@ from .modes import modes, Settings
 from .dit_tiling import patch_dit_model, _has_conv2d, _create_content_wrapper
 
 
+def _hex_remap_batch(centers_x, centers_y, size, wrap_w, wrap_h, settings):
+    """Vectorized hex coordinate remapping for all pixels at once."""
+    import numpy as np
+    from .modes.hex import get_inverse_matrix, get_matrix
+
+    flat_x = np.asarray(centers_x).ravel().astype(np.float64)
+    flat_y = np.asarray(centers_y).ravel().astype(np.float64)
+
+    inv_mat = get_inverse_matrix(settings)
+    mat = get_matrix(settings)
+
+    # pixel_to_hex (batch): inverse matrix multiply + divide by size
+    pts = np.stack([flat_x, flat_y], axis=0)
+    qr = (inv_mat @ pts) / size
+    q, r = qr[0], qr[1]
+    s = -q - r
+
+    # cube_round (vectorized)
+    rq, rr, rs = np.rint(q), np.rint(r), np.rint(s)
+    q_diff, r_diff, s_diff = np.abs(rq - q), np.abs(rr - r), np.abs(rs - s)
+    mask_q = (q_diff > r_diff) & (q_diff > s_diff)
+    mask_r = ~mask_q & (r_diff > s_diff)
+    rq = np.where(mask_q, -rr - rs, rq)
+    rr = np.where(mask_r, -rq - rs, rr)
+
+    # Fractional parts -> hex_to_pixel
+    pixel = size * (mat @ np.stack([q - rq, r - rr], axis=0))
+    new_x = np.rint(pixel[0]).astype(np.int64)
+    new_y = np.rint(pixel[1]).astype(np.int64)
+
+    new_x = (new_x + wrap_w // 2) % wrap_w
+    new_y = (new_y + wrap_h // 2) % wrap_h
+    return new_x, new_y
+
+
 @functools.cache
 def calculate_mapping(
     original_size: tuple[int, int], padded_size: tuple[int, int], settings: Settings
@@ -28,17 +63,48 @@ def calculate_mapping(
     :return: Mapping of pixels
     """
 
-    mapping = []
+    pw, ph = padded_size
+    ow, oh = original_size
+    n_pixels = pw * ph
+
     t0 = time.perf_counter()
-    for y in range(padded_size[1]):
-        for x in range(padded_size[0]):
-            (new_x, new_y) = settings.tiling_fn(
-                x, y, original_size, padded_size, settings
-            )
-            mapping.append([x, y, new_x, new_y])
-    result = list(zip(*mapping))
+
+    if settings.mode == "Rectangular":
+        pad_x = (pw - ow) // 2
+        pad_y = (ph - oh) // 2
+        xs = torch.arange(pw)
+        ys = torch.arange(ph)
+        grid_x, grid_y = torch.meshgrid(xs, ys, indexing='xy')
+        src_x = grid_x.flatten()
+        src_y = grid_y.flatten()
+        new_x = (src_x - pad_x) % ow + pad_x
+        new_y = (src_y - pad_y) % oh + pad_y
+        result = (tuple(src_x.tolist()), tuple(src_y.tolist()),
+                  tuple(new_x.tolist()), tuple(new_y.tolist()))
+
+    elif settings.mode == "Hexagon":
+        import numpy as np
+        size = max(1, round(min(ow, oh) // 2 * settings.scale))
+        cx = np.arange(pw, dtype=np.float64) - pw // 2
+        cy = np.arange(ph, dtype=np.float64) - ph // 2
+        grid_cx, grid_cy = np.meshgrid(cx, cy, indexing='xy')
+        new_x, new_y = _hex_remap_batch(grid_cx, grid_cy, size, pw, ph, settings)
+
+        src_x = np.tile(np.arange(pw, dtype=np.int64), ph)
+        src_y = np.repeat(np.arange(ph, dtype=np.int64), pw)
+        result = (tuple(src_x.tolist()), tuple(src_y.tolist()),
+                  tuple(new_x.tolist()), tuple(new_y.tolist()))
+
+    else:
+        # None mode: identity
+        xs = torch.arange(pw)
+        ys = torch.arange(ph)
+        grid_x, grid_y = torch.meshgrid(xs, ys, indexing='xy')
+        flat_x = tuple(grid_x.flatten().tolist())
+        flat_y = tuple(grid_y.flatten().tolist())
+        result = (flat_x, flat_y, flat_x, flat_y)
+
     elapsed = time.perf_counter() - t0
-    n_pixels = padded_size[0] * padded_size[1]
     print(f"[Tiling] calculate_mapping {padded_size} ({n_pixels} px, {settings.mode}): {elapsed:.3f}s")
     return result
 
@@ -53,18 +119,25 @@ def create_crop_mask(width: int, height: int, settings: Settings):
     :return: Cropped image
     """
 
-    mask = torch.zeros((1, height, width, 1), dtype=torch.float32)
     t0 = time.perf_counter()
-    for y in range(height):
-        for x in range(width):
-            # Calculate new coordinates
-            (new_x, new_y) = settings.tiling_fn(
-                x, y, (width, height), (width, height), settings
-            )
 
-            # If coordinates match, it means we are in the mask
-            if new_x == x and new_y == y:
-                mask[:, y, x] = 1
+    if settings.mode == "Hexagon":
+        import numpy as np
+        size = max(1, round(min(width, height) // 2 * settings.scale))
+        cx = np.arange(width, dtype=np.float64) - width // 2
+        cy = np.arange(height, dtype=np.float64) - height // 2
+        grid_cx, grid_cy = np.meshgrid(cx, cy, indexing='xy')
+        new_x, new_y = _hex_remap_batch(grid_cx, grid_cy, size, width, height, settings)
+
+        src_x = np.tile(np.arange(width, dtype=np.int64), height)
+        src_y = np.repeat(np.arange(height, dtype=np.int64), width)
+        is_identity = torch.from_numpy(((new_x == src_x) & (new_y == src_y)).reshape(height, width))
+        mask = torch.zeros((1, height, width, 1), dtype=torch.float32)
+        mask[0, :, :, 0] = is_identity.float()
+    else:
+        # Rectangular/None: all pixels are in the mask
+        mask = torch.ones((1, height, width, 1), dtype=torch.float32)
+
     elapsed = time.perf_counter() - t0
     print(f"[Tiling] create_crop_mask {width}x{height} ({settings.mode}): {elapsed:.3f}s")
     return mask
