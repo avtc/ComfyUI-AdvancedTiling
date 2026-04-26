@@ -211,6 +211,8 @@ def test_masked_decode(vae, z_source, z_inpaint, mask_lat, mask_img):
     H_img, W_img = img_regular.shape[1], img_regular.shape[2]
     mask_full = F.interpolate(mask_lat.to(device=device), size=(H_img, W_img),
                               mode='bilinear', align_corners=False)
+    # mask_full is (1,1,H,W), image is (B,H,W,C) — reshape to (1,H,W,1)
+    mask_full = mask_full.squeeze(1).unsqueeze(-1)  # (1, H, W, 1)
 
     # Also decode source directly for ground truth
     with torch.no_grad():
