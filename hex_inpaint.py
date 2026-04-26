@@ -390,13 +390,18 @@ class AdvancedTilingHexInpaint:
         for i in range(len(NEIGHBOR_DIRECTIONS)):
             outputs.append(full_neighbor_masks[i])
 
-        # output 9: composited preview (VAE decode, gated by toggle)
+        # output 9: composited preview (pixel-space composite, no VAE round-trip)
         if enable_preview:
-            t_prev = time.time()
-            preview_image = vae.decode(composited)
-            if preview_image.ndim == 5:
-                preview_image = preview_image.squeeze(1)
-            logger.info(f"[HexInpaint] Preview VAE decode: {time.time()-t_prev:.3f}s")
+            preview_image = center_image.clone()
+            neighbor_map_img = _build_neighbor_map(W_img, H_img, settings)
+            n_dirs = len(NEIGHBOR_DIRECTIONS)
+            dir_idx_map = {name: idx for idx, name in enumerate(NEIGHBOR_DIRECTIONS)}
+            for direction_name, neighbor_img in neighbor_images.items():
+                dir_idx = dir_idx_map[direction_name]
+                target_idx = (dir_idx - rotation_steps) % n_dirs
+                waste_mask = (neighbor_map_img == target_idx)
+                if waste_mask.any():
+                    preview_image[0][waste_mask] = neighbor_img[0][waste_mask]
             outputs.append(preview_image)
         else:
             outputs.append(torch.zeros(1, 1, 1, 3, dtype=torch.float32))
