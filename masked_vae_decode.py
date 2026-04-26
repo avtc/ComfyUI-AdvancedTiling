@@ -19,12 +19,8 @@ How it works:
      - preserved area (0): inject reference features (resets accumulated bleed)
 """
 
-import logging
-
 import torch
 import torch.nn.functional as F
-
-logger = logging.getLogger("ComfyUI-AdvancedTiling")
 
 
 def _get_stage_modules(decoder):
@@ -41,10 +37,6 @@ def _get_stage_modules(decoder):
     elif hasattr(decoder, "conv1"):
         return _stages_3d(decoder)
     else:
-        logger.warning(
-            f"[InpaintVAEDecode] Unknown decoder type {type(decoder).__name__}, "
-            f"no compositing stages found"
-        )
         return []
 
 
@@ -217,6 +209,29 @@ class InpaintVAEDecode:
                         "0 = preserved area (keep from reference)."
                     },
                 ),
+                "start_stage": (
+                    "INT",
+                    {
+                        "default": 0,
+                        "min": 0,
+                        "max": 6,
+                        "tooltip": "Start compositing from this decoder stage. "
+                        "Stage 0-1 are at latent resolution (coarse mask, may bleed "
+                        "into border). Higher values skip early low-res stages for "
+                        "cleaner boundaries. Stages: 0=conv_in, 1=mid, 2+=upsample.",
+                    },
+                ),
+                "end_stage": (
+                    "INT",
+                    {
+                        "default": -1,
+                        "min": -1,
+                        "max": 6,
+                        "tooltip": "Stop compositing after this decoder stage. "
+                        "-1 = all remaining stages. Can be used to skip the final "
+                        "high-res stage if it introduces artifacts.",
+                    },
+                ),
             },
             "optional": {
                 "source_samples": (
@@ -245,17 +260,14 @@ class InpaintVAEDecode:
         "VAE bleed at mask boundaries."
     )
 
-    def decode(self, samples, vae, mask, source_samples=None, original_image=None):
+    def decode(self, samples, vae, mask, start_stage=0, end_stage=-1,
+               source_samples=None, original_image=None):
         z_inpaint = samples["samples"]
 
-        # Use original image's latent as reference when available — avoids
-        # bleed from latent-space compositing boundaries (center+neighbor)
         if original_image is not None:
             z_ref = vae.encode(original_image)
-            logger.info("[InpaintVAEDecode] Using original_image as reference")
         elif source_samples is not None:
             z_ref = source_samples["samples"]
-            logger.info("[InpaintVAEDecode] Using source_samples as reference")
         else:
             raise ValueError(
                 "InpaintVAEDecode requires either source_samples or original_image "
@@ -274,19 +286,24 @@ class InpaintVAEDecode:
         decoder = vae.first_stage_model.decoder
         stages = _get_stage_modules(decoder)
 
+        # Determine which stages to composite
+        last = len(stages) if end_stage < 0 else min(end_stage + 1, len(stages))
+        composite_stages = set(range(start_stage, last))
         stage_names = [name for name, _ in stages]
+        active_names = [stage_names[i] for i in sorted(composite_stages) if i < len(stages)]
         logger.info(
             f"[InpaintVAEDecode] Latent ({H_lat}x{W_lat}), "
-            f"compositing stages: {stage_names}"
+            f"all stages: {stage_names}, compositing: {active_names}"
         )
 
-        # Step 1: Reference decode — save features at each stage boundary
+        # Step 1: Reference decode — save features at stages we'll composite
         ref_features = {}
         save_hooks = []
-        for name, module in stages:
-            save_hooks.append(
-                module.register_forward_hook(_save_hook(ref_features, name))
-            )
+        for i, (name, module) in enumerate(stages):
+            if i in composite_stages:
+                save_hooks.append(
+                    module.register_forward_hook(_save_hook(ref_features, name))
+                )
 
         with torch.no_grad():
             vae.decode(z_ref)
@@ -297,14 +314,15 @@ class InpaintVAEDecode:
         ref_summary = {k: tuple(v.shape) for k, v in ref_features.items()}
         logger.info(f"[InpaintVAEDecode] Reference features: {ref_summary}")
 
-        # Step 2: Main decode — composite at each stage boundary
+        # Step 2: Main decode — composite only at selected stages
         comp_hooks = []
-        for name, module in stages:
-            comp_hooks.append(
-                module.register_forward_hook(
-                    _composite_hook(ref_features, mask_prepared, name)
+        for i, (name, module) in enumerate(stages):
+            if i in composite_stages:
+                comp_hooks.append(
+                    module.register_forward_hook(
+                        _composite_hook(ref_features, mask_prepared, name)
+                    )
                 )
-            )
 
         with torch.no_grad():
             image = vae.decode(z_inpaint)
@@ -317,7 +335,5 @@ class InpaintVAEDecode:
             image = image.reshape(
                 -1, image.shape[-3], image.shape[-2], image.shape[-1]
             )
-
-        logger.info(f"[InpaintVAEDecode] Output: {image.shape}")
 
         return (image,)
