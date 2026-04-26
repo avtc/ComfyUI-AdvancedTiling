@@ -2,16 +2,21 @@
 Masked VAE decode for inpainting with minimal bleed.
 
 At each stage of the VAE decoder, features in the non-masked (preserved)
-area are replaced with features from a parallel decode of the source latent.
-This prevents VAE convolution bleed from accumulating through the decoder
-layers, reducing artifacts from ~16-24 pixels to ~1-3 pixels at mask
-boundaries.
+area are replaced with features from a parallel decode of the reference
+latent. This prevents VAE convolution bleed from accumulating through the
+decoder layers, reducing artifacts from ~16-24 pixels to ~1-3 pixels at
+mask boundaries.
+
+When original_image is provided, it is VAE-encoded and used as the
+reference latent instead of source_samples. This avoids bleed from
+latent-space compositing boundaries (e.g. center+neighbor hex tiles)
+that would otherwise contaminate the preserved area features.
 
 How it works:
-  1. Decode the source latent, saving intermediate features at each stage
+  1. Decode the reference latent, saving intermediate features at each stage
   2. Decode the inpainted latent, compositing at each stage:
      - masked area (1): keep inpainted features
-     - preserved area (0): inject source features (resets accumulated bleed)
+     - preserved area (0): inject reference features (resets accumulated bleed)
 """
 
 import logging
@@ -185,10 +190,15 @@ class InpaintVAEDecode:
     VAE decode with intermediate compositing to eliminate bleed at mask
     boundaries.
 
-    Takes an inpainted latent (after KSampler) and the source latent
-    (before KSampler), along with the inpaint mask. Decodes both through
-    the VAE decoder but, at each upsampling stage, replaces features in
-    preserved areas with features from the source decode.
+    Takes an inpainted latent (after KSampler) and a reference latent, along
+    with the inpaint mask. Decodes both through the VAE decoder but, at each
+    upsampling stage, replaces features in preserved areas with features from
+    the reference decode.
+
+    When original_image is provided, it is VAE-encoded and used as the
+    reference instead of source_samples. This avoids bleed from latent-space
+    compositing boundaries (e.g. center+neighbor hex tiles) that would
+    otherwise contaminate the preserved-area features.
     """
 
     @classmethod
@@ -203,7 +213,7 @@ class InpaintVAEDecode:
                     "LATENT",
                     {
                         "tooltip": "Source latent before sampling (from HexInpaint node). "
-                        "Provides reference features for preserved areas."
+                        "Used as reference when original_image is not provided."
                     },
                 ),
                 "vae": ("VAE", {"tooltip": "VAE model for decoding."}),
@@ -212,7 +222,17 @@ class InpaintVAEDecode:
                     {
                         "tooltip": "Inpaint mask. "
                         "1 = inpainted area (keep from samples), "
-                        "0 = preserved area (keep from source_samples)."
+                        "0 = preserved area (keep from reference)."
+                    },
+                ),
+            },
+            "optional": {
+                "original_image": (
+                    "IMAGE",
+                    {
+                        "tooltip": "Original clean image. When provided, VAE-encoded and used "
+                        "as the reference decode instead of source_samples. Avoids VAE "
+                        "convolution bleed from latent-space compositing boundaries."
                     },
                 ),
             }
@@ -226,12 +246,20 @@ class InpaintVAEDecode:
         "VAE bleed at mask boundaries."
     )
 
-    def decode(self, samples, source_samples, vae, mask):
+    def decode(self, samples, source_samples, vae, mask, original_image=None):
         z_inpaint = samples["samples"]
-        z_source = source_samples["samples"]
+
+        # Use original image's latent as reference when available — avoids
+        # bleed from latent-space compositing boundaries (center+neighbor)
+        if original_image is not None:
+            z_ref = vae.encode(original_image)
+            logger.info("[InpaintVAEDecode] Using original_image as reference")
+        else:
+            z_ref = source_samples["samples"]
+            logger.info("[InpaintVAEDecode] Using source_samples as reference")
 
         z_inpaint_4d, _ = _normalize_latent(z_inpaint)
-        z_source_4d, _ = _normalize_latent(z_source)
+        z_ref_4d, _ = _normalize_latent(z_ref)
 
         _, _, H_lat, W_lat = z_inpaint_4d.shape
 
@@ -257,7 +285,7 @@ class InpaintVAEDecode:
             )
 
         with torch.no_grad():
-            vae.decode(z_source)
+            vae.decode(z_ref)
 
         for h in save_hooks:
             h.remove()
