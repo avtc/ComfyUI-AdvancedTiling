@@ -111,19 +111,26 @@ def _composite_hook(ref_features, mask_base, name):
 
         ref = ref_features[name].to(device=output.device, dtype=output.dtype)
 
-        if output.shape[2:] != ref.shape[2:]:
+        if output.shape != ref.shape:
             return output
 
-        # Scale mask to current feature resolution
-        H, W = output.shape[2:]
+        # Spatial dimensions are always the last two
+        H, W = output.shape[-2], output.shape[-1]
+
+        # Scale mask to spatial resolution
         mask = mask_base
-        if mask.shape[2] != H or mask.shape[3] != W:
+        if mask.shape[-2] != H or mask.shape[-1] != W:
             mask = F.interpolate(
                 mask.float(),
                 size=(H, W),
                 mode="bilinear",
                 align_corners=False,
             )
+
+        # Expand mask dims to match output (handles 4D and 5D+ tensors)
+        # mask starts as (1, 1, H, W), insert singleton dims for T etc.
+        while mask.dim() < output.dim():
+            mask = mask.unsqueeze(2)
 
         # masked area (1) → keep inpainted; preserved area (0) → use reference
         result = output * mask + ref * (1 - mask)
