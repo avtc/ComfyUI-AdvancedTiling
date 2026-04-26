@@ -19,8 +19,12 @@ How it works:
      - preserved area (0): inject reference features (resets accumulated bleed)
 """
 
+import logging
+
 import torch
 import torch.nn.functional as F
+
+logger = logging.getLogger("ComfyUI-AdvancedTiling")
 
 
 def _get_stage_modules(decoder):
@@ -37,6 +41,10 @@ def _get_stage_modules(decoder):
     elif hasattr(decoder, "conv1"):
         return _stages_3d(decoder)
     else:
+        logger.warning(
+            f"[InpaintVAEDecode] Unknown decoder type {type(decoder).__name__}, "
+            f"no compositing stages found"
+        )
         return []
 
 
