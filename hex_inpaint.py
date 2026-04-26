@@ -13,8 +13,6 @@ import functools
 
 import torch
 
-from comfy_execution.graph_utils import is_link
-
 from .modes import Settings
 from .modes.hex_mask import (
     NEIGHBOR_DIRECTIONS,
@@ -22,27 +20,6 @@ from .modes.hex_mask import (
 )
 
 logger = logging.getLogger("ComfyUI-AdvancedTiling")
-
-
-def _is_output_connected(prompt, unique_id, output_index):
-    """
-    Check if a specific output slot of this node is connected to another node.
-
-    :param prompt: The prompt dict from ComfyUI hidden input
-    :param unique_id: This node's unique ID from ComfyUI hidden input
-    :param output_index: The output slot index to check
-    :return: True if the output is connected (or if we can't determine)
-    """
-    if prompt is None or unique_id is None:
-        return True
-    unique_id_str = str(unique_id)
-    for node_id, node_info in prompt.items():
-        if node_id == unique_id_str:
-            continue
-        for input_value in node_info.get("inputs", {}).values():
-            if is_link(input_value) and str(input_value[0]) == unique_id_str and input_value[1] == output_index:
-                return True
-    return False
 
 
 def _normalize_latent(latent: torch.Tensor) -> tuple[torch.Tensor, tuple[int, ...]]:
@@ -228,12 +205,18 @@ class AdvancedTilingHexInpaint:
                         "tooltip": "Rotate neighbor image assignments by N steps clockwise. +1: E input → SE region, NE → E. -1: counter-clockwise. Useful when neighbor tiles come from a differently-oriented grid.",
                     },
                 ),
+                "enable_preview": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Enable composited preview output (VAE decode of center + neighbor latents). Adds ~0.5-2s per run.",
+                    },
+                ),
             },
             "optional": {
                 f"neighbor_{d}": ("IMAGE", {"tooltip": f"{d} neighbor tile image"})
                 for d in NEIGHBOR_DIRECTIONS
             },
-            "hidden": {"unique_id": "UNIQUE_ID", "prompt": "PROMPT"},
         }
 
     RETURN_TYPES = ("LATENT", "MASK", "MASK", "MASK", "MASK", "MASK", "MASK", "MASK", "IMAGE")
@@ -246,7 +229,7 @@ class AdvancedTilingHexInpaint:
     FUNCTION = "run"
     CATEGORY = "conditioning"
 
-    def run(self, settings, vae, center_image, inpaint_mode, border_width, feather_radius, feather_sides, skip_same_neighbors, rotate_mapping=0, unique_id=None, prompt=None, **kwargs):
+    def run(self, settings, vae, center_image, inpaint_mode, border_width, feather_radius, feather_sides, skip_same_neighbors, rotate_mapping=0, enable_preview=False, **kwargs):
         t_start = time.time()
 
         n = len(NEIGHBOR_DIRECTIONS)
@@ -330,44 +313,24 @@ class AdvancedTilingHexInpaint:
         logger.info(f"[HexInpaint] noise_mask shape={noise_mask.shape}, "
                      f"coverage={noise_mask.mean().item():.3f}")
 
-        # 7. Assemble outputs with lazy computation
-        outputs = [latent_dict]  # output 0: LATENT — always computed
+        # 7. Generate masks at image resolution (for output visualization)
+        t5 = time.time()
+        hex_radius_img = min(W_img, H_img) // 2
+        erosion_img = max(1, int(border_width * hex_radius_img))
+        feather_img = max(0, round(feather_radius * erosion_img))
 
-        # Check if any image-resolution mask output is connected
-        full_border_mask = None
-        full_neighbor_masks = None
-        need_image_masks = (
-            _is_output_connected(prompt, unique_id, 1)
-            or any(_is_output_connected(prompt, unique_id, i + 2) for i in range(len(NEIGHBOR_DIRECTIONS)))
+        _, full_border_mask, full_neighbor_masks = create_feathered_masks(
+            W_img, H_img, settings, border_width, feather_img, feather_sides, active_directions
         )
+        logger.info(f"[HexInpaint] Image masks ({W_img}x{H_img}): {time.time()-t5:.3f}s")
 
-        if need_image_masks:
-            t5 = time.time()
-            hex_radius_img = min(W_img, H_img) // 2
-            erosion_img = max(1, int(border_width * hex_radius_img))
-            feather_img = max(0, round(feather_radius * erosion_img))
-
-            _, full_border_mask, full_neighbor_masks = create_feathered_masks(
-                W_img, H_img, settings, border_width, feather_img, feather_sides, active_directions
-            )
-            logger.info(f"[HexInpaint] Image masks ({W_img}x{H_img}): {time.time()-t5:.3f}s")
-
-        # output 1: combined border mask
-        if full_border_mask is not None:
-            outputs.append(full_border_mask)
-        else:
-            outputs.append(torch.zeros(1, H_img, W_img, dtype=torch.float32))
-            logger.info("[HexInpaint] Skipped image border mask (output not connected)")
-
-        # outputs 2-7: per-neighbor masks
+        # 8. Assemble outputs
+        outputs = [latent_dict, full_border_mask]
         for i in range(len(NEIGHBOR_DIRECTIONS)):
-            if full_neighbor_masks is not None:
-                outputs.append(full_neighbor_masks[i])
-            else:
-                outputs.append(torch.zeros(H_img, W_img, dtype=torch.float32))
+            outputs.append(full_neighbor_masks[i])
 
-        # output 8: composited preview (VAE decode)
-        if _is_output_connected(prompt, unique_id, 8):
+        # output 8: composited preview (VAE decode, gated by toggle)
+        if enable_preview:
             t_prev = time.time()
             preview_image = vae.decode(composited)
             if preview_image.ndim == 5:
@@ -376,7 +339,6 @@ class AdvancedTilingHexInpaint:
             outputs.append(preview_image)
         else:
             outputs.append(torch.zeros(1, 1, 1, 3, dtype=torch.float32))
-            logger.info("[HexInpaint] Skipped preview VAE decode (output not connected)")
 
         logger.info(f"[HexInpaint] Total: {time.time()-t_start:.3f}s")
         return tuple(outputs)

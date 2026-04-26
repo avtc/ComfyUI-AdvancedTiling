@@ -149,6 +149,7 @@ class AdvancedTilingHexGridPreview:
         canvas_h = max_py - min_py
 
         canvas = torch.zeros(B, canvas_h, canvas_w, C, dtype=center_image.dtype)
+        occupied = torch.zeros(canvas_h, canvas_w, dtype=torch.bool)
 
         mask_h, mask_w = hex_mask.shape
 
@@ -166,8 +167,12 @@ class AdvancedTilingHexGridPreview:
             full_mask = torch.zeros(tile_h, tile_w, dtype=torch.float32)
             full_mask[mask_y0:mask_y0 + mask_h, mask_x0:mask_x0 + mask_w] = hex_mask.float()
 
-            # Apply mask and paste
-            mask_expanded = full_mask.unsqueeze(0).unsqueeze(-1)  # (1, tile_h, tile_w, 1)
+            # Only write to unoccupied canvas pixels (first tile wins at boundaries)
+            tile_occupied = occupied[y0:y0 + tile_h, x0:x0 + tile_w]
+            write_mask = full_mask * (~tile_occupied).float()
+            occupied[y0:y0 + tile_h, x0:x0 + tile_w] |= full_mask.bool()
+
+            mask_expanded = write_mask.unsqueeze(0).unsqueeze(-1)  # (1, tile_h, tile_w, 1)
             masked_img = img * mask_expanded
             canvas[:, y0:y0 + tile_h, x0:x0 + tile_w, :] += masked_img
 
