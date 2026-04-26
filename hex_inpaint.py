@@ -189,6 +189,26 @@ class AdvancedTilingHexInpaint:
                         "tooltip": "When enabled, also feathers the side edges of each mask where no active neighbor is present. Disable to feather only the inner edge (toward hex center).",
                     },
                 ),
+                "mask_strength_min": (
+                    "FLOAT",
+                    {
+                        "default": 0.0,
+                        "min": 0.0,
+                        "max": 1.0,
+                        "step": 0.01,
+                        "tooltip": "Minimum denoise strength in the masked area. Non-zero mask values are remapped so the softest feather edge applies at least this much denoising.",
+                    },
+                ),
+                "mask_strength_max": (
+                    "FLOAT",
+                    {
+                        "default": 1.0,
+                        "min": 0.0,
+                        "max": 1.0,
+                        "step": 0.01,
+                        "tooltip": "Maximum denoise strength in the masked area. Non-zero mask values are remapped so the strongest area caps at this value.",
+                    },
+                ),
                 "skip_same_neighbors": (
                     "BOOLEAN",
                     {
@@ -229,7 +249,7 @@ class AdvancedTilingHexInpaint:
     FUNCTION = "run"
     CATEGORY = "conditioning"
 
-    def run(self, settings, vae, center_image, inpaint_mode, border_width, feather_radius, feather_sides, skip_same_neighbors, rotate_mapping=0, enable_preview=False, **kwargs):
+    def run(self, settings, vae, center_image, inpaint_mode, border_width, feather_radius, feather_sides, mask_strength_min, mask_strength_max, skip_same_neighbors, rotate_mapping=0, enable_preview=False, **kwargs):
         t_start = time.time()
 
         n = len(NEIGHBOR_DIRECTIONS)
@@ -307,13 +327,24 @@ class AdvancedTilingHexInpaint:
         logger.info(f"[HexInpaint] Latent masks ({W_lat}x{H_lat}): {t4-t3:.3f}s, "
                      f"border={int(border_mask_lat.sum().item())}, feather={feather_lat}px")
 
-        # 6. Build latent dict with noise_mask
+        # 6. Remap mask strength range (non-zero values only)
+        if mask_strength_min > 0.0 or mask_strength_max < 1.0:
+            nonzero = border_mask_lat > 0
+            border_mask_lat = torch.where(
+                nonzero,
+                mask_strength_min + border_mask_lat * (mask_strength_max - mask_strength_min),
+                border_mask_lat,
+            )
+            logger.info(f"[HexInpaint] Strength remap: "
+                         f"[0,1] -> [{mask_strength_min:.2f},{mask_strength_max:.2f}]")
+
+        # 7. Build latent dict with noise_mask
         noise_mask = border_mask_lat.unsqueeze(0)  # (1, 1, H_lat, W_lat)
         latent_dict = {"samples": composited, "noise_mask": noise_mask}
         logger.info(f"[HexInpaint] noise_mask shape={noise_mask.shape}, "
                      f"coverage={noise_mask.mean().item():.3f}")
 
-        # 7. Generate masks at image resolution (for output visualization)
+        # 8. Generate masks at image resolution (for output visualization)
         t5 = time.time()
         hex_radius_img = min(W_img, H_img) // 2
         erosion_img = max(1, int(border_width * hex_radius_img))
@@ -324,12 +355,28 @@ class AdvancedTilingHexInpaint:
         )
         logger.info(f"[HexInpaint] Image masks ({W_img}x{H_img}): {time.time()-t5:.3f}s")
 
-        # 8. Assemble outputs
+        # 9. Remap image-resolution masks to match
+        if mask_strength_min > 0.0 or mask_strength_max < 1.0:
+            nonzero_img = full_border_mask > 0
+            full_border_mask = torch.where(
+                nonzero_img,
+                mask_strength_min + full_border_mask * (mask_strength_max - mask_strength_min),
+                full_border_mask,
+            )
+            for i in range(len(NEIGHBOR_DIRECTIONS)):
+                nz = full_neighbor_masks[i] > 0
+                full_neighbor_masks[i] = torch.where(
+                    nz,
+                    mask_strength_min + full_neighbor_masks[i] * (mask_strength_max - mask_strength_min),
+                    full_neighbor_masks[i],
+                )
+
+        # 10. Assemble outputs
         outputs = [latent_dict, full_border_mask]
         for i in range(len(NEIGHBOR_DIRECTIONS)):
             outputs.append(full_neighbor_masks[i])
 
-        # output 8: composited preview (VAE decode, gated by toggle)
+        # output 10: composited preview (VAE decode, gated by toggle)
         if enable_preview:
             t_prev = time.time()
             preview_image = vae.decode(composited)
