@@ -163,12 +163,16 @@ def _normalize_latent(latent):
     return x, original_shape
 
 
-def _prepare_mask(mask, H_lat, W_lat, device):
+def _prepare_mask(mask, device):
     """
-    Prepare mask at latent resolution.
+    Prepare mask keeping original resolution.
+
+    The compositing hook will downscale to each decoder stage's resolution,
+    which preserves sharp boundaries better than downscaling to latent
+    resolution first and then upscaling.
 
     :param mask: Input mask (H, W), (1, H, W), or (B, H, W)
-    :return: (1, 1, H_lat, W_lat) on device
+    :return: (1, 1, H, W) on device
     """
     m = mask.to(device=device, dtype=torch.float32)
 
@@ -176,11 +180,6 @@ def _prepare_mask(mask, H_lat, W_lat, device):
         m = m.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
     elif m.dim() == 3:
         m = m[:1].unsqueeze(1)  # (1, 1, H, W)
-
-    if m.shape[2] != H_lat or m.shape[3] != W_lat:
-        m = F.interpolate(
-            m, size=(H_lat, W_lat), mode="bilinear", align_corners=False
-        )
 
     return m
 
@@ -268,8 +267,8 @@ class InpaintVAEDecode:
 
         _, _, H_lat, W_lat = z_inpaint_4d.shape
 
-        # Prepare mask at latent resolution on VAE device
-        mask_lat = _prepare_mask(mask, H_lat, W_lat, vae.device)
+        # Prepare mask — keep at original resolution for sharp boundaries
+        mask_prepared = _prepare_mask(mask, vae.device)
 
         # Get compositing stages from the decoder
         decoder = vae.first_stage_model.decoder
@@ -303,7 +302,7 @@ class InpaintVAEDecode:
         for name, module in stages:
             comp_hooks.append(
                 module.register_forward_hook(
-                    _composite_hook(ref_features, mask_lat, name)
+                    _composite_hook(ref_features, mask_prepared, name)
                 )
             )
 
