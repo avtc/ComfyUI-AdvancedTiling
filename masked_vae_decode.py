@@ -209,13 +209,6 @@ class InpaintVAEDecode:
                     "LATENT",
                     {"tooltip": "Inpainted latent (after KSampler)."},
                 ),
-                "source_samples": (
-                    "LATENT",
-                    {
-                        "tooltip": "Source latent before sampling (from HexInpaint node). "
-                        "Used as reference when original_image is not provided."
-                    },
-                ),
                 "vae": ("VAE", {"tooltip": "VAE model for decoding."}),
                 "mask": (
                     "MASK",
@@ -227,6 +220,13 @@ class InpaintVAEDecode:
                 ),
             },
             "optional": {
+                "source_samples": (
+                    "LATENT",
+                    {
+                        "tooltip": "Source latent before sampling (from HexInpaint node). "
+                        "Used as reference when original_image is not provided."
+                    },
+                ),
                 "original_image": (
                     "IMAGE",
                     {
@@ -246,7 +246,7 @@ class InpaintVAEDecode:
         "VAE bleed at mask boundaries."
     )
 
-    def decode(self, samples, source_samples, vae, mask, original_image=None):
+    def decode(self, samples, vae, mask, source_samples=None, original_image=None):
         z_inpaint = samples["samples"]
 
         # Use original image's latent as reference when available — avoids
@@ -254,9 +254,14 @@ class InpaintVAEDecode:
         if original_image is not None:
             z_ref = vae.encode(original_image)
             logger.info("[InpaintVAEDecode] Using original_image as reference")
-        else:
+        elif source_samples is not None:
             z_ref = source_samples["samples"]
             logger.info("[InpaintVAEDecode] Using source_samples as reference")
+        else:
+            raise ValueError(
+                "InpaintVAEDecode requires either source_samples or original_image "
+                "to provide reference features for the preserved area."
+            )
 
         z_inpaint_4d, _ = _normalize_latent(z_inpaint)
         z_ref_4d, _ = _normalize_latent(z_ref)
