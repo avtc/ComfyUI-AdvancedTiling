@@ -426,6 +426,16 @@ class AdvancedTilingHexInpaint:
         paintbrush_img = center_image[0] * (1 - border_3ch) + solid_color * border_3ch
         paintbrush_img = paintbrush_img.unsqueeze(0)  # (1, H, W, 3)
 
+        # Composite neighbor images into waste region of paintbrush preview
+        neighbor_map_img = _build_neighbor_map(W_img, H_img, settings)
+        direction_to_idx = {name: idx for idx, name in enumerate(NEIGHBOR_DIRECTIONS)}
+        for direction_name, neighbor_img in neighbor_images.items():
+            dir_idx = direction_to_idx[direction_name]
+            target_idx = (dir_idx - rotation_steps) % n
+            waste_mask = (neighbor_map_img == target_idx)
+            if waste_mask.any():
+                paintbrush_img[0][waste_mask] = neighbor_img[0][waste_mask]
+
         t_pb = time.time()
         paintbrush_latent = vae.encode(paintbrush_img)
         if neighbor_latents:
