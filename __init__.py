@@ -10,12 +10,14 @@ from .advanced_tiling import (
     AdvancedTilingVAEDecode,
 )
 from .hex_inpaint import AdvancedTilingHexInpaint
+from .hex_grid_preview import AdvancedTilingHexGridPreview
 
 NODE_CLASS_MAPPINGS = {
     "AdvancedTilingSettings": AdvancedTilingSettings,
     "AdvancedTiling": AdvancedTiling,
     "AdvancedTilingVAEDecode": AdvancedTilingVAEDecode,
     "AdvancedTilingHexInpaint": AdvancedTilingHexInpaint,
+    "AdvancedTilingHexGridPreview": AdvancedTilingHexGridPreview,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -23,6 +25,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "AdvancedTiling": "Advanced Tiling",
     "AdvancedTilingVAEDecode": "Advanced Tiling VAE Decode",
     "AdvancedTilingHexInpaint": "Advanced Tiling Hex Inpaint",
+    "AdvancedTilingHexGridPreview": "Advanced Tiling Hex Grid Preview",
 }
 
 try:

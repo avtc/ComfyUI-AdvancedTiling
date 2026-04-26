@@ -13,6 +13,8 @@ import functools
 
 import torch
 
+from comfy_execution.graph_utils import is_link
+
 from .modes import Settings
 from .modes.hex_mask import (
     NEIGHBOR_DIRECTIONS,
@@ -20,6 +22,27 @@ from .modes.hex_mask import (
 )
 
 logger = logging.getLogger("ComfyUI-AdvancedTiling")
+
+
+def _is_output_connected(prompt, unique_id, output_index):
+    """
+    Check if a specific output slot of this node is connected to another node.
+
+    :param prompt: The prompt dict from ComfyUI hidden input
+    :param unique_id: This node's unique ID from ComfyUI hidden input
+    :param output_index: The output slot index to check
+    :return: True if the output is connected (or if we can't determine)
+    """
+    if prompt is None or unique_id is None:
+        return True
+    unique_id_str = str(unique_id)
+    for node_id, node_info in prompt.items():
+        if node_id == unique_id_str:
+            continue
+        for input_value in node_info.get("inputs", {}).values():
+            if is_link(input_value) and str(input_value[0]) == unique_id_str and input_value[1] == output_index:
+                return True
+    return False
 
 
 def _normalize_latent(latent: torch.Tensor) -> tuple[torch.Tensor, tuple[int, ...]]:
@@ -210,18 +233,20 @@ class AdvancedTilingHexInpaint:
                 f"neighbor_{d}": ("IMAGE", {"tooltip": f"{d} neighbor tile image"})
                 for d in NEIGHBOR_DIRECTIONS
             },
+            "hidden": {"unique_id": "UNIQUE_ID", "prompt": "PROMPT"},
         }
 
-    RETURN_TYPES = ("LATENT", "MASK", "MASK", "MASK", "MASK", "MASK", "MASK", "MASK")
+    RETURN_TYPES = ("LATENT", "MASK", "MASK", "MASK", "MASK", "MASK", "MASK", "MASK", "IMAGE")
     RETURN_NAMES = (
         "LATENT", "MASK",
         "neighbor_E", "neighbor_NE", "neighbor_NW",
         "neighbor_W", "neighbor_SW", "neighbor_SE",
+        "composited_preview",
     )
     FUNCTION = "run"
     CATEGORY = "conditioning"
 
-    def run(self, settings, vae, center_image, inpaint_mode, border_width, feather_radius, feather_sides, skip_same_neighbors, rotate_mapping=0, **kwargs):
+    def run(self, settings, vae, center_image, inpaint_mode, border_width, feather_radius, feather_sides, skip_same_neighbors, rotate_mapping=0, unique_id=None, prompt=None, **kwargs):
         t_start = time.time()
 
         n = len(NEIGHBOR_DIRECTIONS)
@@ -266,7 +291,12 @@ class AdvancedTilingHexInpaint:
         active_directions = set()
         for i, direction in enumerate(NEIGHBOR_DIRECTIONS):
             if direction in neighbor_images:
-                if skip_same_neighbors and torch.allclose(center_image, neighbor_images[direction], atol=1e-6):
+                nimg = neighbor_images[direction]
+                if nimg.shape != center_image.shape:
+                    logger.warning(f"[HexInpaint] {direction} size mismatch "
+                                   f"({nimg.shape} vs {center_image.shape}), treating as active")
+                    active_directions.add((i - rotation_steps) % n)
+                elif skip_same_neighbors and torch.allclose(center_image, nimg, atol=1e-6):
                     logger.info(f"[HexInpaint] Auto-skip {direction}: matches center")
                 else:
                     active_directions.add((i - rotation_steps) % n)
@@ -300,21 +330,53 @@ class AdvancedTilingHexInpaint:
         logger.info(f"[HexInpaint] noise_mask shape={noise_mask.shape}, "
                      f"coverage={noise_mask.mean().item():.3f}")
 
-        # 7. Generate masks at image resolution (for output visualization)
-        t5 = time.time()
-        hex_radius_img = min(W_img, H_img) // 2
-        erosion_img = max(1, int(border_width * hex_radius_img))
-        feather_img = max(0, round(feather_radius * erosion_img))
+        # 7. Assemble outputs with lazy computation
+        outputs = [latent_dict]  # output 0: LATENT — always computed
 
-        _, full_border_mask, full_neighbor_masks = create_feathered_masks(
-            W_img, H_img, settings, border_width, feather_img, feather_sides, active_directions
+        # Check if any image-resolution mask output is connected
+        full_border_mask = None
+        full_neighbor_masks = None
+        need_image_masks = (
+            _is_output_connected(prompt, unique_id, 1)
+            or any(_is_output_connected(prompt, unique_id, i + 2) for i in range(len(NEIGHBOR_DIRECTIONS)))
         )
-        t6 = time.time()
-        logger.info(f"[HexInpaint] Image masks ({W_img}x{H_img}): {t6-t5:.3f}s")
 
-        outputs = [latent_dict, full_border_mask]
+        if need_image_masks:
+            t5 = time.time()
+            hex_radius_img = min(W_img, H_img) // 2
+            erosion_img = max(1, int(border_width * hex_radius_img))
+            feather_img = max(0, round(feather_radius * erosion_img))
+
+            _, full_border_mask, full_neighbor_masks = create_feathered_masks(
+                W_img, H_img, settings, border_width, feather_img, feather_sides, active_directions
+            )
+            logger.info(f"[HexInpaint] Image masks ({W_img}x{H_img}): {time.time()-t5:.3f}s")
+
+        # output 1: combined border mask
+        if full_border_mask is not None:
+            outputs.append(full_border_mask)
+        else:
+            outputs.append(torch.zeros(1, H_img, W_img, dtype=torch.float32))
+            logger.info("[HexInpaint] Skipped image border mask (output not connected)")
+
+        # outputs 2-7: per-neighbor masks
         for i in range(len(NEIGHBOR_DIRECTIONS)):
-            outputs.append(full_neighbor_masks[i])
+            if full_neighbor_masks is not None:
+                outputs.append(full_neighbor_masks[i])
+            else:
+                outputs.append(torch.zeros(H_img, W_img, dtype=torch.float32))
+
+        # output 8: composited preview (VAE decode)
+        if _is_output_connected(prompt, unique_id, 8):
+            t_prev = time.time()
+            preview_image = vae.decode(composited)
+            if preview_image.ndim == 5:
+                preview_image = preview_image.squeeze(1)
+            logger.info(f"[HexInpaint] Preview VAE decode: {time.time()-t_prev:.3f}s")
+            outputs.append(preview_image)
+        else:
+            outputs.append(torch.zeros(1, 1, 1, 3, dtype=torch.float32))
+            logger.info("[HexInpaint] Skipped preview VAE decode (output not connected)")
 
         logger.info(f"[HexInpaint] Total: {time.time()-t_start:.3f}s")
         return tuple(outputs)
