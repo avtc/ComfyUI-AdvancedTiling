@@ -54,7 +54,7 @@ def load_vae_model(path):
     return vae
 
 
-def create_test_data(H_lat=64, W_lat=64):
+def create_test_data(latent_channels=4, H_lat=64, W_lat=64):
     """
     Create synthetic test data.
 
@@ -64,7 +64,7 @@ def create_test_data(H_lat=64, W_lat=64):
     """
     torch.manual_seed(42)
 
-    z_source = torch.randn(1, 4, H_lat, W_lat)
+    z_source = torch.randn(1, latent_channels, H_lat, W_lat)
 
     # Create circular mask at latent resolution
     ys = torch.arange(H_lat).float() - H_lat / 2
@@ -78,7 +78,7 @@ def create_test_data(H_lat=64, W_lat=64):
     mask_lat = mask_lat.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
 
     # Inpainted latent: different content in masked area
-    z_different = torch.randn(1, 4, H_lat, W_lat) * 2.0
+    z_different = torch.randn(1, latent_channels, H_lat, W_lat) * 2.0
     z_inpaint = z_source * (1 - mask_lat) + z_different * mask_lat
 
     # Image-resolution mask for the node input (H, W)
@@ -274,8 +274,10 @@ def main():
 
     decoder = vae.first_stage_model.decoder
 
-    # Create test data
-    z_source, z_inpaint, mask_lat, mask_img = create_test_data()
+    # Create test data matching VAE's latent channels
+    z_source, z_inpaint, mask_lat, mask_img = create_test_data(
+        latent_channels=vae.latent_channels
+    )
     print(f"Test latent: {z_source.shape}, mask: {mask_img.shape}")
 
     # Run tests
