@@ -21,6 +21,17 @@ from .modes.hex_mask import (
 
 logger = logging.getLogger("ComfyUI-AdvancedTiling")
 
+# Per-direction color for mask visualization and regional prompting
+DIRECTION_COLORS = torch.tensor([
+    [1.0, 0.0, 0.0],  # E  → Red
+    [0.0, 0.0, 1.0],  # NE → Blue
+    [0.0, 1.0, 0.0],  # NW → Green
+    [1.0, 1.0, 0.0],  # W  → Yellow
+    [1.0, 0.5, 0.0],  # SW → Orange
+    [0.5, 0.0, 1.0],  # SE → Purple
+])
+DIRECTION_COLOR_NAMES = ["red", "blue", "green", "yellow", "orange", "purple"]
+
 
 def _normalize_latent(latent: torch.Tensor) -> tuple[torch.Tensor, tuple[int, ...]]:
     """
@@ -239,12 +250,15 @@ class AdvancedTilingHexInpaint:
             },
         }
 
-    RETURN_TYPES = ("LATENT", "MASK", "MASK", "MASK", "MASK", "MASK", "MASK", "MASK", "IMAGE")
+    RETURN_TYPES = ("LATENT", "MASK", "MASK", "MASK", "MASK", "MASK", "MASK", "MASK", "IMAGE", "IMAGE", "LATENT", "IMAGE")
     RETURN_NAMES = (
         "LATENT", "MASK",
-        "neighbor_E", "neighbor_NE", "neighbor_NW",
-        "neighbor_W", "neighbor_SW", "neighbor_SE",
+        *[f"{NEIGHBOR_DIRECTIONS[i]}_{DIRECTION_COLOR_NAMES[i]}"
+          for i in range(len(NEIGHBOR_DIRECTIONS))],
         "composited_preview",
+        "color_mask",
+        "LATENT_paintbrush",
+        "paintbrush_preview",
     )
     FUNCTION = "run"
     CATEGORY = "conditioning"
@@ -376,7 +390,7 @@ class AdvancedTilingHexInpaint:
         for i in range(len(NEIGHBOR_DIRECTIONS)):
             outputs.append(full_neighbor_masks[i])
 
-        # output 10: composited preview (VAE decode, gated by toggle)
+        # output 9: composited preview (VAE decode, gated by toggle)
         if enable_preview:
             t_prev = time.time()
             preview_image = vae.decode(composited)
@@ -386,6 +400,47 @@ class AdvancedTilingHexInpaint:
             outputs.append(preview_image)
         else:
             outputs.append(torch.zeros(1, 1, 1, 3, dtype=torch.float32))
+
+        # output 10: color mask for regional prompting
+        color_mask = torch.zeros(H_img, W_img, 3, dtype=torch.float32)
+        for i in range(len(NEIGHBOR_DIRECTIONS)):
+            mask_i = full_neighbor_masks[i]  # (H_img, W_img)
+            color = DIRECTION_COLORS[i]
+            for c in range(3):
+                color_mask[:, :, c] += mask_i * color[c]
+        outputs.append(color_mask.unsqueeze(0))  # (1, H, W, 3)
+
+        # output 11: paintbrush latent (image with solid colors in border regions)
+        # Build paintbrush image: original + solid color overlay in border
+        solid_color = torch.zeros(H_img, W_img, 3, dtype=torch.float32)
+        border_any = torch.zeros(H_img, W_img, dtype=torch.float32)
+        for i in range(len(NEIGHBOR_DIRECTIONS)):
+            region = (full_neighbor_masks[i] > 0).float()
+            border_any = torch.max(border_any, region)
+            color = DIRECTION_COLORS[i]
+            for c in range(3):
+                solid_color[:, :, c] = torch.where(
+                    region > 0, color[c], solid_color[:, :, c],
+                )
+        border_3ch = border_any.unsqueeze(-1)
+        paintbrush_img = center_image[0] * (1 - border_3ch) + solid_color * border_3ch
+        paintbrush_img = paintbrush_img.unsqueeze(0)  # (1, H, W, 3)
+
+        t_pb = time.time()
+        paintbrush_latent = vae.encode(paintbrush_img)
+        if neighbor_latents:
+            paintbrush_composited = composite_latents(
+                paintbrush_latent, neighbor_latents, settings, rotation_steps,
+            )
+        else:
+            paintbrush_composited = paintbrush_latent
+        paintbrush_latent_dict = {
+            "samples": paintbrush_composited,
+            "noise_mask": noise_mask,
+        }
+        outputs.append(paintbrush_latent_dict)
+        outputs.append(paintbrush_img)
+        logger.info(f"[HexInpaint] Paintbrush latent: {time.time()-t_pb:.3f}s")
 
         logger.info(f"[HexInpaint] Total: {time.time()-t_start:.3f}s")
         return tuple(outputs)
