@@ -222,8 +222,14 @@ def test_masked_decode(vae, z_source, z_inpaint, mask_lat, mask_img):
     preserved_mask = (1 - mask_full).expand_as(img_regular)
     n_preserved = preserved_mask.sum()
 
-    diff_regular = ((img_regular - img_source.to(device=device, dtype=torch.float32)).abs() * preserved_mask).sum() / n_preserved
-    diff_masked = ((img_masked.to(device=device) - img_source.to(device=device, dtype=torch.float32)).abs() * preserved_mask).sum() / n_preserved
+    # Move everything to CPU for comparison
+    img_regular_f = img_regular.cpu().float()
+    img_masked_f = img_masked.cpu().float()
+    img_source_f = img_source.cpu().float()
+    preserved_mask = preserved_mask.cpu()
+
+    diff_regular = ((img_regular_f - img_source_f).abs() * preserved_mask).sum() / n_preserved
+    diff_masked = ((img_masked_f - img_source_f).abs() * preserved_mask).sum() / n_preserved
 
     print(f"  Preserved area avg pixel difference from source:")
     print(f"    Regular decode: {diff_regular.item():.6f}")
@@ -242,8 +248,8 @@ def test_masked_decode(vae, z_source, z_inpaint, mask_lat, mask_img):
     save_image(img_masked.cpu().float(), os.path.join(out_dir, "masked_decode.png"))
 
     # Save difference maps (amplified)
-    diff_reg_map = (img_regular - img_source.to(device=device, dtype=torch.float32)).abs()
-    diff_mask_map = (img_masked.to(device=device) - img_source.to(device=device, dtype=torch.float32)).abs()
+    diff_reg_map = (img_regular_f - img_source_f).abs()
+    diff_mask_map = (img_masked_f - img_source_f).abs()
     amp = 10.0  # amplify for visibility
     save_image((diff_reg_map.cpu().float() * amp).clamp(0, 1),
                os.path.join(out_dir, "diff_regular_x10.png"))
