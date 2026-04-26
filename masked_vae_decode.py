@@ -88,7 +88,8 @@ def _composite_hook(ref_features, mask_base, name):
             )
 
         # masked area (1) → keep inpainted; preserved area (0) → use reference
-        return output * mask + ref * (1 - mask)
+        result = output * mask + ref * (1 - mask)
+        return result.to(dtype=output.dtype)
 
     return hook
 
