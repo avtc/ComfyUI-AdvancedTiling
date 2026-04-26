@@ -234,7 +234,8 @@ class AdvancedTilingHexGridPreview:
             pixel_mask = (cell_q_t == q) & (cell_r_t == r) & is_inside_t
             if not pixel_mask.any():
                 continue
-            canvas[:, pixel_mask, :] = img[:, tile_y_t[pixel_mask], tile_x_t[pixel_mask], :]
+            cy, cx = pixel_mask.nonzero(as_tuple=True)
+            canvas[:, cy, cx, :] = img[:, tile_y_t[cy, cx], tile_x_t[cy, cx], :]
 
         # Crop to content bounds
         content = canvas[0].sum(dim=-1) > 0
