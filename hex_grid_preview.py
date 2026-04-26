@@ -285,14 +285,14 @@ class AdvancedTilingHexGridPreview:
                      f"nonzero={int((canvas > 0).sum())}")
 
         # Crop to content bounds
-        content = canvas[0].sum(dim=-1) > 0
-        rows = content.any(dim=1)
-        cols = content.any(dim=0)
-        if rows.any() and cols.any():
-            r0 = rows.nonzero()[0][0].item()
-            r1 = rows.nonzero()[0][-1].item() + 1
-            c0 = cols.nonzero()[0][0].item()
-            c1 = cols.nonzero()[0][-1].item() + 1
+        content = canvas[0].sum(dim=-1) > 0  # (H, W) bool
+        row_has_content = content.any(dim=1)  # (H,)
+        col_has_content = content.any(dim=0)  # (W,)
+        if row_has_content.any() and col_has_content.any():
+            row_idx = row_has_content.nonzero(as_tuple=True)[0]
+            col_idx = col_has_content.nonzero(as_tuple=True)[0]
+            r0, r1 = row_idx[0].item(), row_idx[-1].item() + 1
+            c0, c1 = col_idx[0].item(), col_idx[-1].item() + 1
             canvas = canvas[:, r0:r1, c0:c1, :]
         else:
             logger.warning("[HexGridPreview] NO content in canvas!")
