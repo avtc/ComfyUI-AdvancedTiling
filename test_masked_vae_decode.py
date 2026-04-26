@@ -23,30 +23,35 @@ from PIL import Image
 
 
 def find_vae():
-    """Find an available VAE file."""
+    """Find an available VAE file and return (path, label)."""
     import folder_paths
 
     # Check standalone VAEs
-    vae_dir = folder_paths.get_folder_paths("vae")[0]
-    if os.path.exists(vae_dir):
-        for f in os.listdir(vae_dir):
-            if f.endswith((".safetensors", ".pt", ".bin")):
-                return os.path.join(vae_dir, f), f"vae/{f}"
+    for vae_dir in folder_paths.get_folder_paths("vae"):
+        if os.path.exists(vae_dir):
+            for f in sorted(os.listdir(vae_dir)):
+                if f.endswith((".safetensors", ".pt", ".bin")):
+                    return os.path.join(vae_dir, f), f"vae/{f}"
 
     # Fall back to checkpoint's embedded VAE
-    ckpt_dir = folder_paths.get_folder_paths("checkpoints")[0]
-    if os.path.exists(ckpt_dir):
-        for f in os.listdir(ckpt_dir):
-            if f.endswith((".safetensors", ".pt", ".bin")):
-                return os.path.join(ckpt_dir, f), f"checkpoint/{f}"
+    for ckpt_dir in folder_paths.get_folder_paths("checkpoints"):
+        if os.path.exists(ckpt_dir):
+            for f in sorted(os.listdir(ckpt_dir)):
+                if f.endswith((".safetensors", ".pt", ".bin")):
+                    return os.path.join(ckpt_dir, f), f"checkpoint/{f}"
 
     return None, None
 
 
 def load_vae_model(path):
-    """Load VAE model."""
-    from comfy.sd import load_vae
-    return load_vae(path)
+    """Load VAE model using ComfyUI's infrastructure."""
+    import comfy.utils
+    import comfy.sd
+
+    sd, _ = comfy.utils.load_torch_file(path, return_metadata=True)
+    vae = comfy.sd.VAE(sd=sd)
+    vae.throw_exception_if_invalid()
+    return vae
 
 
 def create_test_data(H_lat=64, W_lat=64):
