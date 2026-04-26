@@ -26,12 +26,25 @@ def _get_stage_modules(decoder):
     """
     Identify modules whose outputs represent decoder stage boundaries.
 
-    Compositing after each of these prevents VAE bleed from accumulating
-    through subsequent layers. Stages are ordered from lowest to highest
-    resolution (matching the decoder's forward pass order).
+    Supports both standard Decoder (SD 1.5, SDXL, etc.) and Decoder3d
+    (Wan, Qwen-Image, etc.) architectures.
 
     :return: List of (name, module) pairs
     """
+    if hasattr(decoder, "conv_in"):
+        return _stages_standard(decoder)
+    elif hasattr(decoder, "conv1"):
+        return _stages_3d(decoder)
+    else:
+        logger.warning(
+            f"[InpaintVAEDecode] Unknown decoder type {type(decoder).__name__}, "
+            f"no compositing stages found"
+        )
+        return []
+
+
+def _stages_standard(decoder):
+    """Stage detection for standard Decoder (SD 1.5, SDXL, etc.)."""
     stages = []
 
     # Stage 0: after initial convolution (latent resolution)
@@ -41,9 +54,6 @@ def _get_stage_modules(decoder):
     stages.append(("mid", decoder.mid.block_2))
 
     # Stages 2+: after each up level
-    # Decoder iterates i_level from num_resolutions-1 down to 0.
-    # Levels with i_level != 0 have an upsample module.
-    # Level 0 (highest resolution) has no upsample.
     num_res = decoder.num_resolutions
     for i_level in reversed(range(num_res)):
         up = decoder.up[i_level]
@@ -51,6 +61,34 @@ def _get_stage_modules(decoder):
             stages.append((f"up_{i_level}", up.upsample))
         else:
             stages.append((f"up_{i_level}", up.block[-1]))
+
+    return stages
+
+
+def _stages_3d(decoder):
+    """Stage detection for Decoder3d (Wan, Qwen-Image, etc.)."""
+    stages = []
+
+    # Stage 0: after initial convolution
+    stages.append(("conv_in", decoder.conv1))
+
+    # Stage 1: after middle blocks
+    middle_layers = list(decoder.middle)
+    if middle_layers:
+        stages.append(("mid", middle_layers[-1]))
+
+    # Stages 2+: after each spatial upsample in the sequential upsample blocks
+    up_idx = 0
+    for layer in decoder.upsamples:
+        if type(layer).__name__ == "Resample":
+            stages.append((f"up_{up_idx}", layer))
+            up_idx += 1
+
+    # If no Resample found, hook into last layer
+    if up_idx == 0:
+        ups = list(decoder.upsamples)
+        if ups:
+            stages.append(("up_last", ups[-1]))
 
     return stages
 
