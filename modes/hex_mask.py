@@ -301,12 +301,15 @@ def create_feathered_masks(
                 # Left boundary — shared with sector (d-1) % 6
                 if (d - 1) % 6 not in active_directions:
                     ang = offset_angles - d * (math.pi / 3)
-                    feather = feather * (ang * radius / feather_pixels).clamp(0, 1)
+                    side_w = (ang * radius / feather_pixels).clamp(0, 1)
+                    # Side feathering only near inner edge; outer edge stays sharp
+                    feather = feather * (side_w + (1 - side_w) * inner_weight)
 
                 # Right boundary — shared with sector (d+1) % 6
                 if (d + 1) % 6 not in active_directions:
                     ang = (d + 1) * (math.pi / 3) - offset_angles
-                    feather = feather * (ang * radius / feather_pixels).clamp(0, 1)
+                    side_w = (ang * radius / feather_pixels).clamp(0, 1)
+                    feather = feather * (side_w + (1 - side_w) * inner_weight)
 
             neighbor_masks[d] = feather * sector_mask.float()
 
