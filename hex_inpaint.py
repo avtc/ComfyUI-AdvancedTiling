@@ -1,7 +1,6 @@
 """
-Hex tile inpainting: composites center + neighbor images in pixel space,
-then VAE-encodes the result into a coherent latent for natural edge
-transitions.
+Hex tile inpainting: composites center + neighbor latents with border masks
+for natural edge transitions.
 
 Uses hex geometry directly (not through settings tiling mode) so that:
 - Masks and compositing always use hex_tiling
@@ -94,60 +93,67 @@ def _build_neighbor_map(
     return neighbor_map
 
 
-def composite_images(
-    center_image: torch.Tensor,
-    neighbor_images: dict[str, torch.Tensor],
+def composite_latents(
+    center_latent: torch.Tensor,
+    neighbor_latents: dict[str, torch.Tensor],
     settings: Settings,
     rotation_steps: int = 0,
 ) -> torch.Tensor:
     """
-    Composite center and neighbor images in pixel space.
+    Composite center and neighbor latents into a single latent.
 
-    Pastes neighbor image content into the waste region around the center hex.
-    The result can then be VAE-encoded into a single coherent latent, avoiding
-    the convolution bleed artifacts that occur when pasting in latent space.
+    Places neighbor content in the waste region around the center hex.
 
-    :param center_image: Center tile image (B, H, W, C)
-    :param neighbor_images: Dict mapping direction name ("E", "NE", etc.)
-                            to neighbor image
-    :param settings: Tiling settings
+    :param center_latent: Center tile latent
+    :param neighbor_latents: Dict mapping direction name ("E", "NE", etc.)
+                             to neighbor latent
+    :param settings: Tiling settings (rotation only)
     :param rotation_steps: Rotate direction mapping by N steps clockwise
-    :return: Composited image (same shape as input)
+    :return: Composited latent (same shape as input)
     """
-    result = center_image.clone()
-    _, H, W, _ = result.shape
+    t0 = time.time()
+    result, original_shape = _normalize_latent(center_latent)
+    B, C, H, W = result.shape
 
+    t1 = time.time()
     neighbor_map = _build_neighbor_map(W, H, settings)
+    t2 = time.time()
+
+    total_waste = (neighbor_map >= 0).sum().item()
+    logger.info(f"composite_latents: waste={total_waste}/{H*W}, "
+                f"shape=({B},{C},{H},{W}), "
+                f"normalize={t1-t0:.3f}s, neighbor_map={t2-t1:.3f}s")
+
     n = len(NEIGHBOR_DIRECTIONS)
     direction_to_idx = {name: idx for idx, name in enumerate(NEIGHBOR_DIRECTIONS)}
 
     total_pasted = 0
-    total_waste = (neighbor_map >= 0).sum().item()
-
-    for direction_name, neighbor_img in neighbor_images.items():
+    for direction_name, neighbor_latent in neighbor_latents.items():
         dir_idx = direction_to_idx[direction_name]
         target_idx = (dir_idx - rotation_steps) % n
-        waste_mask = (neighbor_map == target_idx)
-        count = waste_mask.sum().item()
+        mask = (neighbor_map == target_idx)  # [H, W] boolean
+        count = mask.sum().item()
 
         if count == 0:
             logger.info(f"  {direction_name}: no waste pixels found")
             continue
 
-        result[0][waste_mask] = neighbor_img[0][waste_mask]
+        neighbor_4d, _ = _normalize_latent(neighbor_latent)
+        result[:, :, mask] = neighbor_4d[:, :, mask]
         total_pasted += count
         logger.info(f"  {direction_name}: pasted {count} pixels")
 
-    logger.info(f"composite_images: {total_pasted}/{total_waste} waste pixels, "
-                f"shape=({H},{W})")
+    logger.info(f"  total pasted: {total_pasted}/{total_waste} waste pixels")
+
+    if len(original_shape) > 4:
+        result = result.reshape(original_shape)
     return result
 
 
 class AdvancedTilingHexInpaint:
     """
-    Hex tile inpainting node. Composites center + neighbor images in pixel
-    space, VAE-encodes the result, and generates border masks for natural
-    edge transitions.
+    Hex tile inpainting node. Composites center + neighbor latents,
+    generates border masks for natural edge transitions.
 
     Uses hex geometry directly — does NOT apply Conv2d wrapping or depend
     on the settings tiling mode. The settings only provide hex rotation.
@@ -164,7 +170,7 @@ class AdvancedTilingHexInpaint:
                     ["Masked Denoising"],
                     {
                         "default": "Masked Denoising",
-                        "tooltip": "Inpainting mode. 'Masked Denoising' composites neighbor images into the waste region in pixel space and applies a noise mask to the border.",
+                        "tooltip": "Inpainting mode. 'Masked Denoising' composites neighbor latents into the waste region and applies a noise mask to the border.",
                     },
                 ),
                 "border_width": (
@@ -266,28 +272,37 @@ class AdvancedTilingHexInpaint:
         if rotation_steps:
             logger.info(f"[HexInpaint] Mapping rotated by {rotation_steps} steps CW")
 
-        # 1. Collect neighbor images
+        # 1. VAE-encode center image
+        t0 = time.time()
+        center_latent = vae.encode(center_image)
+        t1 = time.time()
+        logger.info(f"[HexInpaint] VAE encode center: {t1-t0:.3f}s, "
+                     f"image={center_image.shape}, latent={center_latent.shape}")
+
+        # 2. VAE-encode provided neighbor images
+        neighbor_latents = {}
         neighbor_images = {}
         for direction in NEIGHBOR_DIRECTIONS:
             key = f"neighbor_{direction}"
             if key in kwargs and kwargs[key] is not None:
+                t_n = time.time()
+                neighbor_latents[direction] = vae.encode(kwargs[key])
                 neighbor_images[direction] = kwargs[key]
+                logger.info(f"[HexInpaint] VAE encode {direction}: "
+                             f"{time.time()-t_n:.3f}s, latent={neighbor_latents[direction].shape}")
 
-        logger.info(f"[HexInpaint] Neighbors provided: {list(neighbor_images.keys())}")
+        logger.info(f"[HexInpaint] Neighbors provided: {list(neighbor_latents.keys())}")
 
-        # 2. Composite in pixel space, then VAE encode
-        t0 = time.time()
-        if neighbor_images:
-            composited_image = composite_images(
-                center_image, neighbor_images, settings, rotation_steps
+        # 3. Composite latents with rotated direction mapping
+        if neighbor_latents:
+            t2 = time.time()
+            composited = composite_latents(
+                center_latent, neighbor_latents, settings, rotation_steps
             )
-            composited = vae.encode(composited_image)
-            logger.info(f"[HexInpaint] Pixel composite + VAE encode: {time.time()-t0:.3f}s, "
-                         f"latent={composited.shape}")
+            logger.info(f"[HexInpaint] Composite: {time.time()-t2:.3f}s")
         else:
-            composited = vae.encode(center_image)
-            logger.info(f"[HexInpaint] VAE encode center: {time.time()-t0:.3f}s, "
-                         f"image={center_image.shape}, latent={composited.shape}")
+            composited = center_latent
+            logger.info("[HexInpaint] No neighbor images — skipping compositing")
 
         # 4. Determine active directions (have non-matching neighbor)
         active_directions = set()
@@ -422,7 +437,13 @@ class AdvancedTilingHexInpaint:
                 paintbrush_img[0][waste_mask] = neighbor_img[0][waste_mask]
 
         t_pb = time.time()
-        paintbrush_composited = vae.encode(paintbrush_img)
+        paintbrush_latent = vae.encode(paintbrush_img)
+        if neighbor_latents:
+            paintbrush_composited = composite_latents(
+                paintbrush_latent, neighbor_latents, settings, rotation_steps,
+            )
+        else:
+            paintbrush_composited = paintbrush_latent
         paintbrush_latent_dict = {
             "samples": paintbrush_composited,
             "noise_mask": noise_mask,
