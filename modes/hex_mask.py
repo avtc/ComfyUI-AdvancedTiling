@@ -290,6 +290,12 @@ def create_feathered_masks(
                 torch.atan2(dy, dx) % (2 * math.pi) + math.pi / 6
             ) % (2 * math.pi)
 
+            # Distance to hex boundary for fading side feathering near outer edge
+            dist_to_outer = _manhattan_distance_to_region(~inside)
+            outer_weight = torch.from_numpy(
+                np.clip(dist_to_outer / feather_pixels, 0.0, 1.0),
+            )
+
         for d in active_directions:
             sector_mask = border & (sectors == d)
             if not sector_mask.any():
@@ -302,14 +308,14 @@ def create_feathered_masks(
                 if (d - 1) % 6 not in active_directions:
                     ang = offset_angles - d * (math.pi / 3)
                     side_w = (ang * radius / feather_pixels).clamp(0, 1)
-                    # Side feathering only near inner edge; outer edge stays sharp
-                    feather = feather * (side_w + (1 - side_w) * inner_weight)
+                    # Side feathering fades out near outer edge (outer_weight→0)
+                    feather = feather * (1 - outer_weight * (1 - side_w))
 
                 # Right boundary — shared with sector (d+1) % 6
                 if (d + 1) % 6 not in active_directions:
                     ang = (d + 1) * (math.pi / 3) - offset_angles
                     side_w = (ang * radius / feather_pixels).clamp(0, 1)
-                    feather = feather * (side_w + (1 - side_w) * inner_weight)
+                    feather = feather * (1 - outer_weight * (1 - side_w))
 
             neighbor_masks[d] = feather * sector_mask.float()
 
