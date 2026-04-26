@@ -269,7 +269,20 @@ class AdvancedTilingHexGridPreview:
             if not pixel_mask.any():
                 continue
             cy, cx = pixel_mask.nonzero(as_tuple=True)
-            canvas[:, cy, cx, :] = img[:, tile_y_t[cy, cx], tile_x_t[cy, cx], :]
+            ty = tile_y_t[cy, cx]
+            tx = tile_x_t[cy, cx]
+            logger.info(f"[HexGridPreview]   cy range=[{cy.min().item()},{cy.max().item()}], "
+                         f"cx range=[{cx.min().item()},{cx.max().item()}], "
+                         f"ty range=[{ty.min().item()},{ty.max().item()}], "
+                         f"tx range=[{tx.min().item()},{tx.max().item()}]")
+            logger.info(f"[HexGridPreview]   canvas device={canvas.device}, dtype={canvas.dtype}, "
+                         f"img device={img.device}, dtype={img.dtype}")
+            logger.info(f"[HexGridPreview]   img sample at center: {img[0, 664, 664, :].tolist()}")
+            canvas[:, cy, cx, :] = img[:, ty, tx, :]
+            logger.info(f"[HexGridPreview]   canvas sum after write: {canvas.sum().item():.4f}")
+
+        logger.info(f"[HexGridPreview] total canvas sum={canvas.sum().item():.4f}, "
+                     f"nonzero={int((canvas > 0).sum())}")
 
         # Crop to content bounds
         content = canvas[0].sum(dim=-1) > 0
