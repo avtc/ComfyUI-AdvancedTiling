@@ -8,6 +8,7 @@ from .advanced_tiling import (
     AdvancedTilingSettings,
     AdvancedTiling,
     AdvancedTilingVAEDecode,
+    HexCropImage,
 )
 from .hex_inpaint import AdvancedTilingHexInpaint
 from .hex_grid_preview import AdvancedTilingHexGridPreview
@@ -18,6 +19,7 @@ NODE_CLASS_MAPPINGS = {
     "AdvancedTilingVAEDecode": AdvancedTilingVAEDecode,
     "AdvancedTilingHexInpaint": AdvancedTilingHexInpaint,
     "AdvancedTilingHexGridPreview": AdvancedTilingHexGridPreview,
+    "HexCropImage": HexCropImage,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -26,6 +28,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "AdvancedTilingVAEDecode": "Advanced Tiling VAE Decode",
     "AdvancedTilingHexInpaint": "Advanced Tiling Hex Inpaint",
     "AdvancedTilingHexGridPreview": "Advanced Tiling Hex Grid Preview",
+    "HexCropImage": "Hex Crop Image",
 }
 
 try:

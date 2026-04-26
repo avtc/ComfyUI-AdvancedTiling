@@ -404,3 +404,57 @@ class AdvancedTilingVAEDecode:
                 image = torch.cat((image, cropped_mask.to(device=image.device)), dim=3)
 
         return (image,)
+
+
+class HexCropImage:
+    """
+    Crop a hexagon from an input image, outputting a square RGBA crop.
+    """
+
+    # pylint: disable=invalid-name
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+            },
+            "optional": {
+                "settings": ("ADVANCED_TILING_SETTINGS",),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "run"
+    CATEGORY = "image"
+
+    def run(self, image, settings=None):
+        if settings is None:
+            settings = Settings("Hexagon", 0, 1.0)
+
+        img_h, img_w = image.shape[1], image.shape[2]
+        mask = create_crop_mask(img_w, img_h, settings)
+        mask_2d = mask[0, :, :, 0]
+        rows = torch.any(mask_2d, dim=1)
+        cols = torch.any(mask_2d, dim=0)
+        row_indices = torch.where(rows)[0]
+        col_indices = torch.where(cols)[0]
+        rmin, rmax = row_indices[0].item(), row_indices[-1].item()
+        cmin, cmax = col_indices[0].item(), col_indices[-1].item()
+
+        hex_h = rmax - rmin + 1
+        center_r = (rmin + rmax) // 2
+        center_c = (cmin + cmax) // 2
+        half = hex_h // 2
+        sq_rmin = max(0, center_r - half)
+        sq_cmin = max(0, center_c - half)
+        sq_rmax = min(img_h, sq_rmin + hex_h) - 1
+        sq_cmax = min(img_w, sq_cmin + hex_h) - 1
+        sq_rmin = sq_rmax + 1 - hex_h
+        sq_cmin = sq_cmax + 1 - hex_h
+
+        image = image[:, sq_rmin:sq_rmax + 1, sq_cmin:sq_cmax + 1, :]
+        cropped_mask = mask[:, sq_rmin:sq_rmax + 1, sq_cmin:sq_cmax + 1, :]
+        image = torch.cat((image, cropped_mask.to(device=image.device)), dim=3)
+
+        return (image,)
