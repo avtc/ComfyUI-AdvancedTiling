@@ -357,7 +357,9 @@ class InpaintVAEDecode:
             inside = (waste_mask == 0)
             if inside.dim() == 3:
                 inside = inside[0]
-            z_inpaint = edge_extend_from_waste(z_inpaint, inside)
+            z_4d, orig_shape = _normalize_latent(z_inpaint)
+            z_4d = edge_extend_from_waste(z_4d, inside)
+            z_inpaint = z_4d.reshape(orig_shape)
 
         # Without waste injection, just decode directly
         if not inject_waste:
