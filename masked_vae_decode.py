@@ -313,8 +313,8 @@ def laplacian_pyramid_blend(
     a = image_a.float().permute(0, 3, 1, 2)
     b = image_b.float().permute(0, 3, 1, 2)
 
-    # Expand mask batch dimension to match images
-    m = mask.float().expand(B, -1, -1, -1)  # (B, 1, H, W)
+    # Expand mask batch dimension to match images, ensure same device
+    m = mask.float().to(device=a.device).expand(B, -1, -1, -1)  # (B, 1, H, W)
 
     # Build Gaussian pyramids
     gp_a = _gaussian_pyramid(a, levels)
@@ -590,6 +590,7 @@ class InpaintVAEDecode:
         # Laplacian pyramid blend post-processing
         if laplacian_blend:
             mask = _make_smooth_hex_mask(waste_mask, blend_band, image.shape)
-            image = laplacian_pyramid_blend(image, original_image, mask)
+            ref = original_image.to(device=image.device, dtype=image.dtype)
+            image = laplacian_pyramid_blend(image, ref, mask)
 
         return (image,)
