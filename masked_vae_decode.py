@@ -314,6 +314,11 @@ class InpaintVAEDecode:
                     "default": False,
                     "tooltip": "Blend hex boundary pixels toward waste area before decode. Produces seamless transitions when cropped tiles are placed in a grid.",
                 }),
+                "inject_waste": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Inject original neighbor content into waste area at each VAE upscale stage. "
+                    "Requires source_samples or original_image. Disable for single-pass decode with edge-extend only.",
+                }),
             },
             "optional": {
                 "source_samples": (
@@ -343,7 +348,8 @@ class InpaintVAEDecode:
     )
 
     def decode(self, samples, vae, waste_mask, start_stage=0, end_stage=-1,
-               edge_extend=False, source_samples=None, original_image=None):
+               edge_extend=False, inject_waste=True,
+               source_samples=None, original_image=None):
         z_inpaint = samples["samples"].clone()
 
         # Edge-extend: blend hex boundary toward waste area
@@ -353,6 +359,18 @@ class InpaintVAEDecode:
                 inside = inside[0]
             z_inpaint = edge_extend_from_waste(z_inpaint, inside)
 
+        # Without waste injection, just decode directly
+        if not inject_waste:
+            with torch.no_grad():
+                image = vae.decode(z_inpaint)
+
+            if image.ndim == 5:
+                image = image.reshape(
+                    -1, image.shape[-3], image.shape[-2], image.shape[-1]
+                )
+            return (image,)
+
+        # Reference injection: decode reference, then composite at each VAE stage
         if original_image is not None:
             z_ref = vae.encode(original_image)
         elif source_samples is not None:
@@ -360,7 +378,7 @@ class InpaintVAEDecode:
         else:
             raise ValueError(
                 "InpaintVAEDecode requires either source_samples or original_image "
-                "to provide reference features for the preserved area."
+                "when inject_waste is enabled."
             )
 
         z_inpaint_4d, _ = _normalize_latent(z_inpaint)
@@ -368,8 +386,10 @@ class InpaintVAEDecode:
 
         _, _, H_lat, W_lat = z_inpaint_4d.shape
 
-        # Prepare mask — keep at original resolution for sharp boundaries
-        mask_prepared = _prepare_mask(waste_mask, vae.device)
+        # Prepare compositing mask: inject reference into waste area (waste=1)
+        # Invert waste_mask so: inside=1 (keep output), waste=0 (inject reference)
+        compositing_mask = 1.0 - waste_mask.float()
+        mask_prepared = _prepare_mask(compositing_mask, vae.device)
 
         # Get compositing stages from the decoder
         decoder = vae.first_stage_model.decoder
