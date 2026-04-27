@@ -254,6 +254,35 @@ def edge_extend_from_waste(
     return latent * (1 - w) + waste_content * w
 
 
+def _feather_inner_edge(
+    image: torch.Tensor,
+    inside_mask: torch.Tensor,
+    blend_band: int,
+) -> torch.Tensor:
+    """Blend inner hex edge toward nearest waste-area pixel content.
+
+    Only affects a narrow band of pixels inside the hex boundary.
+    Waste area and deep interior are untouched.
+
+    :param image: (B, H, W, C) decoded image.
+    :param inside_mask: (H, W) bool where True = inside hex.
+    :param blend_band: Blend band width in pixels.
+    :return: Modified image with feathered inner edge.
+    """
+    weights, nearest_y, nearest_x = _compute_boundary_blend_map_from_mask(
+        inside_mask, blend_band,
+    )
+
+    weights = weights.to(image.device)
+    nearest_y = nearest_y.to(image.device)
+    nearest_x = nearest_x.to(image.device)
+
+    waste_content = image[:, nearest_y, nearest_x, :]  # (B, H, W, C)
+
+    w = weights.unsqueeze(0).unsqueeze(-1)  # (1, H, W, 1)
+    return image * (1 - w) + waste_content * w
+
+
 # ---------------------------------------------------------------------------
 # Laplacian pyramid blending
 # ---------------------------------------------------------------------------
@@ -484,8 +513,8 @@ class InpaintVAEDecode:
                     "Waste area is replaced pixel-perfect; only a narrow band at the hex edge is blended.",
                 }),
                 "blend_band": ("INT", {
-                    "default": 16,
-                    "min": 4,
+                    "default": 8,
+                    "min": 1,
                     "max": 64,
                     "tooltip": "Transition band width in pixels at hex boundary.",
                 }),
@@ -605,21 +634,27 @@ class InpaintVAEDecode:
                     -1, image.shape[-3], image.shape[-2], image.shape[-1]
                 )
 
-        # Post-processing: restore waste area and blend at boundary
+        # Post-processing: smooth seam at hex boundary
         if feather_restore or laplacian_blend:
-            ref = original_image.to(device=image.device, dtype=image.dtype)
-            blend_mask = waste_mask_img if waste_mask_img is not None else waste_mask
-            mask = _make_smooth_hex_mask(blend_mask, blend_band, image.shape)
-
             if feather_restore:
-                # Restore waste from original_image; feather only at inner hex edge.
-                # mask: 1.0 inside hex (keep decoded), 0.0 waste (use original_image),
-                # smooth gradient only in the blend_band at hex boundary.
-                mask = mask.to(device=image.device)
-                mask_hw = mask.permute(0, 2, 3, 1)  # (1, H, W, 1)
-                image = image.float() * mask_hw + ref.float() * (1 - mask_hw)
-                image = image.to(dtype=ref.dtype)
+                # Blend inner hex edge toward nearest waste-area pixel content.
+                # Only affects a narrow band inside the hex boundary.
+                # Waste area and deep interior are untouched.
+                blend_source = waste_mask_img if waste_mask_img is not None else waste_mask
+                inside = (blend_source == 0)
+                if inside.dim() == 3:
+                    inside = inside[0]
+                H_img, W_img = image.shape[1], image.shape[2]
+                if inside.shape != (H_img, W_img):
+                    inside = F.interpolate(
+                        inside.float().unsqueeze(0).unsqueeze(0),
+                        size=(H_img, W_img), mode="nearest",
+                    ).squeeze(0).squeeze(0).bool()
+                image = _feather_inner_edge(image, inside, blend_band)
             else:
+                ref = original_image.to(device=image.device, dtype=image.dtype)
+                blend_mask = waste_mask_img if waste_mask_img is not None else waste_mask
+                mask = _make_smooth_hex_mask(blend_mask, blend_band, image.shape)
                 image = laplacian_pyramid_blend(image, ref, mask)
 
         return (image,)
