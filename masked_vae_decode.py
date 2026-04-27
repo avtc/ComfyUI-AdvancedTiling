@@ -7,10 +7,10 @@ latent. This prevents VAE convolution bleed from accumulating through the
 decoder layers, reducing artifacts from ~16-24 pixels to ~1-3 pixels at
 mask boundaries.
 
-When original_image is provided, it is VAE-encoded and used as the
-reference latent instead of source_samples. This avoids bleed from
-latent-space compositing boundaries (e.g. center+neighbor hex tiles)
-that would otherwise contaminate the preserved area features.
+The original_image is VAE-encoded and used as the
+reference latent. This avoids bleed from latent-space compositing
+boundaries (e.g. center+neighbor hex tiles) that would otherwise
+contaminate the preserved area features.
 
 How it works:
   1. Decode the reference latent, saving intermediate features at each stage
@@ -20,6 +20,7 @@ How it works:
 """
 
 import logging
+import math
 
 import numpy as np
 import torch
@@ -253,20 +254,165 @@ def edge_extend_from_waste(
     return latent * (1 - w) + waste_content * w
 
 
+# ---------------------------------------------------------------------------
+# Laplacian pyramid blending
+# ---------------------------------------------------------------------------
+
+def _gaussian_pyramid(img: torch.Tensor, levels: int) -> list[torch.Tensor]:
+    """Build a Gaussian pyramid by successive 2x average-pooling.
+
+    :param img: Tensor in (B, C, H, W) layout.
+    :param levels: Number of down-sampling steps.
+    :return: List of tensors from finest (original) to coarsest.
+    """
+    gp = [img]
+    cur = img
+    for _ in range(levels):
+        cur = F.avg_pool2d(cur, kernel_size=2, stride=2)
+        gp.append(cur)
+    return gp
+
+
+def _laplacian_pyramid(gp: list[torch.Tensor]) -> list[torch.Tensor]:
+    """Build a Laplacian pyramid from a Gaussian pyramid.
+
+    L[i] = G[i] - upsample(G[i+1])
+
+    :param gp: Gaussian pyramid (finest to coarsest).
+    :return: Laplacian pyramid (finest to coarsest).
+    """
+    lp = []
+    for i in range(len(gp) - 1):
+        H, W = gp[i].shape[-2], gp[i].shape[-1]
+        up = F.interpolate(gp[i + 1], size=(H, W), mode="bilinear", align_corners=False)
+        lp.append(gp[i] - up)
+    lp.append(gp[-1])  # coarsest residue
+    return lp
+
+
+def laplacian_pyramid_blend(
+    image_a: torch.Tensor,
+    image_b: torch.Tensor,
+    mask: torch.Tensor,
+    levels: int = 0,
+) -> torch.Tensor:
+    """Blend two images using Laplacian pyramid with a smooth mask.
+
+    :param image_a: (B, H, W, C) decoded inpainted image.
+    :param image_b: (B, H, W, C) original_image reference.
+    :param mask: (1, 1, H, W) smooth mask. 1.0 = keep *image_a*, 0.0 = keep *image_b*.
+    :param levels: Pyramid depth. 0 = auto (``log2(min(H,W)) - 2``).
+    :return: (B, H, W, C) blended image.
+    """
+    B, H, W, C = image_a.shape
+
+    if levels <= 0:
+        levels = max(1, int(math.log2(min(H, W))) - 2)
+
+    # Convert to (B, C, H, W) float
+    a = image_a.float().permute(0, 3, 1, 2)
+    b = image_b.float().permute(0, 3, 1, 2)
+
+    # Expand mask batch dimension to match images
+    m = mask.float().expand(B, -1, -1, -1)  # (B, 1, H, W)
+
+    # Build Gaussian pyramids
+    gp_a = _gaussian_pyramid(a, levels)
+    gp_b = _gaussian_pyramid(b, levels)
+    gp_m = _gaussian_pyramid(m, levels)
+
+    # Build Laplacian pyramids
+    lp_a = _laplacian_pyramid(gp_a)
+    lp_b = _laplacian_pyramid(gp_b)
+
+    # Blend at each level
+    blended_lp = []
+    for i in range(len(lp_a)):
+        g_mask = gp_m[i]
+        blended = lp_a[i] * g_mask + lp_b[i] * (1 - g_mask)
+        blended_lp.append(blended)
+
+    # Reconstruct from coarsest to finest
+    result = blended_lp[-1]
+    for i in range(len(blended_lp) - 2, -1, -1):
+        H_i, W_i = blended_lp[i].shape[-2], blended_lp[i].shape[-1]
+        result = F.interpolate(result, size=(H_i, W_i), mode="bilinear", align_corners=False)
+        result = result + blended_lp[i]
+
+    # Clamp, convert back to (B, H, W, C)
+    result = result.clamp(0, 1).permute(0, 2, 3, 1)
+    return result.to(dtype=image_a.dtype)
+
+
+def _make_smooth_hex_mask(
+    waste_mask: torch.Tensor,
+    blend_band: int,
+    image_shape: tuple,
+) -> torch.Tensor:
+    """Create smooth hex mask for Laplacian pyramid blending.
+
+    Inverts waste_mask (inside=1, waste=0) and applies Gaussian blur
+    to create a smooth transition zone at the hex boundary.
+
+    :param waste_mask: (1, H, W) or (H, W), waste=1, inside=0.
+    :param blend_band: Transition band width in pixels.
+    :param image_shape: (B, H, W, C) of the target image.
+    :return: (1, 1, H, W) float tensor, 1.0=inside hex, 0.0=waste.
+    """
+    # 1. Invert: inside becomes 1, waste becomes 0
+    mask = 1.0 - waste_mask.float()
+
+    # 2. Reshape to (1, 1, H, W)
+    if mask.dim() == 2:
+        mask = mask.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
+    elif mask.dim() == 3:
+        mask = mask[:1].unsqueeze(1)  # (1, 1, H, W)
+
+    # 3. Resize to match image_shape spatial dims if needed
+    _, _, H, W = mask.shape
+    target_H, target_W = image_shape[1], image_shape[2]
+    if H != target_H or W != target_W:
+        mask = F.interpolate(
+            mask, size=(target_H, target_W), mode="bilinear", align_corners=False,
+        )
+
+    # 4. Gaussian blur
+    sigma = blend_band / 3.0
+    ksize = int(6 * sigma + 1)
+    if ksize % 2 == 0:
+        ksize += 1  # ensure odd
+
+    # Create 1D Gaussian kernel
+    x = torch.arange(ksize, dtype=torch.float32) - ksize // 2
+    kernel_1d = torch.exp(-0.5 * (x / sigma) ** 2)
+    kernel_1d = kernel_1d / kernel_1d.sum()
+
+    # Create 2D kernel via outer product, shape (1, 1, k, k)
+    kernel_2d = kernel_1d.unsqueeze(1) * kernel_1d.unsqueeze(0)
+    kernel_2d = kernel_2d.unsqueeze(0).unsqueeze(0)  # (1, 1, k, k)
+
+    # Apply with reflect padding
+    pad = ksize // 2
+    mask = F.pad(mask, [pad, pad, pad, pad], mode="reflect")
+    mask = F.conv2d(mask, kernel_2d)
+
+    return mask.clamp(0.0, 1.0)
+
+
 class InpaintVAEDecode:
     """
     VAE decode with intermediate compositing to eliminate bleed at mask
     boundaries.
 
-    Takes an inpainted latent (after KSampler) and a reference latent, along
+    Takes an inpainted latent (after KSampler) and an original image, along
     with the inpaint mask. Decodes both through the VAE decoder but, at each
     upsampling stage, replaces features in preserved areas with features from
     the reference decode.
 
-    When original_image is provided, it is VAE-encoded and used as the
-    reference instead of source_samples. This avoids bleed from latent-space
-    compositing boundaries (e.g. center+neighbor hex tiles) that would
-    otherwise contaminate the preserved-area features.
+    The original_image is VAE-encoded and used as the reference decode.
+    This avoids bleed from latent-space compositing boundaries
+    (e.g. center+neighbor hex tiles) that would otherwise contaminate the
+    preserved-area features.
     """
 
     @classmethod
@@ -285,6 +431,14 @@ class InpaintVAEDecode:
                         "waste=1 (keep from samples), "
                         "inside=0 (inject from reference). "
                         "Also defines hex geometry for edge-extend."
+                    },
+                ),
+                "original_image": (
+                    "IMAGE",
+                    {
+                        "tooltip": "Original clean image. VAE-encoded and used "
+                        "as the reference decode. Avoids VAE convolution bleed "
+                        "from latent-space compositing boundaries."
                     },
                 ),
                 "start_stage": (
@@ -317,26 +471,20 @@ class InpaintVAEDecode:
                 "inject_waste": ("BOOLEAN", {
                     "default": True,
                     "tooltip": "Inject original neighbor content into waste area at each VAE upscale stage. "
-                    "Requires source_samples or original_image. Disable for single-pass decode with edge-extend only.",
+                    "Disable for single-pass decode with edge-extend only.",
+                }),
+                "laplacian_blend": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Post-process hex boundary with Laplacian pyramid blending. "
+                    "Uses original_image as reference for seamless transitions.",
+                }),
+                "blend_band": ("INT", {
+                    "default": 16,
+                    "min": 4,
+                    "max": 64,
+                    "tooltip": "Transition band width in pixels at hex boundary.",
                 }),
             },
-            "optional": {
-                "source_samples": (
-                    "LATENT",
-                    {
-                        "tooltip": "Source latent before sampling (from HexInpaint node). "
-                        "Used as reference when original_image is not provided."
-                    },
-                ),
-                "original_image": (
-                    "IMAGE",
-                    {
-                        "tooltip": "Original clean image. When provided, VAE-encoded and used "
-                        "as the reference decode instead of source_samples. Avoids VAE "
-                        "convolution bleed from latent-space compositing boundaries."
-                    },
-                ),
-            }
         }
 
     RETURN_TYPES = ("IMAGE",)
@@ -347,9 +495,10 @@ class InpaintVAEDecode:
         "VAE bleed at mask boundaries."
     )
 
-    def decode(self, samples, vae, waste_mask, start_stage=0, end_stage=-1,
+    def decode(self, samples, vae, waste_mask, original_image,
+               start_stage=0, end_stage=-1,
                edge_extend=False, inject_waste=True,
-               source_samples=None, original_image=None):
+               laplacian_blend=False, blend_band=16):
         z_inpaint = samples["samples"].clone()
 
         # Edge-extend: blend hex boundary toward waste area
@@ -361,90 +510,86 @@ class InpaintVAEDecode:
             z_4d = edge_extend_from_waste(z_4d, inside)
             z_inpaint = z_4d.reshape(orig_shape)
 
-        # Without waste injection, just decode directly
-        if not inject_waste:
+        # Decode
+        if inject_waste:
+            # Two-pass decode with per-stage compositing
+            z_ref = vae.encode(original_image)
+
+            z_inpaint_4d, _ = _normalize_latent(z_inpaint)
+            z_ref_4d, _ = _normalize_latent(z_ref)
+
+            _, _, H_lat, W_lat = z_inpaint_4d.shape
+
+            # Prepare compositing mask: inject reference into waste area (waste=1)
+            # Invert waste_mask so: inside=1 (keep output), waste=0 (inject reference)
+            compositing_mask = 1.0 - waste_mask.float()
+            mask_prepared = _prepare_mask(compositing_mask, vae.device)
+
+            # Get compositing stages from the decoder
+            decoder = vae.first_stage_model.decoder
+            stages = _get_stage_modules(decoder)
+
+            # Determine which stages to composite
+            last = len(stages) if end_stage < 0 else min(end_stage + 1, len(stages))
+            composite_stages = set(range(start_stage, last))
+            stage_names = [name for name, _ in stages]
+            active_names = [stage_names[i] for i in sorted(composite_stages) if i < len(stages)]
+            logger.info(
+                f"[InpaintVAEDecode] Latent ({H_lat}x{W_lat}), "
+                f"all stages: {stage_names}, compositing: {active_names}"
+            )
+
+            # Step 1: Reference decode — save features at stages we'll composite
+            ref_features = {}
+            save_hooks = []
+            for i, (name, module) in enumerate(stages):
+                if i in composite_stages:
+                    save_hooks.append(
+                        module.register_forward_hook(_save_hook(ref_features, name))
+                    )
+
+            with torch.no_grad():
+                vae.decode(z_ref)
+
+            for h in save_hooks:
+                h.remove()
+
+            ref_summary = {k: tuple(v.shape) for k, v in ref_features.items()}
+            logger.info(f"[InpaintVAEDecode] Reference features: {ref_summary}")
+
+            # Step 2: Main decode — composite only at selected stages
+            comp_hooks = []
+            for i, (name, module) in enumerate(stages):
+                if i in composite_stages:
+                    comp_hooks.append(
+                        module.register_forward_hook(
+                            _composite_hook(ref_features, mask_prepared, name)
+                        )
+                    )
+
             with torch.no_grad():
                 image = vae.decode(z_inpaint)
 
+            for h in comp_hooks:
+                h.remove()
+
+            # Handle 5D output (video VAEs)
             if image.ndim == 5:
                 image = image.reshape(
                     -1, image.shape[-3], image.shape[-2], image.shape[-1]
                 )
-            return (image,)
-
-        # Reference injection: decode reference, then composite at each VAE stage
-        if original_image is not None:
-            z_ref = vae.encode(original_image)
-        elif source_samples is not None:
-            z_ref = source_samples["samples"]
         else:
-            raise ValueError(
-                "InpaintVAEDecode requires either source_samples or original_image "
-                "when inject_waste is enabled."
-            )
-
-        z_inpaint_4d, _ = _normalize_latent(z_inpaint)
-        z_ref_4d, _ = _normalize_latent(z_ref)
-
-        _, _, H_lat, W_lat = z_inpaint_4d.shape
-
-        # Prepare compositing mask: inject reference into waste area (waste=1)
-        # Invert waste_mask so: inside=1 (keep output), waste=0 (inject reference)
-        compositing_mask = 1.0 - waste_mask.float()
-        mask_prepared = _prepare_mask(compositing_mask, vae.device)
-
-        # Get compositing stages from the decoder
-        decoder = vae.first_stage_model.decoder
-        stages = _get_stage_modules(decoder)
-
-        # Determine which stages to composite
-        last = len(stages) if end_stage < 0 else min(end_stage + 1, len(stages))
-        composite_stages = set(range(start_stage, last))
-        stage_names = [name for name, _ in stages]
-        active_names = [stage_names[i] for i in sorted(composite_stages) if i < len(stages)]
-        logger.info(
-            f"[InpaintVAEDecode] Latent ({H_lat}x{W_lat}), "
-            f"all stages: {stage_names}, compositing: {active_names}"
-        )
-
-        # Step 1: Reference decode — save features at stages we'll composite
-        ref_features = {}
-        save_hooks = []
-        for i, (name, module) in enumerate(stages):
-            if i in composite_stages:
-                save_hooks.append(
-                    module.register_forward_hook(_save_hook(ref_features, name))
+            # Single-pass decode
+            with torch.no_grad():
+                image = vae.decode(z_inpaint)
+            if image.ndim == 5:
+                image = image.reshape(
+                    -1, image.shape[-3], image.shape[-2], image.shape[-1]
                 )
 
-        with torch.no_grad():
-            vae.decode(z_ref)
-
-        for h in save_hooks:
-            h.remove()
-
-        ref_summary = {k: tuple(v.shape) for k, v in ref_features.items()}
-        logger.info(f"[InpaintVAEDecode] Reference features: {ref_summary}")
-
-        # Step 2: Main decode — composite only at selected stages
-        comp_hooks = []
-        for i, (name, module) in enumerate(stages):
-            if i in composite_stages:
-                comp_hooks.append(
-                    module.register_forward_hook(
-                        _composite_hook(ref_features, mask_prepared, name)
-                    )
-                )
-
-        with torch.no_grad():
-            image = vae.decode(z_inpaint)
-
-        for h in comp_hooks:
-            h.remove()
-
-        # Handle 5D output (video VAEs)
-        if image.ndim == 5:
-            image = image.reshape(
-                -1, image.shape[-3], image.shape[-2], image.shape[-1]
-            )
+        # Laplacian pyramid blend post-processing
+        if laplacian_blend:
+            mask = _make_smooth_hex_mask(waste_mask, blend_band, image.shape)
+            image = laplacian_pyramid_blend(image, original_image, mask)
 
         return (image,)

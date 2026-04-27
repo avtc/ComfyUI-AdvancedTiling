@@ -197,12 +197,17 @@ def test_masked_decode(vae, z_source, z_inpaint, mask_lat, mask_img):
     with torch.no_grad():
         img_regular = vae.decode(z_inpaint.to(device=device, dtype=dtype))
 
+    # Decode source latent for ground truth and to use as original_image
+    with torch.no_grad():
+        img_source = vae.decode(z_source.to(device=device, dtype=dtype))
+
     # Masked decode (reduced bleed)
     node = InpaintVAEDecode()
     samples = {"samples": z_inpaint}
-    source_samples = {"samples": z_source}
+    original_image = img_source.cpu().float()
 
-    (img_masked,) = node.decode(samples, source_samples, vae, mask_img)
+    (img_masked,) = node.decode(samples, vae, mask_img, original_image,
+                                inject_waste=True)
 
     assert img_regular.shape == img_masked.shape, \
         f"Shape mismatch: regular={img_regular.shape} vs masked={img_masked.shape}"
@@ -213,10 +218,6 @@ def test_masked_decode(vae, z_source, z_inpaint, mask_lat, mask_img):
                               mode='bilinear', align_corners=False)
     # mask_full is (1,1,H,W), image is (B,H,W,C) — reshape to (1,H,W,1)
     mask_full = mask_full.squeeze(1).unsqueeze(-1)  # (1, H, W, 1)
-
-    # Also decode source directly for ground truth
-    with torch.no_grad():
-        img_source = vae.decode(z_source.to(device=device, dtype=dtype))
 
     # Difference in preserved area between regular decode and source decode
     preserved_mask = (1 - mask_full).expand_as(img_regular)
