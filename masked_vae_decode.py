@@ -475,8 +475,13 @@ class InpaintVAEDecode:
                 }),
                 "laplacian_blend": ("BOOLEAN", {
                     "default": False,
-                    "tooltip": "Post-process hex boundary with Laplacian pyramid blending. "
-                    "Uses original_image as reference for seamless transitions.",
+                    "tooltip": "Post-process with Laplacian pyramid blending at hex boundary. "
+                    "Multi-scale blend between decoded and original_image.",
+                }),
+                "feather_restore": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Restore waste area from original_image with feathered transition at hex boundary. "
+                    "Waste area is replaced pixel-perfect; only a narrow band at the hex edge is blended.",
                 }),
                 "blend_band": ("INT", {
                     "default": 16,
@@ -508,7 +513,7 @@ class InpaintVAEDecode:
     def decode(self, samples, vae, waste_mask, original_image,
                start_stage=0, end_stage=-1,
                edge_extend=False, inject_waste=True,
-               laplacian_blend=False, blend_band=16,
+               laplacian_blend=False, feather_restore=False, blend_band=16,
                waste_mask_img=None):
         z_inpaint = samples["samples"].clone()
 
@@ -600,11 +605,21 @@ class InpaintVAEDecode:
                     -1, image.shape[-3], image.shape[-2], image.shape[-1]
                 )
 
-        # Laplacian pyramid blend post-processing
-        if laplacian_blend:
+        # Post-processing: restore waste area and blend at boundary
+        if feather_restore or laplacian_blend:
+            ref = original_image.to(device=image.device, dtype=image.dtype)
             blend_mask = waste_mask_img if waste_mask_img is not None else waste_mask
             mask = _make_smooth_hex_mask(blend_mask, blend_band, image.shape)
-            ref = original_image.to(device=image.device, dtype=image.dtype)
-            image = laplacian_pyramid_blend(image, ref, mask)
+
+            if feather_restore:
+                # Restore waste from original_image; feather only at inner hex edge.
+                # mask: 1.0 inside hex (keep decoded), 0.0 waste (use original_image),
+                # smooth gradient only in the blend_band at hex boundary.
+                mask = mask.to(device=image.device)
+                mask_hw = mask.permute(0, 2, 3, 1)  # (1, H, W, 1)
+                image = image.float() * mask_hw + ref.float() * (1 - mask_hw)
+                image = image.to(dtype=ref.dtype)
+            else:
+                image = laplacian_pyramid_blend(image, ref, mask)
 
         return (image,)
