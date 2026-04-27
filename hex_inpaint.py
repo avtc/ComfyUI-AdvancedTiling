@@ -17,6 +17,7 @@ from .modes import Settings
 from .modes.hex_mask import (
     NEIGHBOR_DIRECTIONS,
     create_feathered_masks,
+    create_waste_mask,
 )
 
 logger = logging.getLogger("ComfyUI-AdvancedTiling")
@@ -250,7 +251,7 @@ class AdvancedTilingHexInpaint:
             },
         }
 
-    RETURN_TYPES = ("LATENT", "MASK", "MASK", "MASK", "MASK", "MASK", "MASK", "MASK", "IMAGE", "IMAGE", "LATENT", "IMAGE")
+    RETURN_TYPES = ("LATENT", "MASK", "MASK", "MASK", "MASK", "MASK", "MASK", "MASK", "IMAGE", "IMAGE", "LATENT", "IMAGE", "MASK")
     RETURN_NAMES = (
         "LATENT", "MASK",
         *[f"{NEIGHBOR_DIRECTIONS[i]}_{DIRECTION_COLOR_NAMES[i]}"
@@ -259,6 +260,7 @@ class AdvancedTilingHexInpaint:
         "color_mask",
         "LATENT_paintbrush",
         "paintbrush_preview",
+        "WASTE_MASK",
     )
     FUNCTION = "run"
     CATEGORY = "conditioning"
@@ -337,6 +339,9 @@ class AdvancedTilingHexInpaint:
         _, border_mask_lat, neighbor_masks_lat = create_feathered_masks(
             W_lat, H_lat, settings, border_width, feather_lat, feather_sides, active_directions
         )
+
+        # Waste-area mask at latent resolution for InpaintVAEDecode
+        waste_mask_lat = create_waste_mask(W_lat, H_lat, settings)  # (1, H_lat, W_lat)
         t4 = time.time()
         logger.info(f"[HexInpaint] Latent masks ({W_lat}x{H_lat}): {t4-t3:.3f}s, "
                      f"border={int(border_mask_lat.sum().item())}, feather={feather_lat}px")
@@ -456,6 +461,9 @@ class AdvancedTilingHexInpaint:
         outputs.append(paintbrush_latent_dict)
         outputs.append(paintbrush_img)
         logger.info(f"[HexInpaint] Paintbrush latent: {time.time()-t_pb:.3f}s")
+
+        # output 13: waste-area mask (latent resolution)
+        outputs.append(waste_mask_lat)
 
         logger.info(f"[HexInpaint] Total: {time.time()-t_start:.3f}s")
         return tuple(outputs)

@@ -38,6 +38,23 @@ def _build_inside_mask(width: int, height: int, settings: Settings) -> torch.Ten
     return torch.from_numpy(is_inside)
 
 
+@functools.cache
+def create_waste_mask(width: int, height: int, settings: Settings) -> torch.Tensor:
+    """Create a mask where waste area (outside hex) = 1.0, inside hex = 0.0.
+
+    Uses the same hex geometry as _build_inside_mask so the mask aligns
+    exactly with the composited latent's waste regions.
+
+    :param width: Width at the target resolution (latent or image).
+    :param height: Height at the target resolution.
+    :param settings: Tiling settings providing hex geometry.
+    :return: Float tensor of shape (1, H, W) with values 0.0 (inside) or 1.0 (waste).
+    """
+    inside = _build_inside_mask(width, height, settings)  # (H, W) bool
+    waste = (~inside).float().unsqueeze(0)  # (1, H, W)
+    return waste
+
+
 def _square_erode(mask: torch.Tensor, pixels: int) -> torch.Tensor:
     """
     Axis-aligned (square SE) morphological erosion via separable max_pool1d.
