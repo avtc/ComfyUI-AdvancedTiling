@@ -251,7 +251,7 @@ class AdvancedTilingHexInpaint:
             },
         }
 
-    RETURN_TYPES = ("LATENT", "MASK", "MASK", "MASK", "MASK", "MASK", "MASK", "MASK", "IMAGE", "IMAGE", "LATENT", "IMAGE", "MASK")
+    RETURN_TYPES = ("LATENT", "MASK", "MASK", "MASK", "MASK", "MASK", "MASK", "MASK", "IMAGE", "IMAGE", "LATENT", "IMAGE", "MASK", "MASK")
     RETURN_NAMES = (
         "LATENT", "MASK",
         *[f"{NEIGHBOR_DIRECTIONS[i]}_{DIRECTION_COLOR_NAMES[i]}"
@@ -261,6 +261,7 @@ class AdvancedTilingHexInpaint:
         "LATENT_paintbrush",
         "paintbrush_preview",
         "WASTE_MASK",
+        "WASTE_MASK_IMG",
     )
     FUNCTION = "run"
     CATEGORY = "conditioning"
@@ -342,6 +343,7 @@ class AdvancedTilingHexInpaint:
 
         # Waste-area mask at latent resolution for InpaintVAEDecode
         waste_mask_lat = create_waste_mask(W_lat, H_lat, settings)  # (1, H_lat, W_lat)
+        waste_mask_img = create_waste_mask(W_img, H_img, settings)  # (1, H_img, W_img)
         t4 = time.time()
         logger.info(f"[HexInpaint] Latent masks ({W_lat}x{H_lat}): {t4-t3:.3f}s, "
                      f"border={int(border_mask_lat.sum().item())}, feather={feather_lat}px")
@@ -464,6 +466,8 @@ class AdvancedTilingHexInpaint:
 
         # output 13: waste-area mask (latent resolution)
         outputs.append(waste_mask_lat)
+        # output 14: waste-area mask (image resolution)
+        outputs.append(waste_mask_img)
 
         logger.info(f"[HexInpaint] Total: {time.time()-t_start:.3f}s")
         return tuple(outputs)

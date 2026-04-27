@@ -485,6 +485,16 @@ class InpaintVAEDecode:
                     "tooltip": "Transition band width in pixels at hex boundary.",
                 }),
             },
+            "optional": {
+                "waste_mask_img": (
+                    "MASK",
+                    {
+                        "tooltip": "Waste-area mask at image resolution from HexInpaint. "
+                        "When provided, used for pixel-perfect Laplacian pyramid blending. "
+                        "Falls back to upscaling waste_mask if not connected.",
+                    },
+                ),
+            },
         }
 
     RETURN_TYPES = ("IMAGE",)
@@ -498,7 +508,8 @@ class InpaintVAEDecode:
     def decode(self, samples, vae, waste_mask, original_image,
                start_stage=0, end_stage=-1,
                edge_extend=False, inject_waste=True,
-               laplacian_blend=False, blend_band=16):
+               laplacian_blend=False, blend_band=16,
+               waste_mask_img=None):
         z_inpaint = samples["samples"].clone()
 
         # Edge-extend: blend hex boundary toward waste area
@@ -521,8 +532,10 @@ class InpaintVAEDecode:
             _, _, H_lat, W_lat = z_inpaint_4d.shape
 
             # Prepare compositing mask: inject reference into waste area (waste=1)
-            # Invert waste_mask so: inside=1 (keep output), waste=0 (inject reference)
-            compositing_mask = 1.0 - waste_mask.float()
+            # Invert: inside=1 (keep output), waste=0 (inject reference)
+            # Use image-res mask when available for sharper boundaries at high-res stages
+            compositing_source = waste_mask_img if waste_mask_img is not None else waste_mask
+            compositing_mask = 1.0 - compositing_source.float()
             mask_prepared = _prepare_mask(compositing_mask, vae.device)
 
             # Get compositing stages from the decoder
@@ -589,7 +602,8 @@ class InpaintVAEDecode:
 
         # Laplacian pyramid blend post-processing
         if laplacian_blend:
-            mask = _make_smooth_hex_mask(waste_mask, blend_band, image.shape)
+            blend_mask = waste_mask_img if waste_mask_img is not None else waste_mask
+            mask = _make_smooth_hex_mask(blend_mask, blend_band, image.shape)
             ref = original_image.to(device=image.device, dtype=image.dtype)
             image = laplacian_pyramid_blend(image, ref, mask)
 
