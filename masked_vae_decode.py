@@ -19,16 +19,12 @@ How it works:
      - preserved area (0): inject reference features (resets accumulated bleed)
 """
 
-import functools
 import logging
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from scipy.ndimage import distance_transform_edt
-
-from .modes.hex_mask import _build_inside_mask
-from .modes import Settings
 
 logger = logging.getLogger("ComfyUI-AdvancedTiling")
 
@@ -190,38 +186,25 @@ def _prepare_mask(mask, device):
     return m
 
 
-@functools.cache
-def _compute_boundary_blend_map(
-    width: int,
-    height: int,
-    settings: Settings,
+def _compute_boundary_blend_map_from_mask(
+    inside_mask: torch.Tensor,
     blend_pixels: int = 2,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Precompute blend weights and nearest-waste-pixel indices for edge-extend.
+    """Compute blend map from an explicit inside mask tensor.
 
-    For each inside-hex pixel within ``blend_pixels`` of the boundary,
-    compute a blend weight (1.0 at boundary, decaying inward) and the
-    coordinates of the nearest outside-hex (waste) pixel.
-
-    :param width: Latent width.
-    :param height: Latent height.
-    :param settings: Tiling settings providing hex geometry.
-    :param blend_pixels: How many pixels inside the hex to blend (default 2).
+    :param inside_mask: Bool tensor (H, W) where True = inside hex.
+    :param blend_pixels: Blend band width in pixels.
     :return: Tuple of (weights, nearest_y, nearest_x) tensors each (H, W).
     """
-    inside = _build_inside_mask(width, height, settings)  # (H, W) bool
-    inside_np = inside.cpu().numpy().astype(np.float64)
-
-    # distance_transform_edt: for each pixel where input > 0, distance to
-    # nearest pixel where input == 0.  return_indices gives the coordinates.
+    H, W = inside_mask.shape
+    inside_np = inside_mask.cpu().numpy().astype(np.float64)
     distances, indices = distance_transform_edt(inside_np, return_indices=True)
 
-    nearest_y = torch.from_numpy(indices[0].astype(np.int64))  # (H, W)
-    nearest_x = torch.from_numpy(indices[1].astype(np.int64))  # (H, W)
+    nearest_y = torch.from_numpy(indices[0].astype(np.int64))
+    nearest_x = torch.from_numpy(indices[1].astype(np.int64))
 
-    # Weight: 1.0 at boundary (dist=1), linearly decaying to 0 at blend_pixels+1
     band = (distances >= 1) & (distances <= blend_pixels)
-    blend_values = np.zeros((height, width), dtype=np.float32)
+    blend_values = np.zeros((H, W), dtype=np.float32)
     blend_values[band] = (blend_pixels - distances[band] + 1) / blend_pixels
     weights = torch.from_numpy(blend_values)
 
@@ -230,7 +213,7 @@ def _compute_boundary_blend_map(
 
 def edge_extend_from_waste(
     latent: torch.Tensor,
-    settings: Settings,
+    inside_mask: torch.Tensor,
     blend_pixels: int = 2,
 ) -> torch.Tensor:
     """Blend hex boundary pixels toward nearest waste-area pixel content.
@@ -244,25 +227,29 @@ def edge_extend_from_waste(
     1-2 latent pixel blend propagates to 16-32 pixels at full resolution.
 
     :param latent: Latent tensor (B, C, H, W) — KSampler output.
-    :param settings: Tiling settings providing hex geometry.
+    :param inside_mask: Bool tensor (H, W) where True = inside hex.
     :param blend_pixels: Blend band width in latent pixels (default 2).
     :return: Modified latent tensor with boundary blended toward waste content.
     """
     B, C, H, W = latent.shape
-    weights, nearest_y, nearest_x = _compute_boundary_blend_map(
-        W, H, settings, blend_pixels,
+
+    if inside_mask.shape != (H, W):
+        inside_mask = F.interpolate(
+            inside_mask.float().unsqueeze(0).unsqueeze(0),
+            size=(H, W), mode="nearest",
+        ).squeeze(0).squeeze(0).bool()
+
+    weights, nearest_y, nearest_x = _compute_boundary_blend_map_from_mask(
+        inside_mask, blend_pixels,
     )
 
-    weights = weights.to(latent.device)          # (H, W)
-    nearest_y = nearest_y.to(latent.device)       # (H, W)
-    nearest_x = nearest_x.to(latent.device)       # (H, W)
+    weights = weights.to(latent.device)
+    nearest_y = nearest_y.to(latent.device)
+    nearest_x = nearest_x.to(latent.device)
 
-    # Fetch waste content at nearest-outside positions for every pixel.
-    # For outside pixels the nearest is themselves (distance == 0), so they
-    # stay unchanged.  For inside pixels far from boundary, weight == 0.
-    waste_content = latent[:, :, nearest_y, nearest_x]  # (B, C, H, W)
+    waste_content = latent[:, :, nearest_y, nearest_x]
 
-    w = weights.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
+    w = weights.unsqueeze(0).unsqueeze(0)
     return latent * (1 - w) + waste_content * w
 
 
@@ -291,12 +278,13 @@ class InpaintVAEDecode:
                     {"tooltip": "Inpainted latent (after KSampler)."},
                 ),
                 "vae": ("VAE", {"tooltip": "VAE model for decoding."}),
-                "mask": (
+                "waste_mask": (
                     "MASK",
                     {
-                        "tooltip": "Inpaint mask. "
-                        "1 = inpainted area (keep from samples), "
-                        "0 = preserved area (keep from reference)."
+                        "tooltip": "Waste-area mask from HexInpaint. "
+                        "waste=1 (keep from samples), "
+                        "inside=0 (inject from reference). "
+                        "Also defines hex geometry for edge-extend."
                     },
                 ),
                 "start_stage": (
@@ -343,9 +331,6 @@ class InpaintVAEDecode:
                         "convolution bleed from latent-space compositing boundaries."
                     },
                 ),
-                "tiling_settings": ("ADVANCED_TILING_SETTINGS", {
-                    "tooltip": "Hex geometry for edge-extend. Defaults to Hexagon, scale=1, rotation=0 when not connected.",
-                }),
             }
         }
 
@@ -357,16 +342,16 @@ class InpaintVAEDecode:
         "VAE bleed at mask boundaries."
     )
 
-    def decode(self, samples, vae, mask, start_stage=0, end_stage=-1,
-               edge_extend=False, source_samples=None, original_image=None,
-               tiling_settings=None):
+    def decode(self, samples, vae, waste_mask, start_stage=0, end_stage=-1,
+               edge_extend=False, source_samples=None, original_image=None):
         z_inpaint = samples["samples"].clone()
 
         # Edge-extend: blend hex boundary toward waste area
         if edge_extend:
-            if tiling_settings is None:
-                tiling_settings = Settings(mode="Hexagon", rotation=0.0, scale=1.0)
-            z_inpaint = edge_extend_from_waste(z_inpaint, tiling_settings)
+            inside = (waste_mask == 0)
+            if inside.dim() == 3:
+                inside = inside[0]
+            z_inpaint = edge_extend_from_waste(z_inpaint, inside)
 
         if original_image is not None:
             z_ref = vae.encode(original_image)
@@ -384,7 +369,7 @@ class InpaintVAEDecode:
         _, _, H_lat, W_lat = z_inpaint_4d.shape
 
         # Prepare mask — keep at original resolution for sharp boundaries
-        mask_prepared = _prepare_mask(mask, vae.device)
+        mask_prepared = _prepare_mask(waste_mask, vae.device)
 
         # Get compositing stages from the decoder
         decoder = vae.first_stage_model.decoder
