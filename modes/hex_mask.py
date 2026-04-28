@@ -455,6 +455,19 @@ _CORNER_EDGE_SECTORS = {
     "NW": [(0, 2, 1, 5), (0, 3, 2, 0), (1, 4, 2, 1)],
 }
 
+# Per-edge direction vectors (image coords, Y down) for extent projection.
+# Each entry: [(edge0_dx, edge0_dy), (edge1_dx, edge1_dy), (edge2_dx, edge2_dy)]
+# Edge N direction is along the hex edge from the shared vertex, perpendicular
+# to the inter-center line, pointing away from the third tile.
+_CORNER_EDGE_DIRECTIONS = {
+    "N":  [( 0.866025404,  0.5), (-0.866025404,  0.5), ( 0.0,        -1.0)],
+    "NE": [( 0.0,          1.0), (-0.866025404, -0.5), ( 0.866025404, -0.5)],
+    "SE": [(-0.866025404,  0.5), ( 0.0,         -1.0), ( 0.866025404,  0.5)],
+    "S":  [(-0.866025404, -0.5), ( 0.866025404, -0.5), ( 0.0,          1.0)],
+    "SW": [( 0.0,         -1.0), ( 0.866025404,  0.5), (-0.866025404,  0.5)],
+    "NW": [( 0.866025404, -0.5), ( 0.0,          1.0), (-0.866025404, -0.5)],
+}
+
 
 def create_corner_masks(
     width: int,
@@ -497,15 +510,15 @@ def create_corner_masks(
         eroded_half.append(_erode_mask(inside, max(1, erosion_pixels // 2)))
         sector_maps.append(_compute_sector_map_at(width, height, cx, cy))
 
-    # Pre-compute distance from shared vertex for extent limiting
+    # Pre-compute pixel coordinates relative to vertex for extent projection
     ys, xs = torch.meshgrid(
         torch.arange(height, dtype=torch.float32),
         torch.arange(width, dtype=torch.float32),
         indexing='ij',
     )
     vx, vy = width / 2.0, height / 2.0
-    dist_from_vertex = torch.sqrt((xs - vx) ** 2 + (ys - vy) ** 2)
-    in_extent = dist_from_vertex <= extent_pixels
+    rel_x = xs - vx
+    rel_y = ys - vy
 
     # Pre-compute distance transforms for feathering
     if feather_pixels > 0:
@@ -523,9 +536,14 @@ def create_corner_masks(
         ]
 
     edges = _CORNER_EDGE_SECTORS[corner]
+    edge_dirs = _CORNER_EDGE_DIRECTIONS[corner]
     combined_mask = torch.zeros(height, width, dtype=torch.float32)
 
     for edge_idx, (tile_a, sec_a, tile_b, sec_b) in enumerate(edges):
+        # Per-edge extent: project pixel positions onto edge direction
+        dx, dy = edge_dirs[edge_idx]
+        proj = rel_x * dx + rel_y * dy
+        in_extent = (proj >= 0) & (proj <= extent_pixels)
         pri_a = tile_priorities[tile_a] if tile_priorities else None
         pri_b = tile_priorities[tile_b] if tile_priorities else None
 
