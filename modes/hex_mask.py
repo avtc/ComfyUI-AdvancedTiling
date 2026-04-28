@@ -497,6 +497,8 @@ def create_corner_masks(
     float_offsets = [(ux * hex_radius, uy * hex_radius) for ux, uy in unit_offsets]
 
     # Build hex masks, eroded masks, and sector maps for each tile
+    # Pad before erosion so image boundaries don't create false border rings
+    pad = erosion_pixels + 1
     hex_masks = []
     eroded_full = []
     eroded_half = []
@@ -506,8 +508,17 @@ def create_corner_masks(
         cy = height / 2.0 + oy
         inside = _build_hex_mask_at(width, height, cx, cy, hex_radius)
         hex_masks.append(inside)
-        eroded_full.append(_erode_mask(inside, erosion_pixels))
-        eroded_half.append(_erode_mask(inside, max(1, erosion_pixels // 2)))
+
+        padded = F.pad(inside.float().unsqueeze(0).unsqueeze(0), [pad] * 4, mode='constant', value=1.0)
+        eroded_padded_full = _erode_mask(padded.squeeze().bool(), erosion_pixels)
+        eroded_full.append(eroded_padded_full[pad:-pad, pad:-pad] if pad > 0 else eroded_padded_full)
+
+        half_erosion = max(1, erosion_pixels // 2)
+        half_pad = half_erosion + 1
+        padded_half = F.pad(inside.float().unsqueeze(0).unsqueeze(0), [half_pad] * 4, mode='constant', value=1.0)
+        eroded_padded_half = _erode_mask(padded_half.squeeze().bool(), half_erosion)
+        eroded_half.append(eroded_padded_half[half_pad:-half_pad, half_pad:-half_pad] if half_pad > 0 else eroded_padded_half)
+
         sector_maps.append(_compute_sector_map_at(width, height, cx, cy))
 
     # Pre-compute pixel coordinates relative to vertex for extent projection
