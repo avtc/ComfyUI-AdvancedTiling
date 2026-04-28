@@ -7,7 +7,7 @@ latent. This prevents VAE convolution bleed from accumulating through the
 decoder layers, reducing artifacts from ~16-24 pixels to ~1-3 pixels at
 mask boundaries.
 
-The original_image is VAE-encoded and used as the
+The overlap_image is VAE-encoded and used as the
 reference latent. This avoids bleed from latent-space compositing
 boundaries (e.g. center+neighbor hex tiles) that would otherwise
 contaminate the preserved area features.
@@ -147,6 +147,44 @@ def _composite_hook(ref_features, mask_base, name):
     return hook
 
 
+def _composite_pre_hook(ref_features, mask_base, prev_name):
+    """Forward pre-hook that composites module input with reference features.
+
+    Injects reference features into the waste area BEFORE the module runs,
+    so the module's convolution never sees bleed-contaminated waste content.
+    Uses reference features from the PREVIOUS stage (since the input to this
+    module is the output of the previous one).
+
+    :param prev_name: Name of the previous stage whose reference features to use.
+    """
+
+    def hook(module, input):
+        if prev_name not in ref_features:
+            return input
+
+        features = input[0]
+        ref = ref_features[prev_name].to(
+            device=features.device, dtype=features.dtype,
+        )
+
+        if features.shape != ref.shape:
+            return input
+
+        H, W = features.shape[-2], features.shape[-1]
+        mask = mask_base
+        if mask.shape[-2] != H or mask.shape[-1] != W:
+            mask = F.interpolate(mask.float(), size=(H, W), mode="nearest")
+
+        while mask.dim() < features.dim():
+            mask = mask.unsqueeze(2)
+
+        # inside=1 (keep inpainted), waste=0 (inject reference)
+        result = features * mask + ref * (1 - mask)
+        return (result.to(dtype=features.dtype),)
+
+    return hook
+
+
 def _normalize_latent(latent):
     """Normalize latent to 4D (B, C, H, W) by squeezing singleton dims."""
     original_shape = latent.shape
@@ -212,25 +250,36 @@ def _compute_boundary_blend_map_from_mask(
     return weights, nearest_y, nearest_x
 
 
-def edge_extend_from_waste(
+def edge_extend_from_overlap(
     latent: torch.Tensor,
+    overlap_latent: torch.Tensor,
     inside_mask: torch.Tensor,
     blend_pixels: int = 2,
+    inpaint_mask=None,
 ) -> torch.Tensor:
-    """Blend hex boundary pixels toward nearest waste-area pixel content.
+    """Blend inpaint-zone boundary toward overlap latent pixels.
 
-    For each inside-hex pixel within ``blend_pixels`` of the hex boundary,
-    blend its latent values toward the nearest outside-hex (waste) pixel.
-    This ensures the cropped hex edge carries waste-area characteristics,
-    producing seamless transitions when tiles are placed in a grid.
+    For each inpaint-zone pixel within ``blend_pixels`` of the hex boundary,
+    blend its latent values toward the overlap latent at the same position.
+    The overlap image has correct adjacent-tile content extending into the
+    border mask area, so this creates a smooth transition from that content
+    into the inpainted zone.
+
+    Unlike nearest-waste-pixel approaches, this uses the overlap latent
+    directly — no distance-based pixel lookup.  The blend gradient goes
+    from overlap content (at hex boundary) to inpainted content (toward
+    center).
 
     Operates at latent resolution.  Through ~4 VAE upsampling stages the
     1-2 latent pixel blend propagates to 16-32 pixels at full resolution.
 
-    :param latent: Latent tensor (B, C, H, W) — KSampler output.
+    :param latent: Inpainted latent (B, C, H, W) — KSampler output.
+    :param overlap_latent: VAE-encoded overlap image (B, C, H, W).
     :param inside_mask: Bool tensor (H, W) where True = inside hex.
     :param blend_pixels: Blend band width in latent pixels (default 2).
-    :return: Modified latent tensor with boundary blended toward waste content.
+    :param inpaint_mask: Optional border mask constraining blend to inpaint
+        zone.  Any resolution — downscaled to latent via nearest.
+    :return: Modified latent with boundary blended toward overlap content.
     """
     B, C, H, W = latent.shape
 
@@ -240,18 +289,27 @@ def edge_extend_from_waste(
             size=(H, W), mode="nearest",
         ).squeeze(0).squeeze(0).bool()
 
-    weights, nearest_y, nearest_x = _compute_boundary_blend_map_from_mask(
+    weights, _, _ = _compute_boundary_blend_map_from_mask(
         inside_mask, blend_pixels,
     )
 
+    # Constrain to inpaint zone if mask provided
+    if inpaint_mask is not None:
+        im = inpaint_mask.float()
+        if im.dim() == 2:
+            im = im.unsqueeze(0).unsqueeze(0)
+        elif im.dim() == 3:
+            im = im[:1].unsqueeze(1)
+        if im.shape[-2:] != (H, W):
+            im = F.interpolate(im, size=(H, W), mode="nearest")
+        weights = weights * (im.squeeze(0).squeeze(0) > 0).float()
+
     weights = weights.to(latent.device)
-    nearest_y = nearest_y.to(latent.device)
-    nearest_x = nearest_x.to(latent.device)
-
-    waste_content = latent[:, :, nearest_y, nearest_x]
-
     w = weights.unsqueeze(0).unsqueeze(0)
-    return latent * (1 - w) + waste_content * w
+
+    # Blend: overlap content at boundary → inpainted content toward center
+    overlap = overlap_latent.to(device=latent.device, dtype=latent.dtype)
+    return latent * (1 - w) + overlap * w
 
 
 def _preserve_waste(
@@ -295,9 +353,18 @@ def _feather_seam(
     :param blend_band: Transition band width in pixels (inside hex only).
     :return: (B, H, W, C) image with smoothed seam.
     """
-    inside = (waste_mask == 0)
-    if inside.dim() == 3:
-        inside = inside[0]
+    # Ensure mask matches image resolution — latent-resolution masks cause
+    # blend_target to only modify a tiny corner of the image, making the
+    # feather invisible at the actual hex boundary.
+    H_img, W_img = image.shape[1], image.shape[2]
+    wm = waste_mask.float()
+    if wm.dim() == 2:
+        wm = wm.unsqueeze(0).unsqueeze(0)
+    elif wm.dim() == 3:
+        wm = wm[:1].unsqueeze(1)
+    if wm.shape[-2:] != (H_img, W_img):
+        wm = F.interpolate(wm, size=(H_img, W_img), mode="nearest")
+    inside = (wm.squeeze(0).squeeze(0) == 0)
     H, W = inside.shape
 
     # Find nearest waste pixel for each inside pixel
@@ -379,7 +446,7 @@ def laplacian_pyramid_blend(
     """Blend two images using Laplacian pyramid with a smooth mask.
 
     :param image_a: (B, H, W, C) decoded inpainted image.
-    :param image_b: (B, H, W, C) original_image reference.
+    :param image_b: (B, H, W, C) overlap_image reference.
     :param mask: (1, 1, H, W) smooth mask. 1.0 = keep *image_a*, 0.0 = keep *image_b*.
     :param levels: Pyramid depth. 0 = auto (``log2(min(H,W)) - 2``).
     :return: (B, H, W, C) blended image.
@@ -484,12 +551,12 @@ class InpaintVAEDecode:
     VAE decode with intermediate compositing to eliminate bleed at mask
     boundaries.
 
-    Takes an inpainted latent (after KSampler) and an original image, along
-    with the inpaint mask. Decodes both through the VAE decoder but, at each
-    upsampling stage, replaces features in preserved areas with features from
-    the reference decode.
+    Takes an inpainted latent (after KSampler) and the overlap image from
+    HexInpaint, along with the waste mask. Decodes both through the VAE
+    decoder but, at each upsampling stage, replaces features in preserved
+    areas with features from the reference decode.
 
-    The original_image is VAE-encoded and used as the reference decode.
+    The overlap_image is VAE-encoded and used as the reference decode.
     This avoids bleed from latent-space compositing boundaries
     (e.g. center+neighbor hex tiles) that would otherwise contaminate the
     preserved-area features.
@@ -513,12 +580,13 @@ class InpaintVAEDecode:
                         "Also defines hex geometry for edge-extend."
                     },
                 ),
-                "original_image": (
+                "overlap_image": (
                     "IMAGE",
                     {
-                        "tooltip": "Original clean image. VAE-encoded and used "
-                        "as the reference decode. Avoids VAE convolution bleed "
-                        "from latent-space compositing boundaries."
+                        "tooltip": "Overlap image from HexInpaint (center tile + "
+                        "adjacent tile content extended into border mask area). "
+                        "VAE-encoded as reference decode to avoid VAE convolution "
+                        "bleed from latent-space compositing boundaries."
                     },
                 ),
                 "stages": ("STRING", {
@@ -529,7 +597,13 @@ class InpaintVAEDecode:
                 }),
                 "edge_extend": ("BOOLEAN", {
                     "default": False,
-                    "tooltip": "Blend hex boundary pixels toward waste area before decode. Produces seamless transitions when cropped tiles are placed in a grid.",
+                    "tooltip": "Blend hex boundary pixels toward overlap latent before decode. Creates smooth transition from adjacent tile content into inpainted zone.",
+                }),
+                "edge_extend_band": ("INT", {
+                    "default": 2,
+                    "min": 1,
+                    "max": 16,
+                    "tooltip": "Edge-extend blend band width in latent pixels. Propagates ~8x through VAE decoder stages.",
                 }),
                 "inject_waste": ("BOOLEAN", {
                     "default": True,
@@ -539,7 +613,7 @@ class InpaintVAEDecode:
                 "laplacian_blend": ("BOOLEAN", {
                     "default": False,
                     "tooltip": "Post-process with Laplacian pyramid blending at hex boundary. "
-                    "Multi-scale blend between decoded and original_image.",
+                    "Multi-scale blend between decoded and overlap_image.",
                 }),
                 "feather_restore": ("BOOLEAN", {
                     "default": False,
@@ -563,6 +637,14 @@ class InpaintVAEDecode:
                         "Falls back to upscaling waste_mask if not connected.",
                     },
                 ),
+                "inpaint_mask": (
+                    "MASK",
+                    {
+                        "tooltip": "Inpaint zone mask (border mask) from HexInpaint. "
+                        "When provided, edge_extend only blends within the inpaint zone, "
+                        "preserving non-inpainted interior pixels.",
+                    },
+                ),
             },
         }
 
@@ -574,34 +656,41 @@ class InpaintVAEDecode:
         "VAE bleed at mask boundaries."
     )
 
-    def decode(self, samples, vae, waste_mask, original_image, stages="all",
-               edge_extend=False, inject_waste=True,
+    def decode(self, samples, vae, waste_mask, overlap_image, stages="all",
+               edge_extend=False, edge_extend_band=2, inject_waste=True,
                laplacian_blend=False, feather_restore=False, blend_band=8,
-               waste_mask_img=None):
+               waste_mask_img=None, inpaint_mask=None):
         z_inpaint = samples["samples"].clone()
 
-        # Edge-extend: blend hex boundary toward waste area
+        # VAE-encode overlap image if needed for edge_extend or inject_waste
+        z_ref = None
+        z_ref_4d = None
+        if edge_extend or inject_waste:
+            z_ref = vae.encode(overlap_image)
+            z_ref_4d, _ = _normalize_latent(z_ref)
+
+        # Edge-extend: blend hex boundary toward overlap latent
         if edge_extend:
             inside = (waste_mask == 0)
             if inside.dim() == 3:
                 inside = inside[0]
             z_4d, orig_shape = _normalize_latent(z_inpaint)
-            z_4d = edge_extend_from_waste(z_4d, inside)
+            z_4d = edge_extend_from_overlap(
+                z_4d, z_ref_4d, inside,
+                blend_pixels=edge_extend_band,
+                inpaint_mask=inpaint_mask,
+            )
             z_inpaint = z_4d.reshape(orig_shape)
 
         # Decode
         if inject_waste:
-            # Two-pass decode with per-stage compositing
-            z_ref = vae.encode(original_image)
-
-            z_inpaint_4d, _ = _normalize_latent(z_inpaint)
-            z_ref_4d, _ = _normalize_latent(z_ref)
+            # Two-pass decode with per-stage compositing (pre-hooks)
+            z_inpaint_4d, inpaint_orig_shape = _normalize_latent(z_inpaint)
+            # z_ref_4d already computed above
 
             _, _, H_lat, W_lat = z_inpaint_4d.shape
 
-            # Prepare compositing mask: inject reference into waste area (waste=1)
-            # Invert: inside=1 (keep output), waste=0 (inject reference)
-            # Use image-res mask when available for sharper boundaries at high-res stages
+            # Prepare compositing mask: inside=1 (keep inpainted), waste=0 (inject reference)
             compositing_source = waste_mask_img if waste_mask_img is not None else waste_mask
             compositing_mask = 1.0 - compositing_source.float()
             mask_prepared = _prepare_mask(compositing_mask, vae.device)
@@ -626,17 +715,17 @@ class InpaintVAEDecode:
             active_names = [stage_names[i] for i in sorted(composite_stages) if i < len(decoder_stages)]
             logger.info(
                 f"[InpaintVAEDecode] Latent ({H_lat}x{W_lat}), "
-                f"all stages: {stage_names}, compositing: {active_names}"
+                f"all stages: {stage_names}, compositing (pre-hook): {active_names}"
             )
 
-            # Step 1: Reference decode — save features at stages we'll composite
+            # Step 1: Reference decode — save features at ALL stages
+            # (pre-hooks need the previous stage's features, so we save everything)
             ref_features = {}
             save_hooks = []
             for i, (name, module) in enumerate(decoder_stages):
-                if i in composite_stages:
-                    save_hooks.append(
-                        module.register_forward_hook(_save_hook(ref_features, name))
-                    )
+                save_hooks.append(
+                    module.register_forward_hook(_save_hook(ref_features, name))
+                )
 
             with torch.no_grad():
                 vae.decode(z_ref)
@@ -647,16 +736,35 @@ class InpaintVAEDecode:
             ref_summary = {k: tuple(v.shape) for k, v in ref_features.items()}
             logger.info(f"[InpaintVAEDecode] Reference features: {ref_summary}")
 
-            # Step 2: Main decode — composite only at selected stages
+            # Step 2: Pre-composite latent for stage 0 (conv_in)
+            # Injects reference latent into waste area before conv_in runs.
+            if 0 in composite_stages:
+                mask_lat = mask_prepared
+                if mask_lat.shape[-2:] != (H_lat, W_lat):
+                    mask_lat = F.interpolate(
+                        mask_lat.float(), size=(H_lat, W_lat), mode="nearest",
+                    )
+                z_inpaint_4d = z_inpaint_4d * mask_lat + z_ref_4d.to(
+                    device=z_inpaint_4d.device, dtype=z_inpaint_4d.dtype,
+                ) * (1 - mask_lat)
+
+            # Step 3: Pre-hooks on subsequent stages
+            # Each pre-hook composites the module's input with reference features
+            # from the PREVIOUS stage, so the module never sees bleed-contaminated
+            # waste content.
             comp_hooks = []
             for i, (name, module) in enumerate(decoder_stages):
-                if i in composite_stages:
-                    comp_hooks.append(
-                        module.register_forward_hook(
-                            _composite_hook(ref_features, mask_prepared, name)
-                        )
+                if i not in composite_stages or i == 0:
+                    continue
+                prev_name = decoder_stages[i - 1][0]
+                comp_hooks.append(
+                    module.register_forward_pre_hook(
+                        _composite_pre_hook(ref_features, mask_prepared, prev_name)
                     )
+                )
 
+            # Step 4: Main decode
+            z_inpaint = z_inpaint_4d.reshape(inpaint_orig_shape)
             with torch.no_grad():
                 image = vae.decode(z_inpaint)
 
@@ -677,9 +785,9 @@ class InpaintVAEDecode:
                     -1, image.shape[-3], image.shape[-2], image.shape[-1]
                 )
 
-        # Pixel-perfect waste restore from original — always, not just inject_waste.
-        # Without this, the waste area carries VAE bleed from the composited
-        # latent boundary when inject_waste is disabled.
+        # Pixel-perfect waste restore from overlap image — always.
+        # Ensures waste area has exact overlap_image pixels regardless of
+        # inject_waste or edge_extend settings.
         wm = waste_mask_img if waste_mask_img is not None else waste_mask
         wf = wm.float()
         if wf.dim() == 2:
@@ -691,7 +799,7 @@ class InpaintVAEDecode:
                 wf.unsqueeze(1), size=image.shape[1:3], mode="nearest",
             ).squeeze(1)
         w = wf.to(device=image.device, dtype=image.dtype).unsqueeze(-1)
-        orig = original_image.to(device=image.device, dtype=image.dtype)
+        orig = overlap_image.to(device=image.device, dtype=image.dtype)
         image = image * (1 - w) + orig * w
 
         # Post-processing: smooth seam at hex boundary
@@ -700,7 +808,7 @@ class InpaintVAEDecode:
                 blend_source = waste_mask_img if waste_mask_img is not None else waste_mask
                 image = _feather_seam(image, blend_source, blend_band)
             else:
-                ref = original_image.to(device=image.device, dtype=image.dtype)
+                ref = overlap_image.to(device=image.device, dtype=image.dtype)
                 blend_mask = waste_mask_img if waste_mask_img is not None else waste_mask
                 mask = _make_smooth_hex_mask(blend_mask, blend_band, image.shape)
                 mask = _preserve_waste(mask, blend_mask, image.shape[1:3])
