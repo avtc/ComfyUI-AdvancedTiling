@@ -240,12 +240,10 @@ class AdvancedTilingHexInpaint:
                     },
                 ),
                 "rotate_mapping": (
-                    "INT",
+                    ["0", "1", "2", "3", "4", "5", "ALL"],
                     {
-                        "default": 0,
-                        "min": -5,
-                        "max": 5,
-                        "tooltip": "Rotate neighbor image assignments by N steps clockwise. +1: E input → SE region, NE → E. -1: counter-clockwise. Useful when neighbor tiles come from a differently-oriented grid.",
+                        "default": "0",
+                        "tooltip": "Rotate neighbor image assignments by N steps clockwise. ALL: output all 6 rotations as list.",
                     },
                 ),
                 "enable_preview": (
@@ -256,7 +254,7 @@ class AdvancedTilingHexInpaint:
                     },
                 ),
                 "corner_select": (
-                    ["N", "NE", "SE", "S", "SW", "NW"],
+                    ["N", "NE", "SE", "S", "SW", "NW", "ALL"],
                     {
                         "default": "NE",
                         "tooltip": "Which corner to process in CornerEdges mode. Determines which 2 neighbors are used.",
@@ -303,26 +301,24 @@ class AdvancedTilingHexInpaint:
         "WASTE_MASK_IMG",
         "OVERLAP_IMAGE",
     )
+    OUTPUT_IS_LIST = (True,) * 15
     FUNCTION = "run"
     CATEGORY = "conditioning"
 
-    def run(self, settings, vae, center_image, inpaint_mode, border_width, feather_radius, feather_sides, mask_strength_min, mask_strength_max, skip_same_neighbors, rotate_mapping=0, enable_preview=False, corner_select="NE", mask_extent="half_edge", edge_buffer_depth=0, **kwargs):
+    def run(self, settings, vae, center_image, inpaint_mode, border_width,
+            feather_radius, feather_sides, mask_strength_min, mask_strength_max,
+            skip_same_neighbors, rotate_mapping="0", enable_preview=False,
+            corner_select="NE", mask_extent="half_edge", edge_buffer_depth=0,
+            **kwargs):
         t_start = time.time()
 
-        n = len(NEIGHBOR_DIRECTIONS)
-        rotation_steps = rotate_mapping % n
-
-        if rotation_steps:
-            logger.info(f"[HexInpaint] Mapping rotated by {rotation_steps} steps CW")
-
-        # 1. VAE-encode center image
+        # 1. VAE-encode center image (once, shared across iterations)
         t0 = time.time()
         center_latent = vae.encode(center_image)
-        t1 = time.time()
-        logger.info(f"[HexInpaint] VAE encode center: {t1-t0:.3f}s, "
+        logger.info(f"[HexInpaint] VAE encode center: {time.time()-t0:.3f}s, "
                      f"image={center_image.shape}, latent={center_latent.shape}")
 
-        # 2. VAE-encode provided neighbor images
+        # 2. VAE-encode provided neighbor images (once, shared)
         neighbor_latents = {}
         neighbor_images = {}
         for direction in NEIGHBOR_DIRECTIONS:
@@ -336,7 +332,49 @@ class AdvancedTilingHexInpaint:
 
         logger.info(f"[HexInpaint] Neighbors provided: {list(neighbor_latents.keys())}")
 
-        # --- Mode branching ---
+        # 3. Determine iteration list
+        if inpaint_mode == "CentralTile":
+            if rotate_mapping == "ALL":
+                iterations = [(inpaint_mode, r, "NE") for r in range(6)]
+            else:
+                iterations = [(inpaint_mode, int(rotate_mapping) % 6, "NE")]
+        else:  # CornerEdges
+            if corner_select == "ALL":
+                iterations = [(inpaint_mode, 0, c) for c in CORNER_NAMES]
+            else:
+                iterations = [(inpaint_mode, 0, corner_select)]
+
+        # 4. Run each iteration
+        all_results = []
+        for mode, rot, corner in iterations:
+            result = self._run_single(
+                settings, vae, center_image, center_latent, neighbor_latents,
+                neighbor_images, border_width, feather_radius, feather_sides,
+                mask_strength_min, mask_strength_max, skip_same_neighbors,
+                enable_preview, mask_extent, edge_buffer_depth, kwargs,
+                mode, rot, corner,
+            )
+            all_results.append(result)
+
+        # 5. Transpose: list of 15-tuples -> 15 lists
+        num_outputs = 15
+        transposed = tuple(
+            [result[i] for result in all_results]
+            for i in range(num_outputs)
+        )
+
+        logger.info(f"[HexInpaint] Total: {time.time()-t_start:.3f}s, "
+                     f"iterations={len(all_results)}")
+        return transposed
+
+    def _run_single(
+        self, settings, vae, center_image, center_latent, neighbor_latents,
+        neighbor_images, border_width, feather_radius, feather_sides,
+        mask_strength_min, mask_strength_max, skip_same_neighbors,
+        enable_preview, mask_extent, edge_buffer_depth, kwargs,
+        inpaint_mode, rotation_steps, corner_select,
+    ):
+        """Run the pipeline for one rotation/corner. Returns tuple of 15 outputs (not lists)."""
         if inpaint_mode == "CornerEdges":
             return self._run_corner_edges(
                 settings, vae, center_image, center_latent, neighbor_latents,
@@ -344,7 +382,13 @@ class AdvancedTilingHexInpaint:
                 mask_strength_min, mask_strength_max, corner_select, mask_extent,
                 edge_buffer_depth, enable_preview, kwargs,
             )
-        # --- CentralTile mode (existing logic continues) ---
+
+        # --- CentralTile mode ---
+        t_start = time.time()
+        n = len(NEIGHBOR_DIRECTIONS)
+
+        if rotation_steps:
+            logger.info(f"[HexInpaint] Mapping rotated by {rotation_steps} steps CW")
 
         # 3. Composite latents with rotated direction mapping
         if neighbor_latents:
