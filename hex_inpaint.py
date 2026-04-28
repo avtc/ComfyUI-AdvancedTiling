@@ -435,20 +435,27 @@ class AdvancedTilingHexInpaint:
         for i in range(len(NEIGHBOR_DIRECTIONS)):
             outputs.append(full_neighbor_masks[i])
 
-        # Build overlap image: center + neighbor content in waste area.
-        # Always computed — connect to InpaintVAEDecode original_image for
-        # correct adjacent content at the hex boundary.
+        # Build neighbor map (shared by preview and overlap)
         neighbor_map_img = _build_neighbor_map(W_img, H_img, settings)
         dir_idx_map = {name: idx for idx, name in enumerate(NEIGHBOR_DIRECTIONS)}
+
+        # Overlap image: center + neighbor content in waste area AND border mask.
+        # Extends adjacent content into the hex boundary so InpaintVAEDecode
+        # sees correct adjacent content at the inpainting edge.
         overlap_image = center_image.clone()
         for direction_name, neighbor_img in neighbor_images.items():
             dir_idx = dir_idx_map[direction_name]
             target_idx = (dir_idx - rotation_steps) % n
+            # Waste area (outside hex)
             waste_region = (neighbor_map_img == target_idx)
             if waste_region.any():
                 overlap_image[0][waste_region] = neighbor_img[0][waste_region]
+            # Border mask area (inside hex, near edge)
+            border_region = full_neighbor_masks[target_idx] > 0
+            if border_region.any():
+                overlap_image[0][border_region] = neighbor_img[0][border_region]
 
-        # output 9: composited preview (pixel-space composite, no VAE round-trip)
+        # output 9: composited preview (tiles arrangement as passed to latent)
         if enable_preview:
             preview_image = center_image.clone()
             for direction_name, neighbor_img in neighbor_images.items():
@@ -607,15 +614,48 @@ class AdvancedTilingHexInpaint:
                 border_mask_img,
             )
 
-        # 6. Overlap image (pixel-space corner composite, always computed)
-        corner_overlap = composite_corner_preview(center_image, n1_image, n2_image, corner_select)
+        # 6. Preview and overlap images
+        # Preview: corner composite showing tile arrangement
+        corner_preview = composite_corner_preview(center_image, n1_image, n2_image, corner_select)
+
+        # Overlap: extends neighbor content into border mask area
+        corner_overlap = corner_preview.clone()
+        border_any = border_mask_img > 0
+        if border_any.any():
+            offsets = get_corner_offsets(corner_select, hex_radius_img)
+            _, n1_off, n2_off = offsets
+
+            ys, xs = torch.meshgrid(
+                torch.arange(H_img, dtype=torch.long),
+                torch.arange(W_img, dtype=torch.long),
+                indexing='ij',
+            )
+            cx, cy = W_img / 2.0, H_img / 2.0
+
+            d_n1 = (xs.float() - (cx + n1_off[0])) ** 2 + (ys.float() - (cy + n1_off[1])) ** 2
+            d_n2 = (xs.float() - (cx + n2_off[0])) ** 2 + (ys.float() - (cy + n2_off[1])) ** 2
+
+            use_n1 = border_any & (d_n1 <= d_n2)
+            use_n2 = border_any & (d_n2 < d_n1)
+
+            if use_n1.any():
+                ox, oy = n1_off
+                src_ys = (ys[use_n1] - oy).clamp(0, H_img - 1)
+                src_xs = (xs[use_n1] - ox).clamp(0, W_img - 1)
+                corner_overlap[0][use_n1] = n1_image[0, src_ys, src_xs]
+
+            if use_n2.any():
+                ox, oy = n2_off
+                src_ys = (ys[use_n2] - oy).clamp(0, H_img - 1)
+                src_xs = (xs[use_n2] - ox).clamp(0, W_img - 1)
+                corner_overlap[0][use_n2] = n2_image[0, src_ys, src_xs]
 
         # 7. Assemble outputs (same count as CentralTile for compatibility)
         outputs = [
             latent_dict,            # LATENT
             border_mask_img,        # MASK (debug)
             *[torch.zeros(H_img, W_img)] * 6,  # 6 directional masks (unused)
-            corner_overlap if enable_preview else torch.zeros(1, 1, 1, 3, dtype=torch.float32),  # composited_preview
+            corner_preview if enable_preview else torch.zeros(1, 1, 1, 3, dtype=torch.float32),  # composited_preview
             torch.zeros(1, H_img, W_img, 3),       # color_mask (unused)
             {"samples": center_latent, "noise_mask": noise_mask},  # paintbrush latent
             torch.zeros(1, H_img, W_img, 3),       # paintbrush preview (unused)
