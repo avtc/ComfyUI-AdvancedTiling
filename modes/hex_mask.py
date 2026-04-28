@@ -157,6 +157,23 @@ def _compute_sector_map(width: int, height: int) -> torch.Tensor:
     return ((angles + math.pi / 6) / (math.pi / 3)).long() % 6
 
 
+def _compute_sector_map_at(width: int, height: int, cx: float, cy: float) -> torch.Tensor:
+    """
+    Sector map centered on (cx, cy) instead of image center.
+
+    Same sector划分 as _compute_sector_map but for offset tile positions.
+    """
+    ys, xs = torch.meshgrid(
+        torch.arange(height, dtype=torch.float32),
+        torch.arange(width, dtype=torch.float32),
+        indexing='ij',
+    )
+    dx = xs - cx
+    dy = cy - ys  # Flip Y for math coordinates
+    angles = torch.atan2(dy, dx) % (2 * math.pi)
+    return ((angles + math.pi / 6) / (math.pi / 3)).long() % 6
+
+
 def create_border_mask(
     width: int, height: int, settings: Settings, border_width: float = 0.2,
     inside_mask: torch.Tensor = None,

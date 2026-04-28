@@ -31,6 +31,24 @@ from modes.hex_mask import (
 )
 
 
+def test_sector_map_at_center_matches_global():
+    """_compute_sector_map_at centered on image center should match _compute_sector_map."""
+    from modes.hex_mask import _compute_sector_map, _compute_sector_map_at
+    W, H = 256, 256
+    global_map = _compute_sector_map(W, H)
+    offset_map = _compute_sector_map_at(W, H, W / 2.0, H / 2.0)
+    assert (global_map == offset_map).all(), "Sector maps should match at image center"
+
+
+def test_sector_map_at_offset_covers_all_sectors():
+    """Sector map at offset position should still produce sectors 0-5."""
+    from modes.hex_mask import _compute_sector_map_at
+    W, H = 256, 256
+    smap = _compute_sector_map_at(W, H, 100.0, 150.0)
+    unique = smap.unique().tolist()
+    assert set(unique) == {0, 1, 2, 3, 4, 5}, f"Expected all 6 sectors, got {unique}"
+
+
 def test_corner_offsets_symmetry():
     """All corners should have symmetric offsets (same magnitude, rotated)."""
     R = 256
@@ -159,6 +177,8 @@ def test_no_black_pixels_in_preview():
 
 
 if __name__ == "__main__":
+    test_sector_map_at_center_matches_global()
+    test_sector_map_at_offset_covers_all_sectors()
     test_corner_offsets_symmetry()
     test_tile_map_covers_all()
     test_corner_preview_shape()
