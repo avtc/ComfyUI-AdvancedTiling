@@ -296,7 +296,8 @@ def _feather_seam(
     """
     smooth = _make_smooth_hex_mask(waste_mask, blend_band, image.shape)
     smooth = _preserve_waste(smooth, waste_mask, image.shape[1:3])
-    m = smooth.to(device=image.device, dtype=image.dtype).unsqueeze(-1)
+    # smooth is (1, 1, H, W) CHW — permute to (1, H, W, 1) for BHWC broadcast
+    m = smooth.permute(0, 2, 3, 1).to(device=image.device, dtype=image.dtype)
     orig = original_image.to(device=image.device, dtype=image.dtype)
     return image * m + orig * (1 - m)
 
