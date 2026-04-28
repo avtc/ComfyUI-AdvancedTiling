@@ -568,16 +568,20 @@ def create_corner_masks(
             feather_a = dist_to_eroded_half[tile_a] if feather_pixels > 0 else None
             feather_b = dist_to_eroded_half[tile_b] if feather_pixels > 0 else None
         elif pri_a is not None and pri_b is not None:
+            # Lower number = higher priority = preserve (no mask)
+            # Higher number = lower priority = regenerate (mask)
             if pri_a > pri_b:
-                mask_a = torch.zeros(height, width, dtype=torch.bool)
-                mask_b = hex_masks[tile_b] & ~eroded_full[tile_b] & (sector_maps[tile_b] == sec_b) & in_extent
-                feather_a = None
-                feather_b = dist_to_eroded_full[tile_b] if feather_pixels > 0 else None
-            else:
+                # tile_a has lower priority → mask (regenerate) its side
                 mask_a = hex_masks[tile_a] & ~eroded_full[tile_a] & (sector_maps[tile_a] == sec_a) & in_extent
                 mask_b = torch.zeros(height, width, dtype=torch.bool)
                 feather_a = dist_to_eroded_full[tile_a] if feather_pixels > 0 else None
                 feather_b = None
+            else:
+                # tile_b has lower priority → mask (regenerate) its side
+                mask_a = torch.zeros(height, width, dtype=torch.bool)
+                mask_b = hex_masks[tile_b] & ~eroded_full[tile_b] & (sector_maps[tile_b] == sec_b) & in_extent
+                feather_a = None
+                feather_b = dist_to_eroded_full[tile_b] if feather_pixels > 0 else None
         elif pri_a is None:
             mask_a = hex_masks[tile_a] & ~eroded_full[tile_a] & (sector_maps[tile_a] == sec_a) & in_extent
             mask_b = torch.zeros(height, width, dtype=torch.bool)

@@ -623,7 +623,7 @@ class AdvancedTilingHexInpaint:
             tile_priorities,
         )
 
-        # 3b. Edge buffer: paste nearest tile's latent into mask boundary, exclude from mask
+        # 3b. Edge buffer: paste higher-priority tile's latent into mask boundary, exclude from mask
         if edge_buffer_depth >= 0:
             mask_bool = border_mask_lat.squeeze(0) > 0
             if mask_bool.any():
@@ -643,17 +643,29 @@ class AdvancedTilingHexInpaint:
                     )
                     cx, cy = W_ce / 2.0, H_ce / 2.0
 
-                    # Distance to each tile's center
-                    dists = []
-                    for _, (ox, oy) in enumerate(offsets):
-                        d = (xs.float() - (cx + ox)) ** 2 + (ys.float() - (cy + oy)) ** 2
-                        dists.append(d)
-                    nearest_tile = torch.stack(dists).argmin(dim=0)
+                    # Use highest-priority tile for each buffer pixel
+                    # (provides the anchor content the model should blend toward)
+                    prios = tile_priorities if tile_priorities else [None, None, None]
+                    if all(p is not None for p in prios):
+                        best_tile = torch.full((H_ce, W_ce), -1, dtype=torch.long)
+                        best_pri = torch.full((H_ce, W_ce), float('inf'))
+                        for tile_idx in range(3):
+                            if prios[tile_idx] is not None:
+                                mask_this = best_pri > prios[tile_idx]
+                                best_tile[mask_this] = tile_idx
+                                best_pri[mask_this] = prios[tile_idx]
+                    else:
+                        # Fallback: nearest tile by center distance
+                        dists = []
+                        for _, (ox, oy) in enumerate(offsets):
+                            d = (xs.float() - (cx + ox)) ** 2 + (ys.float() - (cy + oy)) ** 2
+                            dists.append(d)
+                        best_tile = torch.stack(dists).argmin(dim=0)
 
                     latents = [center_latent, n1_latent, n2_latent]
                     total_buffer = 0
                     for tile_idx in range(3):
-                        tile_buffer = buffer & (nearest_tile == tile_idx)
+                        tile_buffer = buffer & (best_tile == tile_idx)
                         if tile_buffer.any():
                             ox, oy = offsets[tile_idx]
                             src_ys = (ys[tile_buffer] - oy).clamp(0, H_ce - 1)
