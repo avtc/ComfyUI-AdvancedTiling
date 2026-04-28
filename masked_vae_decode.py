@@ -125,14 +125,17 @@ def _composite_hook(ref_features, mask_base, name):
         # Spatial dimensions are always the last two
         H, W = output.shape[-2], output.shape[-1]
 
-        # Scale mask to spatial resolution
+        # Scale mask to spatial resolution.
+        # Use nearest-neighbor to keep the mask binary at every resolution.
+        # Bilinear interpolation blurs the boundary at low VAE resolutions,
+        # causing reference features (original content) to leak into the
+        # inpainted area.
         mask = mask_base
         if mask.shape[-2] != H or mask.shape[-1] != W:
             mask = F.interpolate(
                 mask.float(),
                 size=(H, W),
-                mode="bilinear",
-                align_corners=False,
+                mode="nearest",
             )
 
         # Expand mask dims to match output (handles 4D and 5D+ tensors)
@@ -278,28 +281,44 @@ def _preserve_waste(
 
 def _feather_seam(
     image: torch.Tensor,
-    original_image: torch.Tensor,
     waste_mask: torch.Tensor,
     blend_band: int,
 ) -> torch.Tensor:
     """Smooth the seam at the inner hex boundary via Gaussian compositing.
 
-    Only affects pixels INSIDE the hex near the boundary.  Waste area is
-    untouched (restored separately by inject_waste).  Deep hex interior
-    is also untouched.
+    Blends inside-hex boundary pixels toward the nearest waste-area pixel
+    from the decoded image.  This avoids introducing original interior
+    content (e.g. green forest) into the inpainted boundary zone.
+
+    Only affects pixels INSIDE the hex near the boundary.  Waste area and
+    deep hex interior are untouched.
 
     :param image: (B, H, W, C) decoded image (waste already restored).
-    :param original_image: (B, H, W, C) original clean image.
     :param waste_mask: (1, H, W) or (H, W), waste=1, inside=0.
     :param blend_band: Transition band width in pixels (inside hex only).
     :return: (B, H, W, C) image with smoothed seam.
     """
+    inside = (waste_mask == 0)
+    if inside.dim() == 3:
+        inside = inside[0]
+    H, W = inside.shape
+
+    # Find nearest waste pixel for each inside pixel
+    outside_np = (~inside).cpu().numpy().astype(np.float64)
+    _, indices = distance_transform_edt(outside_np, return_indices=True)
+    nearest_y = torch.from_numpy(indices[0].astype(torch.int64))
+    nearest_x = torch.from_numpy(indices[1].astype(torch.int64))
+
+    # Build blend target: for each pixel, use nearest waste pixel from image
+    blend_target = image.clone()
+    iy, ix = torch.where(inside)
+    if iy.numel() > 0:
+        blend_target[0, iy, ix] = image[0, nearest_y[iy, ix], nearest_x[iy, ix]]
+
     smooth = _make_smooth_hex_mask(waste_mask, blend_band, image.shape)
-    smooth = _preserve_waste(smooth, waste_mask, image.shape[1:3])
     # smooth is (1, 1, H, W) CHW — permute to (1, H, W, 1) for BHWC broadcast
     m = smooth.permute(0, 2, 3, 1).to(device=image.device, dtype=image.dtype)
-    orig = original_image.to(device=image.device, dtype=image.dtype)
-    return image * m + orig * (1 - m)
+    return image * m + blend_target.to(device=image.device, dtype=image.dtype) * (1 - m)
 
 
 # ---------------------------------------------------------------------------
@@ -661,27 +680,28 @@ class InpaintVAEDecode:
                     -1, image.shape[-3], image.shape[-2], image.shape[-1]
                 )
 
-        # Pixel-perfect waste restore from original (after VAE injection)
-        if inject_waste:
-            wm = waste_mask_img if waste_mask_img is not None else waste_mask
-            wf = wm.float()
-            if wf.dim() == 2:
-                wf = wf.unsqueeze(0)
-            elif wf.dim() == 3:
-                wf = wf[:1]
-            if wf.shape[-2:] != image.shape[1:3]:
-                wf = F.interpolate(
-                    wf.unsqueeze(1), size=image.shape[1:3], mode="nearest",
-                ).squeeze(1)
-            w = wf.to(device=image.device, dtype=image.dtype).unsqueeze(-1)
-            orig = original_image.to(device=image.device, dtype=image.dtype)
-            image = image * (1 - w) + orig * w
+        # Pixel-perfect waste restore from original — always, not just inject_waste.
+        # Without this, the waste area carries VAE bleed from the composited
+        # latent boundary when inject_waste is disabled.
+        wm = waste_mask_img if waste_mask_img is not None else waste_mask
+        wf = wm.float()
+        if wf.dim() == 2:
+            wf = wf.unsqueeze(0)
+        elif wf.dim() == 3:
+            wf = wf[:1]
+        if wf.shape[-2:] != image.shape[1:3]:
+            wf = F.interpolate(
+                wf.unsqueeze(1), size=image.shape[1:3], mode="nearest",
+            ).squeeze(1)
+        w = wf.to(device=image.device, dtype=image.dtype).unsqueeze(-1)
+        orig = original_image.to(device=image.device, dtype=image.dtype)
+        image = image * (1 - w) + orig * w
 
         # Post-processing: smooth seam at hex boundary
         if feather_restore or laplacian_blend:
             if feather_restore:
                 blend_source = waste_mask_img if waste_mask_img is not None else waste_mask
-                image = _feather_seam(image, original_image, blend_source, blend_band)
+                image = _feather_seam(image, blend_source, blend_band)
             else:
                 ref = original_image.to(device=image.device, dtype=image.dtype)
                 blend_mask = waste_mask_img if waste_mask_img is not None else waste_mask
