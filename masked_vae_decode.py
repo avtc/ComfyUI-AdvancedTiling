@@ -254,41 +254,74 @@ def edge_extend_from_waste(
     return latent * (1 - w) + waste_content * w
 
 
-def _feather_inner_edge(
+def _preserve_waste(
+    mask_smooth: torch.Tensor,
+    waste_mask: torch.Tensor,
+    target_hw: tuple[int, int],
+) -> torch.Tensor:
+    """Force waste-area entries in a smooth mask to 1.0.
+
+    After Gaussian-blurring an inside/waste mask the waste side of the
+    boundary dips below 1.0, which would cause blending there.  This
+    helper restores those pixels so the waste area passes through
+    unchanged.
+    """
+    wb = waste_mask.float()
+    if wb.dim() == 2:
+        wb = wb.unsqueeze(0).unsqueeze(0)
+    elif wb.dim() == 3:
+        wb = wb[:1].unsqueeze(1)
+    if wb.shape[-2:] != target_hw:
+        wb = F.interpolate(wb, size=target_hw, mode="nearest")
+    return torch.where(wb > 0.5, torch.ones_like(mask_smooth), mask_smooth)
+
+
+def _feather_seam(
     image: torch.Tensor,
-    inside_mask: torch.Tensor,
+    original_image: torch.Tensor,
+    waste_mask: torch.Tensor,
     blend_band: int,
 ) -> torch.Tensor:
-    """Blend inner hex edge toward nearest waste-area pixel content.
+    """Smooth the seam at the inner hex boundary via Gaussian compositing.
 
-    Only affects a narrow band of pixels inside the hex boundary.
-    Waste area and deep interior are untouched.
+    Only affects pixels INSIDE the hex near the boundary.  Waste area is
+    untouched (restored separately by inject_waste).  Deep hex interior
+    is also untouched.
 
-    :param image: (B, H, W, C) decoded image.
-    :param inside_mask: (H, W) bool where True = inside hex.
-    :param blend_band: Blend band width in pixels.
-    :return: Modified image with feathered inner edge.
+    :param image: (B, H, W, C) decoded image (waste already restored).
+    :param original_image: (B, H, W, C) original clean image.
+    :param waste_mask: (1, H, W) or (H, W), waste=1, inside=0.
+    :param blend_band: Transition band width in pixels (inside hex only).
+    :return: (B, H, W, C) image with smoothed seam.
     """
-    weights, nearest_y, nearest_x = _compute_boundary_blend_map_from_mask(
-        inside_mask, blend_band,
-    )
-
-    weights = weights.to(image.device)
-    nearest_y = nearest_y.to(image.device)
-    nearest_x = nearest_x.to(image.device)
-
-    waste_content = image[:, nearest_y, nearest_x, :]  # (B, H, W, C)
-
-    w = weights.unsqueeze(0).unsqueeze(-1)  # (1, H, W, 1)
-    return image * (1 - w) + waste_content * w
+    smooth = _make_smooth_hex_mask(waste_mask, blend_band, image.shape)
+    smooth = _preserve_waste(smooth, waste_mask, image.shape[1:3])
+    m = smooth.to(device=image.device, dtype=image.dtype).unsqueeze(-1)
+    orig = original_image.to(device=image.device, dtype=image.dtype)
+    return image * m + orig * (1 - m)
 
 
 # ---------------------------------------------------------------------------
 # Laplacian pyramid blending
 # ---------------------------------------------------------------------------
 
+def _blur2x(x: torch.Tensor) -> torch.Tensor:
+    """Separable Gaussian blur using Burt-Adelson 5-tap kernel (σ ≈ 1.0)."""
+    kernel = torch.tensor(
+        [1.0, 4.0, 6.0, 4.0, 1.0],
+        dtype=x.dtype, device=x.device,
+    )
+    kernel = kernel / kernel.sum()
+    C = x.shape[1]
+    kh = kernel.view(1, 1, 1, -1).expand(C, 1, 1, -1).contiguous()
+    x = F.conv2d(F.pad(x, [2, 2, 0, 0], mode="reflect"), kh, groups=C)
+    kv = kernel.view(1, 1, -1, 1).expand(C, 1, -1, 1).contiguous()
+    x = F.conv2d(F.pad(x, [0, 0, 2, 2], mode="reflect"), kv, groups=C)
+    return x
+
+
 def _gaussian_pyramid(img: torch.Tensor, levels: int) -> list[torch.Tensor]:
-    """Build a Gaussian pyramid by successive 2x average-pooling.
+    """Build a Gaussian pyramid with proper Burt-Adelson blur at each level.
 
     :param img: Tensor in (B, C, H, W) layout.
     :param levels: Number of down-sampling steps.
@@ -297,7 +330,8 @@ def _gaussian_pyramid(img: torch.Tensor, levels: int) -> list[torch.Tensor]:
     gp = [img]
     cur = img
     for _ in range(levels):
-        cur = F.avg_pool2d(cur, kernel_size=2, stride=2)
+        cur = _blur2x(cur)
+        cur = cur[:, :, ::2, ::2]
         gp.append(cur)
     return gp
 
@@ -492,8 +526,9 @@ class InpaintVAEDecode:
                 }),
                 "feather_restore": ("BOOLEAN", {
                     "default": False,
-                    "tooltip": "Restore waste area from original_image with feathered transition at hex boundary. "
-                    "Waste area is replaced pixel-perfect; only a narrow band at the hex edge is blended.",
+                    "tooltip": "Smooth the seam at the inner hex boundary via Gaussian compositing. "
+                    "Only affects pixels inside the hex near the boundary; waste area is untouched. "
+                    "Transition band width controlled by blend_band.",
                 }),
                 "blend_band": ("INT", {
                     "default": 8,
@@ -625,27 +660,32 @@ class InpaintVAEDecode:
                     -1, image.shape[-3], image.shape[-2], image.shape[-1]
                 )
 
+        # Pixel-perfect waste restore from original (after VAE injection)
+        if inject_waste:
+            wm = waste_mask_img if waste_mask_img is not None else waste_mask
+            wf = wm.float()
+            if wf.dim() == 2:
+                wf = wf.unsqueeze(0)
+            elif wf.dim() == 3:
+                wf = wf[:1]
+            if wf.shape[-2:] != image.shape[1:3]:
+                wf = F.interpolate(
+                    wf.unsqueeze(1), size=image.shape[1:3], mode="nearest",
+                ).squeeze(1)
+            w = wf.to(device=image.device, dtype=image.dtype).unsqueeze(-1)
+            orig = original_image.to(device=image.device, dtype=image.dtype)
+            image = image * (1 - w) + orig * w
+
         # Post-processing: smooth seam at hex boundary
         if feather_restore or laplacian_blend:
             if feather_restore:
-                # Blend inner hex edge toward nearest waste-area pixel content.
-                # Only affects a narrow band inside the hex boundary.
-                # Waste area and deep interior are untouched.
                 blend_source = waste_mask_img if waste_mask_img is not None else waste_mask
-                inside = (blend_source == 0)
-                if inside.dim() == 3:
-                    inside = inside[0]
-                H_img, W_img = image.shape[1], image.shape[2]
-                if inside.shape != (H_img, W_img):
-                    inside = F.interpolate(
-                        inside.float().unsqueeze(0).unsqueeze(0),
-                        size=(H_img, W_img), mode="nearest",
-                    ).squeeze(0).squeeze(0).bool()
-                image = _feather_inner_edge(image, inside, blend_band)
+                image = _feather_seam(image, original_image, blend_source, blend_band)
             else:
                 ref = original_image.to(device=image.device, dtype=image.dtype)
                 blend_mask = waste_mask_img if waste_mask_img is not None else waste_mask
                 mask = _make_smooth_hex_mask(blend_mask, blend_band, image.shape)
+                mask = _preserve_waste(mask, blend_mask, image.shape[1:3])
                 image = laplacian_pyramid_blend(image, ref, mask)
 
         return (image,)
