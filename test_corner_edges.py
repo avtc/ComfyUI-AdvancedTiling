@@ -115,7 +115,7 @@ def test_tile_map_covers_all():
 
 
 def test_corner_preview_shape():
-    """Corner preview should have same shape as input."""
+    """Corner preview should be square (cropped)."""
     B, H, W, C = 1, 256, 256, 3
     img_a = torch.rand(B, H, W, C)
     img_b = torch.rand(B, H, W, C)
@@ -123,9 +123,9 @@ def test_corner_preview_shape():
 
     for corner in CORNER_NAMES:
         preview = composite_corner_preview(img_a, img_b, img_c, corner)
-        assert preview.shape == (B, H, W, C), (
-            f"{corner}: shape {preview.shape} != {(B, H, W, C)}"
-        )
+        _, pH, pW, _ = preview.shape
+        assert pH == pW, f"{corner}: not square: {pH}x{pW}"
+        assert pH <= H, f"{corner}: crop height {pH} > input {H}"
     print("PASS: test_corner_preview_shape")
 
 
@@ -199,7 +199,7 @@ def test_tile_map_center_assigned_to_central():
 
 
 def test_no_black_pixels_in_preview():
-    """Preview should have no black pixels near the vertex (center region)."""
+    """Cropped preview should have no black pixels (all content)."""
     B, H, W, C = 1, 256, 256, 3
     img_a = torch.ones(B, H, W, C) * 0.5
     img_b = torch.ones(B, H, W, C) * 0.7
@@ -207,11 +207,9 @@ def test_no_black_pixels_in_preview():
 
     for corner in CORNER_NAMES:
         preview = composite_corner_preview(img_a, img_b, img_c, corner)
-        # Check a 64x64 region around center — all pixels should be non-zero
-        center_region = preview[0, 96:160, 96:160, :]
-        black_pixels = (center_region.sum(dim=-1) == 0).sum().item()
+        black_pixels = (preview.sum(dim=-1) == 0).sum().item()
         assert black_pixels == 0, (
-            f"{corner}: {black_pixels} black pixels in center region"
+            f"{corner}: {black_pixels} black pixels in cropped preview"
         )
     print("PASS: test_no_black_pixels_in_preview")
 
