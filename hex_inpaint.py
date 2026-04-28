@@ -527,7 +527,7 @@ class AdvancedTilingHexInpaint:
         enable_preview, kwargs,
     ):
         """CornerEdges mode: compose 3 tiles at a corner and generate edge masks."""
-        from .terrain_priority import match_terrain_priority, TerrainPriorities
+        from .tile_priority import match_terrain_priority, TerrainPriorities
 
         t_start = time.time()
         priorities = kwargs.get("priorities")
@@ -607,23 +607,21 @@ class AdvancedTilingHexInpaint:
                 border_mask_img,
             )
 
-        # 6. Preview
-        if enable_preview:
-            preview = composite_corner_preview(center_image, n1_image, n2_image, corner_select)
-        else:
-            preview = torch.zeros(1, 1, 1, 3, dtype=torch.float32)
+        # 6. Overlap image (pixel-space corner composite, always computed)
+        corner_overlap = composite_corner_preview(center_image, n1_image, n2_image, corner_select)
 
         # 7. Assemble outputs (same count as CentralTile for compatibility)
         outputs = [
             latent_dict,            # LATENT
             border_mask_img,        # MASK (debug)
-            *[torch.zeros(1, H_img, W_img)] * 6,  # 6 directional masks (unused)
-            preview,                # composited_preview
+            *[torch.zeros(H_img, W_img)] * 6,  # 6 directional masks (unused)
+            corner_overlap if enable_preview else torch.zeros(1, 1, 1, 3, dtype=torch.float32),  # composited_preview
             torch.zeros(1, H_img, W_img, 3),       # color_mask (unused)
             {"samples": center_latent, "noise_mask": noise_mask},  # paintbrush latent
             torch.zeros(1, H_img, W_img, 3),       # paintbrush preview (unused)
             torch.zeros(1, H_lat, W_lat),           # waste_mask_lat (unused)
             torch.zeros(1, H_img, W_img),           # waste_mask_img (unused)
+            corner_overlap,                         # overlap_image
         ]
 
         logger.info(f"[CornerEdges] Total: {time.time()-t_start:.3f}s, "

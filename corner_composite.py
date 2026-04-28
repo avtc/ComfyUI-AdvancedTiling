@@ -37,6 +37,18 @@ _CORNER_OFFSETS = {
     "NW": (( 0.866025404,  0.5), ( 0.0,         -1.0), (-0.866025404,  0.5)),
 }
 
+# Sector start angles for angular fallback.
+# Computed from the boundary just clockwise of the central tile's center
+# angle as seen from the shared vertex.
+_CORNER_SECTOR_START = {
+    "N":  math.radians(210),
+    "NE": math.radians(150),
+    "SE": math.radians(90),
+    "S":  math.radians(30),
+    "SW": math.radians(330),
+    "NW": math.radians(270),
+}
+
 
 def get_corner_offsets(corner: str, hex_radius: float):
     """
@@ -53,46 +65,85 @@ def get_corner_offsets(corner: str, hex_radius: float):
     )
 
 
+def _build_offset_hex_mask(
+    width: int, height: int, ox: float, oy: float, hex_radius: float,
+) -> torch.Tensor:
+    """
+    Build boolean mask for a pointy-top hex at offset position in output space.
+
+    :param ox: X offset in image coordinates
+    :param oy: Y offset in image coordinates
+    :param hex_radius: Hex circumradius
+    :return: Bool tensor (H, W)
+    """
+    cx = width / 2.0 + ox
+    cy = height / 2.0 + oy
+    apothem = hex_radius * math.sqrt(3) / 2
+
+    ys, xs = torch.meshgrid(
+        torch.arange(height, dtype=torch.float32),
+        torch.arange(width, dtype=torch.float32),
+        indexing='ij',
+    )
+    dx = xs - cx
+    dy = cy - ys  # flip Y for math coords
+
+    dist = torch.sqrt(dx * dx + dy * dy)
+    angles = torch.atan2(dy, dx) % (2 * math.pi)
+
+    # Nearest edge-midpoint direction (0, 60, 120, 180, 240, 300 degrees)
+    sector_angles = (torch.round(angles / (math.pi / 3)) * (math.pi / 3)) % (2 * math.pi)
+    local_angles = (angles - sector_angles + math.pi) % (2 * math.pi) - math.pi
+
+    cos_local = torch.clamp(torch.cos(local_angles), min=1e-6)
+    boundary_dist = apothem / cos_local
+
+    return dist <= boundary_dist + 0.5  # half-pixel tolerance for boundary pixels
+
+
 def build_corner_tile_map(
     width: int, height: int, corner: str, hex_radius: float,
 ) -> torch.Tensor:
     """
     Build a map assigning each output pixel to one of 3 tiles.
 
-    Uses 120-degree sectors radiating from the output center. Each sector
-    is assigned to the tile whose content covers that angular range.
+    Uses hex masks (with sub-pixel offsets) for accurate tile boundaries.
+    Falls back to 120-degree angular sectors for any pixels not covered
+    by a hex mask (outer regions beyond circumradius).
 
+    :param width: Output width
+    :param height: Output height
+    :param corner: Corner name
+    :param hex_radius: Hex circumradius in pixels
     :return: LongTensor (H, W) with values 0 (central), 1 (neighbor1), 2 (neighbor2)
     """
-    ys, xs = torch.meshgrid(
-        torch.arange(height, dtype=torch.float32),
-        torch.arange(width, dtype=torch.float32),
-        indexing='ij',
-    )
-    dx = xs - width / 2.0
-    dy = -(ys - height / 2.0)  # flip Y for math coords
-    angles = torch.atan2(dy, dx) % (2 * math.pi)
+    unit_offsets = _CORNER_OFFSETS[corner]
+    # Float offsets for accurate hex mask boundaries
+    float_offsets = [(ux * hex_radius, uy * hex_radius) for ux, uy in unit_offsets]
 
-    # The 3 boundaries are at 120-degree intervals.
-    # The starting angle depends on the corner.
-    # Sector 0 (central tile) starts at boundary_0 and spans 120 degrees.
-    # boundary_0 is the edge between central and neighbor1.
-    # boundary_1 is between neighbor1 and neighbor2.
-    # boundary_2 is between neighbor2 and central.
-    _CORNER_SECTOR_START = {
-        "N":  math.radians(210),
-        "NE": math.radians(270),
-        "SE": math.radians(90),
-        "S":  math.radians(30),
-        "SW": math.radians(330),
-        "NW": math.radians(30),
-    }
+    # Primary: hex-mask-based assignment (accurate boundaries)
+    tile_map = torch.full((height, width), -1, dtype=torch.long)
+    for tile_idx, (ox, oy) in enumerate(float_offsets):
+        hex_mask = _build_offset_hex_mask(width, height, ox, oy, hex_radius)
+        unassigned = tile_map < 0
+        tile_map[hex_mask & unassigned] = tile_idx
 
-    sector_start = _CORNER_SECTOR_START[corner]
-    # Relative angle from sector start, in [0, 2*pi)
-    rel_angle = (angles - sector_start) % (2 * math.pi)
-    # Tile index: 0=central (0-120), 1=neighbor1 (120-240), 2=neighbor2 (240-360)
-    tile_map = (rel_angle / (2 * math.pi / 3)).long() % 3
+    # Fallback: angular sectors for uncovered pixels (outer region)
+    uncovered = tile_map < 0
+    if uncovered.any():
+        ys, xs = torch.meshgrid(
+            torch.arange(height, dtype=torch.float32),
+            torch.arange(width, dtype=torch.float32),
+            indexing='ij',
+        )
+        dx = xs - width / 2.0
+        dy = -(ys - height / 2.0)
+        angles = torch.atan2(dy, dx) % (2 * math.pi)
+
+        sector_start = _CORNER_SECTOR_START[corner]
+        rel_angle = (angles - sector_start) % (2 * math.pi)
+        sector_map = (rel_angle / (2 * math.pi / 3)).long() % 3
+        tile_map[uncovered] = sector_map[uncovered]
 
     return tile_map
 
@@ -130,19 +181,16 @@ def composite_corner_latents(
     for tile_idx, (ox, oy) in enumerate(offsets):
         src = latents[tile_idx]
         mask = (tile_map == tile_idx)
-        # For each pixel assigned to this tile, look up the source pixel
-        # accounting for the offset
         ys, xs = torch.meshgrid(
             torch.arange(H, dtype=torch.long),
             torch.arange(W, dtype=torch.long),
             indexing='ij',
         )
-        src_ys = ys - oy
-        src_xs = xs - ox
-        valid = mask & (src_ys >= 0) & (src_ys < H) & (src_xs >= 0) & (src_xs < W)
+        src_ys = (ys - oy).clamp(0, H - 1)
+        src_xs = (xs - ox).clamp(0, W - 1)
 
-        if valid.any():
-            result[:, :, valid] = src[:, :, src_ys[valid], src_xs[valid]]
+        if mask.any():
+            result[:, :, mask] = src[:, :, src_ys[mask], src_xs[mask]]
 
     if len(center_orig) > 4:
         result = result.reshape(center_orig)
@@ -176,11 +224,10 @@ def composite_corner_preview(
             torch.arange(W, dtype=torch.long),
             indexing='ij',
         )
-        src_ys = ys - oy
-        src_xs = xs - ox
-        valid = mask & (src_ys >= 0) & (src_ys < H) & (src_xs >= 0) & (src_xs < W)
+        src_ys = (ys - oy).clamp(0, H - 1)
+        src_xs = (xs - ox).clamp(0, W - 1)
 
-        if valid.any():
-            result[0, valid] = src[0, src_ys[valid], src_xs[valid]]
+        if mask.any():
+            result[0, mask] = src[0, src_ys[mask], src_xs[mask]]
 
     return result

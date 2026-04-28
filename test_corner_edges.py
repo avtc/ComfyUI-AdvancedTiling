@@ -4,8 +4,19 @@ import math
 import torch
 import sys
 import os
+import importlib
 
-sys.path.insert(0, os.path.dirname(__file__))
+# Set up package imports so relative imports work within the package
+_pkg_dir = os.path.dirname(os.path.abspath(__file__))
+_parent = os.path.dirname(_pkg_dir)
+sys.path.insert(0, _parent)
+
+# The directory has a hyphen, so use importlib for the top-level package
+_pkg_name = os.path.basename(_pkg_dir)
+_pkg = importlib.import_module(_pkg_name)
+sys.modules[_pkg_name] = _pkg
+# Also register it without hyphen for relative imports
+sys.modules["ComfyUI_AdvancedTiling"] = _pkg
 
 from corner_composite import (
     CORNER_NAMES,
@@ -13,8 +24,11 @@ from corner_composite import (
     get_corner_offsets,
     build_corner_tile_map,
     composite_corner_preview,
+    _build_offset_hex_mask,
 )
-from modes.hex_mask import create_corner_masks
+from modes.hex_mask import (
+    create_corner_masks, _build_hex_mask_at, NEIGHBOR_DIRECTIONS,
+)
 
 
 def test_corner_offsets_symmetry():
@@ -22,7 +36,6 @@ def test_corner_offsets_symmetry():
     R = 256
     for corner in CORNER_NAMES:
         offsets = get_corner_offsets(corner, R)
-        # Each offset should have magnitude R (vertex distance from center)
         for ox, oy in offsets:
             dist = math.sqrt(ox * ox + oy * oy)
             assert abs(dist - R) < 2.0, (
@@ -39,7 +52,6 @@ def test_tile_map_covers_all():
         assert set(unique.tolist()).issubset({0, 1, 2}), (
             f"{corner}: unexpected tile indices {unique.tolist()}"
         )
-        # All pixels assigned
         assert tile_map.numel() == 256 * 256
     print("PASS: test_tile_map_covers_all")
 
@@ -74,7 +86,7 @@ def test_corner_mask_equal_priority_no_mask():
     for corner in CORNER_NAMES:
         mask = create_corner_masks(
             256, 256, corner, border_width=0.2,
-            tile_priorities=[3, 3, 3],  # all equal
+            tile_priorities=[3, 3, 3],
         )
         assert mask.max() == 0.0, (
             f"{corner}: equal priority should produce empty mask, got max={mask.max()}"
@@ -95,12 +107,55 @@ def test_corner_mask_extent():
 
 def test_corner_neighbors_mapping():
     """Each corner should map to valid neighbor directions."""
-    from modes.hex_mask import NEIGHBOR_DIRECTIONS
     for corner, (n1, n2) in CORNER_NEIGHBORS.items():
         assert n1 in NEIGHBOR_DIRECTIONS, f"{corner}: n1={n1} not in directions"
         assert n2 in NEIGHBOR_DIRECTIONS, f"{corner}: n2={n2} not in directions"
         assert n1 != n2, f"{corner}: n1 and n2 should be different"
     print("PASS: test_corner_neighbors_mapping")
+
+
+def test_hex_mask_covers_center():
+    """Hex mask centered at image center should cover the center pixel."""
+    mask = _build_hex_mask_at(256, 256, 128, 128, 128)
+    assert mask[128, 128], "Center pixel should be inside hex"
+    print("PASS: test_hex_mask_covers_center")
+
+
+def test_hex_mask_offset_covers_vertex():
+    """Offset hex mask should cover the output center (vertex position)."""
+    R = 128
+    # For corner N, central tile offset is (0, R)
+    mask = _build_offset_hex_mask(256, 256, 0, R, R)
+    assert mask[128, 128], "Vertex at output center should be inside offset hex"
+    print("PASS: test_hex_mask_offset_covers_vertex")
+
+
+def test_tile_map_center_assigned_to_central():
+    """Center pixel should be assigned to the central tile (index 0)."""
+    for corner in CORNER_NAMES:
+        tile_map = build_corner_tile_map(256, 256, corner, 128)
+        assert tile_map[128, 128] == 0, (
+            f"{corner}: center pixel assigned to tile {tile_map[128, 128]}, expected 0"
+        )
+    print("PASS: test_tile_map_center_assigned_to_central")
+
+
+def test_no_black_pixels_in_preview():
+    """Preview should have no black pixels near the vertex (center region)."""
+    B, H, W, C = 1, 256, 256, 3
+    img_a = torch.ones(B, H, W, C) * 0.5
+    img_b = torch.ones(B, H, W, C) * 0.7
+    img_c = torch.ones(B, H, W, C) * 0.9
+
+    for corner in CORNER_NAMES:
+        preview = composite_corner_preview(img_a, img_b, img_c, corner)
+        # Check a 64x64 region around center — all pixels should be non-zero
+        center_region = preview[0, 96:160, 96:160, :]
+        black_pixels = (center_region.sum(dim=-1) == 0).sum().item()
+        assert black_pixels == 0, (
+            f"{corner}: {black_pixels} black pixels in center region"
+        )
+    print("PASS: test_no_black_pixels_in_preview")
 
 
 if __name__ == "__main__":
@@ -111,4 +166,8 @@ if __name__ == "__main__":
     test_corner_mask_equal_priority_no_mask()
     test_corner_mask_extent()
     test_corner_neighbors_mapping()
+    test_hex_mask_covers_center()
+    test_hex_mask_offset_covers_vertex()
+    test_tile_map_center_assigned_to_central()
+    test_no_black_pixels_in_preview()
     print("\nAll tests passed!")

@@ -340,6 +340,51 @@ def create_feathered_masks(
     return inside, border_mask, neighbor_masks
 
 
+def _build_hex_mask_at(
+    width: int, height: int, cx: float, cy: float, circumradius: float,
+) -> torch.Tensor:
+    """
+    Build boolean mask for a pointy-top hex at an arbitrary position.
+
+    :param cx: Hex center X in image coordinates
+    :param cy: Hex center Y in image coordinates (Y down)
+    :param circumradius: Hex circumradius
+    :return: Bool tensor (H, W)
+    """
+    apothem = circumradius * math.sqrt(3) / 2
+
+    ys, xs = torch.meshgrid(
+        torch.arange(height, dtype=torch.float32),
+        torch.arange(width, dtype=torch.float32),
+        indexing='ij',
+    )
+    dx = xs - cx
+    dy = cy - ys  # flip Y for math coords
+
+    dist = torch.sqrt(dx * dx + dy * dy)
+    angles = torch.atan2(dy, dx) % (2 * math.pi)
+
+    sector_angles = (torch.round(angles / (math.pi / 3)) * (math.pi / 3)) % (2 * math.pi)
+    local_angles = (angles - sector_angles + math.pi) % (2 * math.pi) - math.pi
+
+    cos_local = torch.clamp(torch.cos(local_angles), min=1e-6)
+    boundary_dist = apothem / cos_local
+
+    return dist <= boundary_dist + 0.5  # half-pixel tolerance for boundary pixels
+
+
+# Unit offsets for each corner's 3 tiles: (central, neighbor1, neighbor2).
+# Multiply by hex_radius to get pixel offsets.
+_CORNER_OFFSET_UNITS = {
+    "N":  (( 0.0,          1.0), ( 0.866025404, -0.5), (-0.866025404, -0.5)),
+    "NE": ((-0.866025404,  0.5), ( 0.866025404,  0.5), ( 0.0,         -1.0)),
+    "SE": ((-0.866025404, -0.5), ( 0.0,          1.0), ( 0.866025404, -0.5)),
+    "S":  (( 0.0,         -1.0), (-0.866025404,  0.5), ( 0.866025404,  0.5)),
+    "SW": (( 0.866025404, -0.5), (-0.866025404, -0.5), ( 0.0,          1.0)),
+    "NW": (( 0.866025404,  0.5), ( 0.0,         -1.0), (-0.866025404,  0.5)),
+}
+
+
 def create_corner_masks(
     width: int,
     height: int,
@@ -352,8 +397,9 @@ def create_corner_masks(
     """
     Generate a combined border mask for corner inpainting.
 
-    Creates masks along 3 edges where tiles meet at the corner,
-    applying priority-based side selection.
+    Uses morphological erosion (same approach as CentralTile mode):
+    for each tile, compute hex mask → erode → border ring = inside & ~eroded.
+    The border ring along each edge is then selected based on priority.
 
     :param width: Image width
     :param height: Image height
@@ -368,32 +414,39 @@ def create_corner_masks(
     hex_radius = min(width, height) // 2
     erosion_pixels = max(1, int(border_width * hex_radius))
 
-    # How far from center the mask extends along each edge
     if mask_extent == "half_edge":
         extent_pixels = round(hex_radius / 2)
     else:  # full_edge
         extent_pixels = hex_radius
 
-    # Boundary angles (math coords) for each corner
+    unit_offsets = _CORNER_OFFSET_UNITS[corner]
+    # Float offsets for accurate hex mask boundaries
+    float_offsets = [(ux * hex_radius, uy * hex_radius) for ux, uy in unit_offsets]
+
+    # Build hex masks and eroded masks for each tile (morphological approach)
+    hex_masks = []
+    eroded_masks = []
+    for ox, oy in float_offsets:
+        cx = width / 2.0 + ox
+        cy = height / 2.0 + oy
+        inside = _build_hex_mask_at(width, height, cx, cy, hex_radius)
+        eroded = _erode_mask(inside, erosion_pixels)
+        hex_masks.append(inside)
+        eroded_masks.append(eroded)
+
+    # Boundary angles for extent limiting
     _CORNER_BOUNDARIES = {
-        "N":  [math.radians(210), math.radians(330), math.radians(90)],
+        "N":  [math.radians(330), math.radians(210), math.radians(90)],
         "NE": [math.radians(270), math.radians(150), math.radians(30)],
         "SE": [math.radians(90),  math.radians(210), math.radians(330)],
         "S":  [math.radians(30),  math.radians(150), math.radians(270)],
         "SW": [math.radians(330), math.radians(90),  math.radians(210)],
         "NW": [math.radians(30),  math.radians(270), math.radians(150)],
     }
-
     boundaries = _CORNER_BOUNDARIES[corner]
-
-    # tile_priorities: [center, n1, n2]
-    # boundaries: [center↔n1, center↔n2, n1↔n2]
-    # For each boundary, the two adjacent tiles are:
-    #   boundary 0 (center↔n1): tiles 0 and 1
-    #   boundary 1 (center↔n2): tiles 0 and 2
-    #   boundary 2 (n1↔n2): tiles 1 and 2
     edge_tile_pairs = [(0, 1), (0, 2), (1, 2)]
 
+    # Pre-compute angular data for extent limiting
     ys, xs = torch.meshgrid(
         torch.arange(height, dtype=torch.float32),
         torch.arange(width, dtype=torch.float32),
@@ -404,62 +457,60 @@ def create_corner_masks(
     dist_from_center = torch.sqrt(dx * dx + dy * dy)
     pixel_angles = torch.atan2(dy, dx) % (2 * math.pi)
 
+    # Pre-compute distance transforms for feathering
+    if feather_pixels > 0:
+        dist_to_eroded = [
+            torch.from_numpy(np.clip(
+                _manhattan_distance_to_region(eroded_masks[i]) / feather_pixels,
+                0.0, 1.0,
+            ))
+            for i in range(3)
+        ]
+
     combined_mask = torch.zeros(height, width, dtype=torch.float32)
 
     for edge_idx, (boundary_angle, (tile_a, tile_b)) in enumerate(
         zip(boundaries, edge_tile_pairs)
     ):
-        # Determine which side(s) to mask based on priority
         pri_a = tile_priorities[tile_a] if tile_priorities else None
         pri_b = tile_priorities[tile_b] if tile_priorities else None
 
         if pri_a is not None and pri_b is not None and pri_a == pri_b:
-            # Equal priority: no mask needed (seamless tiles)
             continue
 
-        # Angular distance to boundary line
+        # Border rings: inside & ~eroded (same as CentralTile)
+        border_a = hex_masks[tile_a] & ~eroded_masks[tile_a]
+        border_b = hex_masks[tile_b] & ~eroded_masks[tile_b]
+
+        # Extent: only from vertex outward along the edge
         angle_diff = (pixel_angles - boundary_angle + math.pi) % (2 * math.pi) - math.pi
-        # Perpendicular distance from boundary line
-        perp_dist = torch.abs(torch.sin(angle_diff)) * dist_from_center
+        along_dist = torch.cos(angle_diff) * dist_from_center
+        in_extent = (along_dist >= 0) & (along_dist <= extent_pixels)
 
-        # Distance along boundary from center
-        along_dist = torch.abs(torch.cos(angle_diff)) * dist_from_center
-
-        # Mask conditions
-        in_extent = along_dist <= extent_pixels
-        in_band = perp_dist <= erosion_pixels
-
+        # Priority-based side selection
         if pri_a is None and pri_b is None:
-            # Both unknown: mask both sides equally
-            mask_band = in_extent & in_band
+            edge_mask = (border_a | border_b) & in_extent
+            feather = torch.where(border_a, dist_to_eroded[tile_a], dist_to_eroded[tile_b]) if feather_pixels > 0 else None
         elif pri_a is not None and pri_b is not None:
-            # Different priorities: mask lower-priority side only
-            # Lower priority = higher index value
             if pri_a > pri_b:
-                # Mask tile A's side (positive angle_diff)
-                side_mask = angle_diff > 0
+                edge_mask = border_b & in_extent
+                feather = dist_to_eroded[tile_b] if feather_pixels > 0 else None
             else:
-                # Mask tile B's side (negative angle_diff)
-                side_mask = angle_diff < 0
-            mask_band = in_extent & in_band & side_mask
+                edge_mask = border_a & in_extent
+                feather = dist_to_eroded[tile_a] if feather_pixels > 0 else None
         elif pri_a is None:
-            # A unknown, B known: mask A's side only
-            side_mask = angle_diff > 0
-            mask_band = in_extent & in_band & side_mask
+            edge_mask = border_a & in_extent
+            feather = dist_to_eroded[tile_a] if feather_pixels > 0 else None
         else:
-            # B unknown, A known: mask B's side only
-            side_mask = angle_diff < 0
-            mask_band = in_extent & in_band & side_mask
+            edge_mask = border_b & in_extent
+            feather = dist_to_eroded[tile_b] if feather_pixels > 0 else None
 
         # Apply feathering
-        if feather_pixels > 0 and mask_band.any():
-            feather_weight = torch.clamp(
-                (erosion_pixels - perp_dist) / feather_pixels, 0.0, 1.0
-            )
-            edge_mask = mask_band.float() * feather_weight
+        if feather_pixels > 0 and edge_mask.any():
+            edge_float = edge_mask.float() * feather
         else:
-            edge_mask = mask_band.float()
+            edge_float = edge_mask.float()
 
-        combined_mask = torch.max(combined_mask, edge_mask)
+        combined_mask = torch.max(combined_mask, edge_float)
 
     return combined_mask.unsqueeze(0)  # (1, H, W)

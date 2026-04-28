@@ -14,7 +14,7 @@ class TerrainPriorities:
     entries: list[tuple[torch.Tensor, int]] = field(default_factory=list)
 
 
-class TerrainPrioritySettings:
+class TilePrioritySettings:
     """
     Maps reference terrain images to priority integers.
     Chain multiple nodes for more than 8 terrain types.
@@ -27,7 +27,7 @@ class TerrainPrioritySettings:
             "required": {},
             "optional": {
                 "priorities_in": ("TERRAIN_PRIORITIES", {
-                    "tooltip": "Chain input from previous TerrainPrioritySettings node.",
+                    "tooltip": "Chain input from previous TilePrioritySettings node.",
                 }),
             },
         }
@@ -56,9 +56,10 @@ class TerrainPrioritySettings:
         if priorities_in is not None:
             entries.extend(priorities_in.entries)
 
-        for i in range(1, 9):
+        priorities = [priority_1, priority_2, priority_3, priority_4,
+                      priority_5, priority_6, priority_7, priority_8]
+        for i, pri in enumerate(priorities, start=1):
             img = kwargs.get(f"image_{i}")
-            pri = locals()[f"priority_{i}"]
             if img is not None and pri >= 0:
                 entries.append((img, pri))
 
@@ -72,8 +73,8 @@ def match_terrain_priority(
     """
     Match a tile image against reference images and return its priority.
 
-    Uses MSE between the tile and each reference image.
-    Returns None if no match found (all MSE above threshold).
+    Uses torch.allclose (same approach as CentralTile skip detection).
+    Returns None if no exact match found.
 
     :param tile_image: Tile image tensor (1, H, W, 3)
     :param priorities: Terrain priority settings
@@ -82,11 +83,7 @@ def match_terrain_priority(
     if not priorities.entries:
         return None
 
-    best_mse = float("inf")
-    best_priority = None
-
     for ref_image, priority in priorities.entries:
-        # Handle size mismatch by resizing reference to match tile
         if ref_image.shape != tile_image.shape:
             ref_resized = torch.nn.functional.interpolate(
                 ref_image.permute(0, 3, 1, 2),
@@ -97,13 +94,7 @@ def match_terrain_priority(
         else:
             ref_resized = ref_image
 
-        mse = ((tile_image.float() - ref_resized.float()) ** 2).mean().item()
-        if mse < best_mse:
-            best_mse = mse
-            best_priority = priority
+        if torch.allclose(tile_image.float(), ref_resized.float(), atol=1e-6):
+            return priority
 
-    # Threshold: if best MSE is too high, treat as unknown
-    if best_mse > 0.1:
-        return None
-
-    return best_priority
+    return None
