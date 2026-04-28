@@ -306,8 +306,8 @@ def _feather_seam(
     # Find nearest waste pixel for each inside pixel
     outside_np = (~inside).cpu().numpy().astype(np.float64)
     _, indices = distance_transform_edt(outside_np, return_indices=True)
-    nearest_y = torch.from_numpy(indices[0].astype(torch.int64))
-    nearest_x = torch.from_numpy(indices[1].astype(torch.int64))
+    nearest_y = torch.from_numpy(indices[0].astype(np.int64))
+    nearest_x = torch.from_numpy(indices[1].astype(np.int64))
 
     # Build blend target: for each pixel, use nearest waste pixel from image
     blend_target = image.clone()
