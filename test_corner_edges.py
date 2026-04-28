@@ -62,6 +62,33 @@ def test_corner_edge_sectors_structure():
             assert tile_a != tile_b, f"{corner}: same tile on both sides"
 
 
+def test_corner_mask_sector_shape_matches_central():
+    """Corner mask sectors should have same shape as CentralTile neighbor masks."""
+    from modes.hex_mask import create_corner_masks, _build_hex_mask_at, _compute_sector_map_at
+    W, H = 256, 256
+    R = W // 2
+    corner = "NE"
+
+    corner_mask = create_corner_masks(W, H, corner, border_width=0.2, tile_priorities=None)
+    assert corner_mask.max() > 0, "Corner mask should be non-empty with no priorities"
+    assert corner_mask[0, 0, 0] == 0, "Mask should be zero at top-left corner"
+    assert corner_mask[0, 0, -1] == 0, "Mask should be zero at top-right corner"
+    assert corner_mask[0, -1, 0] == 0, "Mask should be zero at bottom-left corner"
+    assert corner_mask[0, -1, -1] == 0, "Mask should be zero at bottom-right corner"
+
+
+def test_corner_mask_half_erosion_unknown_priority():
+    """When both priorities are unknown, each side uses half border width."""
+    from modes.hex_mask import create_corner_masks
+    W, H = 256, 256
+
+    mask_unknown = create_corner_masks(W, H, "NE", border_width=0.2, tile_priorities=None)
+    mask_known = create_corner_masks(W, H, "NE", border_width=0.2, tile_priorities=[1, 2, 3])
+
+    assert mask_unknown.max() > 0, "Unknown priorities should produce mask"
+    assert mask_known.max() > 0, "Known different priorities should produce mask"
+
+
 def test_corner_offsets_symmetry():
     """All corners should have symmetric offsets (same magnitude, rotated)."""
     R = 256
@@ -193,6 +220,8 @@ if __name__ == "__main__":
     test_sector_map_at_center_matches_global()
     test_sector_map_at_offset_covers_all_sectors()
     test_corner_edge_sectors_structure()
+    test_corner_mask_sector_shape_matches_central()
+    test_corner_mask_half_erosion_unknown_priority()
     test_corner_offsets_symmetry()
     test_tile_map_covers_all()
     test_corner_preview_shape()
