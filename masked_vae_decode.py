@@ -382,7 +382,25 @@ def _feather_seam(
     smooth = _make_smooth_hex_mask(waste_mask, blend_band, image.shape)
     # smooth is (1, 1, H, W) CHW — permute to (1, H, W, 1) for BHWC broadcast
     m = smooth.permute(0, 2, 3, 1).to(device=image.device, dtype=image.dtype)
-    return image * m + blend_target.to(device=image.device, dtype=image.dtype) * (1 - m)
+
+    result = image * m + blend_target.to(device=image.device, dtype=image.dtype) * (1 - m)
+
+    # ---- Diagnostic logging ----
+    n_inside = int(inside.sum())
+    m_inside = m[0, inside[:, :], 0]  # (n_inside,)
+    diff = (result - image).abs()
+    logger.info(
+        f"[Feather] image={image.shape}, waste_mask in={waste_mask.shape}, "
+        f"inside={n_inside}/{H*W}, blend_band={blend_band}, "
+        f"m_inside min={m_inside.min().item():.4f} max={m_inside.max().item():.4f} "
+        f"mean={m_inside.mean().item():.4f}, "
+        f"m<0.99 count={int((m_inside < 0.99).sum())}, "
+        f"blend_target-img max={((blend_target[0, inside] - image[0, inside]).abs().max().item()):.6f}, "
+        f"output-img max_diff={diff.max().item():.6f}"
+    )
+    # ---- End diagnostic ----
+
+    return result
 
 
 # ---------------------------------------------------------------------------
