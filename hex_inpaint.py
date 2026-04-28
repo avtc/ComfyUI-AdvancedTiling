@@ -451,7 +451,7 @@ class AdvancedTilingHexInpaint:
             if waste_region.any():
                 overlap_image[0][waste_region] = neighbor_img[0][waste_region]
             # Border mask area (inside hex, near edge)
-            border_region = full_neighbor_masks[target_idx] > 0
+            border_region = full_neighbor_masks[target_idx] > 0  # (H, W) bool
             if border_region.any():
                 overlap_image[0][border_region] = neighbor_img[0][border_region]
 
@@ -621,6 +621,8 @@ class AdvancedTilingHexInpaint:
         # Overlap: extends neighbor content into border mask area
         corner_overlap = corner_preview.clone()
         border_any = border_mask_img > 0
+        if border_any.dim() == 3:
+            border_any = border_any[0]
         if border_any.any():
             offsets = get_corner_offsets(corner_select, hex_radius_img)
             _, n1_off, n2_off = offsets
