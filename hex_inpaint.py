@@ -642,16 +642,7 @@ class AdvancedTilingHexInpaint:
         if n2_latent is None:
             n2_latent = vae.encode(n2_image)
 
-        # 1. Composite corner latents
-        composited_4d, _ = _normalize_latent(center_latent)
-        _, _, H_lat, W_lat = composited_4d.shape
-        hex_radius_lat = min(W_lat, H_lat) // 2
-
-        composited = composite_corner_latents(
-            center_latent, n1_latent, n2_latent, corner_select, hex_radius_lat,
-        )
-
-        # 2. Determine tile priorities
+        # 1. Determine tile priorities (needed before composite)
         tile_priorities = [None, None, None]  # [center, n1, n2]
         if priorities is not None:
             tile_priorities[0] = match_terrain_priority(center_image, priorities)
@@ -660,36 +651,25 @@ class AdvancedTilingHexInpaint:
             logger.info(f"[CornerEdges] Priorities: center={tile_priorities[0]}, "
                          f"{n1_dir}={tile_priorities[1]}, {n2_dir}={tile_priorities[2]}")
 
+        # 2. Composite corner latents in priority order.
+        # Lowest priority pasted first, highest priority pasted last —
+        # higher-priority tile overwrites at overlapping hex edges.
+        # This eliminates the need for a separate edge buffer.
+        composited_4d, _ = _normalize_latent(center_latent)
+        _, _, H_lat, W_lat = composited_4d.shape
+        hex_radius_lat = min(W_lat, H_lat) // 2
+
+        composited = composite_corner_latents(
+            center_latent, n1_latent, n2_latent, corner_select, hex_radius_lat,
+            tile_priorities=tile_priorities,
+        )
+
         # 3. Generate corner mask at latent resolution
         feather_lat = max(0, round(feather_radius * max(1, int(border_width * hex_radius_lat))))
         border_mask_lat = create_corner_masks(
             W_lat, H_lat, corner_select, border_width, feather_lat, mask_extent,
             tile_priorities,
         )
-
-        # 3b. Edge buffer: exclude outermost mask pixels from inpainting.
-        # The tile_map filter in create_corner_masks already ensures the mask
-        # doesn't cover higher-priority tile pixels. The buffer provides a thin
-        # ring of preserved composite content at the mask boundary, giving the
-        # model a clean edge to blend from. We do NOT overwrite the composite
-        # here — that would create a visible "copy-pasted" line from the
-        # adjacent tile's latent at a different source position.
-        if edge_buffer_depth >= 0:
-            mask_bool = border_mask_lat.squeeze(0) > 0
-            if mask_bool.any():
-                dist_to_boundary = _manhattan_distance_to_region(~mask_bool)
-                threshold = edge_buffer_depth + 1
-                buffer = mask_bool & (torch.from_numpy(dist_to_boundary) <= threshold)
-
-                if buffer.any():
-                    total_buffer = buffer.sum().item()
-                    border_mask_lat = torch.where(
-                        buffer.unsqueeze(0),
-                        torch.zeros_like(border_mask_lat),
-                        border_mask_lat,
-                    )
-                    logger.info(f"[CornerEdges] Edge buffer: depth={edge_buffer_depth}, "
-                                f"pixels={total_buffer}")
 
         # Remap mask strength
         if mask_strength_min > 0.0 or mask_strength_max < 1.0:
@@ -722,7 +702,7 @@ class AdvancedTilingHexInpaint:
 
         # 6. Preview and overlap images
         # Preview: corner composite showing tile arrangement
-        corner_preview = composite_corner_preview(center_image, n1_image, n2_image, corner_select)
+        corner_preview = composite_corner_preview(center_image, n1_image, n2_image, corner_select, tile_priorities)
 
         # Overlap: extends neighbor content into border mask area
         corner_overlap = corner_preview.clone()

@@ -468,6 +468,16 @@ _CORNER_EDGE_DIRECTIONS = {
     "NW": [( 0.866025404, -0.5), ( 0.0,          1.0), (-0.866025404, -0.5)],
 }
 
+# Sector start angles for angular fallback (same values as corner_composite._CORNER_SECTOR_START)
+_CORNER_SECTOR_STARTS = {
+    "N":  math.radians(210),
+    "NE": math.radians(150),
+    "SE": math.radians(90),
+    "S":  math.radians(30),
+    "SW": math.radians(330),
+    "NW": math.radians(270),
+}
+
 
 def create_corner_masks(
     width: int,
@@ -546,14 +556,25 @@ def create_corner_masks(
             for e in eroded_half
         ]
 
-    # Build tile assignment map to prevent masking pixels from the wrong tile.
-    # Hex masks overlap at shared edges, so without this filter, pixels
-    # assigned to the preserved (higher-priority) tile by the composite
-    # would get caught in the lower-priority tile's border ring.
+    # Non-overlapping tile assignment: each pixel belongs to exactly one tile.
+    # Highest priority (lowest number) processed first so overlap pixels at
+    # shared hex edges are assigned to the preserved tile, matching the
+    # priority-ordered composite.
     tile_map = torch.full((height, width), -1, dtype=torch.long)
-    for tile_idx in range(3):
+    tile_order = list(range(3))
+    if tile_priorities and all(p is not None for p in tile_priorities):
+        tile_order.sort(key=lambda i: tile_priorities[i])  # highest priority first
+    for tile_idx in tile_order:
         unassigned = tile_map < 0
         tile_map[hex_masks[tile_idx] & unassigned] = tile_idx
+    uncovered = tile_map < 0
+    if uncovered.any():
+        # 120-degree angular sectors from vertex for outer region
+        vertex_angles = torch.atan2(-rel_y, rel_x) % (2 * math.pi)
+        sector_start = _CORNER_SECTOR_STARTS[corner]
+        rel_angle = (vertex_angles - sector_start) % (2 * math.pi)
+        sector_fb = (rel_angle / (2 * math.pi / 3)).long() % 3
+        tile_map[uncovered] = sector_fb[uncovered]
 
     edges = _CORNER_EDGE_SECTORS[corner]
     edge_dirs = _CORNER_EDGE_DIRECTIONS[corner]
@@ -570,39 +591,34 @@ def create_corner_masks(
         if pri_a is not None and pri_b is not None and pri_a == pri_b:
             continue
 
-        # Determine which sides to mask and erosion level.
-        # Each mask is filtered by tile_map to avoid masking pixels that
-        # belong to the other tile (hex masks overlap at shared edges).
+        # Use tile_map directly for non-overlapping tile ownership.
+        # This excludes overlap pixels from the mask by design.
         owns_a = tile_map == tile_a
         owns_b = tile_map == tile_b
         if pri_a is None and pri_b is None:
-            mask_a = hex_masks[tile_a] & ~eroded_half[tile_a] & (sector_maps[tile_a] == sec_a) & in_extent & owns_a
-            mask_b = hex_masks[tile_b] & ~eroded_half[tile_b] & (sector_maps[tile_b] == sec_b) & in_extent & owns_b
+            mask_a = owns_a & ~eroded_half[tile_a] & (sector_maps[tile_a] == sec_a) & in_extent
+            mask_b = owns_b & ~eroded_half[tile_b] & (sector_maps[tile_b] == sec_b) & in_extent
             feather_a = dist_to_eroded_half[tile_a] if feather_pixels > 0 else None
             feather_b = dist_to_eroded_half[tile_b] if feather_pixels > 0 else None
         elif pri_a is not None and pri_b is not None:
-            # Lower number = higher priority = preserve (no mask)
-            # Higher number = lower priority = regenerate (mask)
             if pri_a > pri_b:
-                # tile_a has lower priority → mask (regenerate) its side
-                mask_a = hex_masks[tile_a] & ~eroded_full[tile_a] & (sector_maps[tile_a] == sec_a) & in_extent & owns_a
+                mask_a = owns_a & ~eroded_full[tile_a] & (sector_maps[tile_a] == sec_a) & in_extent
                 mask_b = torch.zeros(height, width, dtype=torch.bool)
                 feather_a = dist_to_eroded_full[tile_a] if feather_pixels > 0 else None
                 feather_b = None
             else:
-                # tile_b has lower priority → mask (regenerate) its side
                 mask_a = torch.zeros(height, width, dtype=torch.bool)
-                mask_b = hex_masks[tile_b] & ~eroded_full[tile_b] & (sector_maps[tile_b] == sec_b) & in_extent & owns_b
+                mask_b = owns_b & ~eroded_full[tile_b] & (sector_maps[tile_b] == sec_b) & in_extent
                 feather_a = None
                 feather_b = dist_to_eroded_full[tile_b] if feather_pixels > 0 else None
         elif pri_a is None:
-            mask_a = hex_masks[tile_a] & ~eroded_full[tile_a] & (sector_maps[tile_a] == sec_a) & in_extent & owns_a
+            mask_a = owns_a & ~eroded_full[tile_a] & (sector_maps[tile_a] == sec_a) & in_extent
             mask_b = torch.zeros(height, width, dtype=torch.bool)
             feather_a = dist_to_eroded_full[tile_a] if feather_pixels > 0 else None
             feather_b = None
         else:
             mask_a = torch.zeros(height, width, dtype=torch.bool)
-            mask_b = hex_masks[tile_b] & ~eroded_full[tile_b] & (sector_maps[tile_b] == sec_b) & in_extent & owns_b
+            mask_b = owns_b & ~eroded_full[tile_b] & (sector_maps[tile_b] == sec_b) & in_extent
             feather_a = None
             feather_b = dist_to_eroded_full[tile_b] if feather_pixels > 0 else None
 
