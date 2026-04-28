@@ -340,6 +340,48 @@ def create_feathered_masks(
     return inside, border_mask, neighbor_masks
 
 
+def compute_edge_buffer_mask(
+    width: int,
+    height: int,
+    settings: Settings,
+    border_width: float,
+    edge_buffer_depth: int,
+    active_directions: set[int],
+) -> torch.Tensor:
+    """
+    Compute per-direction boolean masks for the latent edge buffer zone.
+
+    The edge buffer identifies the outermost N pixels of the border ring per
+    active direction.  These pixels will be hard-pasted with neighbor latent
+    content and excluded from the inpaint mask, seeding the diffusion boundary
+    with correct adjacent content.
+
+    :param border_width: Border width fraction (same as passed to create_feathered_masks).
+    :param edge_buffer_depth: 0 = edge pixels only, N = N pixels deeper from boundary.
+    :param active_directions: Direction indices (0-5) that have a neighbour.
+    :return: Boolean tensor (6, H, W) per direction.  True = buffer pixel.
+    """
+    inside = _build_inside_mask(width, height, settings)
+    hex_radius = min(width, height) // 2
+    erosion_pixels = max(1, int(border_width * hex_radius))
+    eroded = _erode_mask(inside, erosion_pixels)
+    border = inside & ~eroded
+
+    sectors = _compute_sector_map(width, height)
+
+    # Distance from each pixel to nearest waste pixel (hex boundary).
+    # Inside pixels at the boundary get distance 1, deeper pixels get higher values.
+    dist_to_boundary = _manhattan_distance_to_region(~inside)
+    threshold = edge_buffer_depth + 1  # depth=0 → dist<=1 (boundary only)
+
+    buffer_masks = torch.zeros((6, height, width), dtype=torch.bool)
+    for d in active_directions:
+        sector_border = border & (sectors == d)
+        buffer_masks[d] = sector_border & (torch.from_numpy(dist_to_boundary) <= threshold)
+
+    return buffer_masks
+
+
 def _build_hex_mask_at(
     width: int, height: int, cx: float, cy: float, circumradius: float,
 ) -> torch.Tensor:

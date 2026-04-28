@@ -16,6 +16,7 @@ import torch
 from .modes import Settings
 from .modes.hex_mask import (
     NEIGHBOR_DIRECTIONS,
+    compute_edge_buffer_mask,
     create_corner_masks,
     create_feathered_masks,
     create_waste_mask,
@@ -266,6 +267,15 @@ class AdvancedTilingHexInpaint:
                         "tooltip": "half_edge: mask extends to edge midpoint (composable corners). full_edge: mask covers entire edge.",
                     },
                 ),
+                "edge_buffer_depth": (
+                    "INT",
+                    {
+                        "default": 0,
+                        "min": 0,
+                        "max": 8,
+                        "tooltip": "Latent pixels from hex boundary pre-filled with neighbor content. 0 = edge pixels only, higher = deeper buffer. Excluded from inpaint mask.",
+                    },
+                ),
             },
             "optional": {
                 **{
@@ -294,7 +304,7 @@ class AdvancedTilingHexInpaint:
     FUNCTION = "run"
     CATEGORY = "conditioning"
 
-    def run(self, settings, vae, center_image, inpaint_mode, border_width, feather_radius, feather_sides, mask_strength_min, mask_strength_max, skip_same_neighbors, rotate_mapping=0, enable_preview=False, corner_select="NE", mask_extent="half_edge", **kwargs):
+    def run(self, settings, vae, center_image, inpaint_mode, border_width, feather_radius, feather_sides, mask_strength_min, mask_strength_max, skip_same_neighbors, rotate_mapping=0, enable_preview=False, corner_select="NE", mask_extent="half_edge", edge_buffer_depth=0, **kwargs):
         t_start = time.time()
 
         n = len(NEIGHBOR_DIRECTIONS)
@@ -382,6 +392,32 @@ class AdvancedTilingHexInpaint:
         # Waste-area mask at latent resolution for InpaintVAEDecode
         waste_mask_lat = create_waste_mask(W_lat, H_lat, settings)  # (1, H_lat, W_lat)
         waste_mask_img = create_waste_mask(W_img, H_img, settings)  # (1, H_img, W_img)
+
+        # 5b. Edge buffer: paste neighbor latent into border ring edge, exclude from mask
+        if edge_buffer_depth >= 0 and neighbor_latents and active_directions:
+            buffer_dir_masks = compute_edge_buffer_mask(
+                W_lat, H_lat, settings, border_width, edge_buffer_depth, active_directions
+            )
+            direction_to_idx = {name: idx for idx, name in enumerate(NEIGHBOR_DIRECTIONS)}
+            total_buffer = 0
+            for direction_name, neighbor_latent in neighbor_latents.items():
+                dir_idx = direction_to_idx[direction_name]
+                target_idx = (dir_idx - rotation_steps) % n
+                buf_mask = buffer_dir_masks[target_idx]
+                if buf_mask.any():
+                    neighbor_4d, _ = _normalize_latent(neighbor_latent)
+                    composited_4d[:, :, buf_mask] = neighbor_4d[:, :, buf_mask]
+                    total_buffer += buf_mask.sum().item()
+            # Exclude buffer from inpaint mask
+            buffer_combined = buffer_dir_masks.any(dim=0)
+            border_mask_lat = torch.where(
+                buffer_combined.unsqueeze(0),
+                torch.zeros_like(border_mask_lat),
+                border_mask_lat,
+            )
+            logger.info(f"[HexInpaint] Edge buffer: depth={edge_buffer_depth}, "
+                        f"pixels={total_buffer}")
+
         t4 = time.time()
         logger.info(f"[HexInpaint] Latent masks ({W_lat}x{H_lat}): {t4-t3:.3f}s, "
                      f"border={int(border_mask_lat.sum().item())}, feather={feather_lat}px")
