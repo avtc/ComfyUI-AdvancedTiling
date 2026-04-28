@@ -13,6 +13,7 @@ from .advanced_tiling import (
 from .hex_inpaint import AdvancedTilingHexInpaint
 from .hex_grid_preview import AdvancedTilingHexGridPreview
 from .masked_vae_decode import InpaintVAEDecode
+from .terrain_priority import TerrainPrioritySettings
 
 NODE_CLASS_MAPPINGS = {
     "AdvancedTilingSettings": AdvancedTilingSettings,
@@ -21,6 +22,7 @@ NODE_CLASS_MAPPINGS = {
     "AdvancedTilingHexInpaint": AdvancedTilingHexInpaint,
     "AdvancedTilingHexGridPreview": AdvancedTilingHexGridPreview,
     "InpaintVAEDecode": InpaintVAEDecode,
+    "TerrainPrioritySettings": TerrainPrioritySettings,
     "HexCropImage": HexCropImage,
 }
 
@@ -31,6 +33,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "AdvancedTilingHexInpaint": "Advanced Tiling Hex Inpaint",
     "AdvancedTilingHexGridPreview": "Advanced Tiling Hex Grid Preview",
     "InpaintVAEDecode": "Inpaint VAE Decode",
+    "TerrainPrioritySettings": "Terrain Priority Settings",
     "HexCropImage": "Hex Crop Image",
 }
 

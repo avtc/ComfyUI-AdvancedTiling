@@ -338,3 +338,128 @@ def create_feathered_masks(
 
     border_mask = neighbor_masks.sum(dim=0, keepdim=True).clamp(0, 1)
     return inside, border_mask, neighbor_masks
+
+
+def create_corner_masks(
+    width: int,
+    height: int,
+    corner: str,
+    border_width: float = 0.2,
+    feather_pixels: int = 0,
+    mask_extent: str = "half_edge",
+    tile_priorities: list[int | None] | None = None,
+) -> torch.Tensor:
+    """
+    Generate a combined border mask for corner inpainting.
+
+    Creates masks along 3 edges where tiles meet at the corner,
+    applying priority-based side selection.
+
+    :param width: Image width
+    :param height: Image height
+    :param corner: Corner name ("N", "NE", "SE", "S", "SW", "NW")
+    :param border_width: Border band width as fraction of hex radius
+    :param feather_pixels: Feather radius in pixels (0 = sharp)
+    :param mask_extent: "half_edge" (R/2 from center) or "full_edge" (R)
+    :param tile_priorities: List of 3 priorities [center, n1, n2] or None.
+        None means unknown. Used to decide which side(s) to mask.
+    :return: Combined border mask (1, H, W) float
+    """
+    hex_radius = min(width, height) // 2
+    erosion_pixels = max(1, int(border_width * hex_radius))
+
+    # How far from center the mask extends along each edge
+    if mask_extent == "half_edge":
+        extent_pixels = round(hex_radius / 2)
+    else:  # full_edge
+        extent_pixels = hex_radius
+
+    # Boundary angles (math coords) for each corner
+    _CORNER_BOUNDARIES = {
+        "N":  [math.radians(210), math.radians(330), math.radians(90)],
+        "NE": [math.radians(270), math.radians(150), math.radians(30)],
+        "SE": [math.radians(90),  math.radians(210), math.radians(330)],
+        "S":  [math.radians(30),  math.radians(150), math.radians(270)],
+        "SW": [math.radians(330), math.radians(90),  math.radians(210)],
+        "NW": [math.radians(30),  math.radians(270), math.radians(150)],
+    }
+
+    boundaries = _CORNER_BOUNDARIES[corner]
+
+    # tile_priorities: [center, n1, n2]
+    # boundaries: [center↔n1, center↔n2, n1↔n2]
+    # For each boundary, the two adjacent tiles are:
+    #   boundary 0 (center↔n1): tiles 0 and 1
+    #   boundary 1 (center↔n2): tiles 0 and 2
+    #   boundary 2 (n1↔n2): tiles 1 and 2
+    edge_tile_pairs = [(0, 1), (0, 2), (1, 2)]
+
+    ys, xs = torch.meshgrid(
+        torch.arange(height, dtype=torch.float32),
+        torch.arange(width, dtype=torch.float32),
+        indexing='ij',
+    )
+    dx = xs - width / 2.0
+    dy = -(ys - height / 2.0)  # math coords
+    dist_from_center = torch.sqrt(dx * dx + dy * dy)
+    pixel_angles = torch.atan2(dy, dx) % (2 * math.pi)
+
+    combined_mask = torch.zeros(height, width, dtype=torch.float32)
+
+    for edge_idx, (boundary_angle, (tile_a, tile_b)) in enumerate(
+        zip(boundaries, edge_tile_pairs)
+    ):
+        # Determine which side(s) to mask based on priority
+        pri_a = tile_priorities[tile_a] if tile_priorities else None
+        pri_b = tile_priorities[tile_b] if tile_priorities else None
+
+        if pri_a is not None and pri_b is not None and pri_a == pri_b:
+            # Equal priority: no mask needed (seamless tiles)
+            continue
+
+        # Angular distance to boundary line
+        angle_diff = (pixel_angles - boundary_angle + math.pi) % (2 * math.pi) - math.pi
+        # Perpendicular distance from boundary line
+        perp_dist = torch.abs(torch.sin(angle_diff)) * dist_from_center
+
+        # Distance along boundary from center
+        along_dist = torch.abs(torch.cos(angle_diff)) * dist_from_center
+
+        # Mask conditions
+        in_extent = along_dist <= extent_pixels
+        in_band = perp_dist <= erosion_pixels
+
+        if pri_a is None and pri_b is None:
+            # Both unknown: mask both sides equally
+            mask_band = in_extent & in_band
+        elif pri_a is not None and pri_b is not None:
+            # Different priorities: mask lower-priority side only
+            # Lower priority = higher index value
+            if pri_a > pri_b:
+                # Mask tile A's side (positive angle_diff)
+                side_mask = angle_diff > 0
+            else:
+                # Mask tile B's side (negative angle_diff)
+                side_mask = angle_diff < 0
+            mask_band = in_extent & in_band & side_mask
+        elif pri_a is None:
+            # A unknown, B known: mask A's side only
+            side_mask = angle_diff > 0
+            mask_band = in_extent & in_band & side_mask
+        else:
+            # B unknown, A known: mask B's side only
+            side_mask = angle_diff < 0
+            mask_band = in_extent & in_band & side_mask
+
+        # Apply feathering
+        if feather_pixels > 0 and mask_band.any():
+            feather_weight = torch.clamp(
+                (erosion_pixels - perp_dist) / feather_pixels, 0.0, 1.0
+            )
+            edge_mask = mask_band.float() * feather_weight
+        else:
+            edge_mask = mask_band.float()
+
+        combined_mask = torch.max(combined_mask, edge_mask)
+
+    return combined_mask.unsqueeze(0)  # (1, H, W)

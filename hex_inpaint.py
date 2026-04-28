@@ -16,8 +16,16 @@ import torch
 from .modes import Settings
 from .modes.hex_mask import (
     NEIGHBOR_DIRECTIONS,
+    create_corner_masks,
     create_feathered_masks,
     create_waste_mask,
+)
+from .corner_composite import (
+    CORNER_NAMES,
+    CORNER_NEIGHBORS,
+    composite_corner_latents,
+    composite_corner_preview,
+    get_corner_offsets,
 )
 
 logger = logging.getLogger("ComfyUI-AdvancedTiling")
@@ -168,10 +176,10 @@ class AdvancedTilingHexInpaint:
                 "vae": ("VAE",),
                 "center_image": ("IMAGE",),
                 "inpaint_mode": (
-                    ["Masked Denoising"],
+                    ["CentralTile", "CornerEdges"],
                     {
-                        "default": "Masked Denoising",
-                        "tooltip": "Inpainting mode. 'Masked Denoising' composites neighbor latents into the waste region and applies a noise mask to the border.",
+                        "default": "CentralTile",
+                        "tooltip": "CentralTile: inpaint edges of central hex tile. CornerEdges: compose 3 tiles meeting at a corner, inpaint the 3 edges between them.",
                     },
                 ),
                 "border_width": (
@@ -244,10 +252,29 @@ class AdvancedTilingHexInpaint:
                         "tooltip": "Enable composited preview output (VAE decode of center + neighbor latents). Adds ~0.5-2s per run.",
                     },
                 ),
+                "corner_select": (
+                    ["N", "NE", "SE", "S", "SW", "NW"],
+                    {
+                        "default": "NE",
+                        "tooltip": "Which corner to process in CornerEdges mode. Determines which 2 neighbors are used.",
+                    },
+                ),
+                "mask_extent": (
+                    ["half_edge", "full_edge"],
+                    {
+                        "default": "half_edge",
+                        "tooltip": "half_edge: mask extends to edge midpoint (composable corners). full_edge: mask covers entire edge.",
+                    },
+                ),
             },
             "optional": {
-                f"neighbor_{d}": ("IMAGE", {"tooltip": f"{d} neighbor tile image"})
-                for d in NEIGHBOR_DIRECTIONS
+                **{
+                    f"neighbor_{d}": ("IMAGE", {"tooltip": f"{d} neighbor tile image"})
+                    for d in NEIGHBOR_DIRECTIONS
+                },
+                "priorities": ("TERRAIN_PRIORITIES", {
+                    "tooltip": "Terrain priority settings. Determines which edges get inpainted based on terrain type.",
+                }),
             },
         }
 
@@ -266,7 +293,7 @@ class AdvancedTilingHexInpaint:
     FUNCTION = "run"
     CATEGORY = "conditioning"
 
-    def run(self, settings, vae, center_image, inpaint_mode, border_width, feather_radius, feather_sides, mask_strength_min, mask_strength_max, skip_same_neighbors, rotate_mapping=0, enable_preview=False, **kwargs):
+    def run(self, settings, vae, center_image, inpaint_mode, border_width, feather_radius, feather_sides, mask_strength_min, mask_strength_max, skip_same_neighbors, rotate_mapping=0, enable_preview=False, corner_select="NE", mask_extent="half_edge", **kwargs):
         t_start = time.time()
 
         n = len(NEIGHBOR_DIRECTIONS)
@@ -295,6 +322,16 @@ class AdvancedTilingHexInpaint:
                              f"{time.time()-t_n:.3f}s, latent={neighbor_latents[direction].shape}")
 
         logger.info(f"[HexInpaint] Neighbors provided: {list(neighbor_latents.keys())}")
+
+        # --- Mode branching ---
+        if inpaint_mode == "CornerEdges":
+            return self._run_corner_edges(
+                settings, vae, center_image, center_latent, neighbor_latents,
+                neighbor_images, border_width, feather_radius, feather_sides,
+                mask_strength_min, mask_strength_max, corner_select, mask_extent,
+                enable_preview, kwargs,
+            )
+        # --- CentralTile mode (existing logic continues) ---
 
         # 3. Composite latents with rotated direction mapping
         if neighbor_latents:
@@ -470,4 +507,114 @@ class AdvancedTilingHexInpaint:
         outputs.append(waste_mask_img)
 
         logger.info(f"[HexInpaint] Total: {time.time()-t_start:.3f}s")
+        return tuple(outputs)
+
+    def _run_corner_edges(
+        self, settings, vae, center_image, center_latent, neighbor_latents,
+        neighbor_images, border_width, feather_radius, feather_sides,
+        mask_strength_min, mask_strength_max, corner_select, mask_extent,
+        enable_preview, kwargs,
+    ):
+        """CornerEdges mode: compose 3 tiles at a corner and generate edge masks."""
+        from .terrain_priority import match_terrain_priority, TerrainPriorities
+
+        t_start = time.time()
+        priorities = kwargs.get("priorities")
+
+        n1_dir, n2_dir = CORNER_NEIGHBORS[corner_select]
+        n1_key, n2_key = f"neighbor_{n1_dir}", f"neighbor_{n2_dir}"
+
+        # Validate neighbors are provided
+        n1_image = kwargs.get(n1_key)
+        n2_image = kwargs.get(n2_key)
+        if n1_image is None or n2_image is None:
+            logger.warning(f"[CornerEdges] Missing neighbors for {corner_select} corner: "
+                           f"need {n1_dir} and {n2_dir}")
+            empty_latent = {"samples": center_latent, "noise_mask": torch.zeros(1, 1, 1, 1)}
+            return (empty_latent, torch.zeros(1, 1), *[torch.zeros(1, 1)] * 6,
+                    torch.zeros(1, 1, 1, 3), torch.zeros(1, 1, 1, 3),
+                    empty_latent, torch.zeros(1, 1, 1, 3), torch.zeros(1, 1), torch.zeros(1, 1))
+
+        n1_latent = neighbor_latents.get(n1_dir)
+        n2_latent = neighbor_latents.get(n2_dir)
+        if n1_latent is None:
+            n1_latent = vae.encode(n1_image)
+        if n2_latent is None:
+            n2_latent = vae.encode(n2_image)
+
+        # 1. Composite corner latents
+        composited_4d, _ = _normalize_latent(center_latent)
+        _, _, H_lat, W_lat = composited_4d.shape
+        hex_radius_lat = min(W_lat, H_lat) // 2
+
+        composited = composite_corner_latents(
+            center_latent, n1_latent, n2_latent, corner_select, hex_radius_lat,
+        )
+
+        # 2. Determine tile priorities
+        tile_priorities = [None, None, None]  # [center, n1, n2]
+        if priorities is not None:
+            tile_priorities[0] = match_terrain_priority(center_image, priorities)
+            tile_priorities[1] = match_terrain_priority(n1_image, priorities)
+            tile_priorities[2] = match_terrain_priority(n2_image, priorities)
+            logger.info(f"[CornerEdges] Priorities: center={tile_priorities[0]}, "
+                         f"{n1_dir}={tile_priorities[1]}, {n2_dir}={tile_priorities[2]}")
+
+        # 3. Generate corner mask at latent resolution
+        feather_lat = max(0, round(feather_radius * max(1, int(border_width * hex_radius_lat))))
+        border_mask_lat = create_corner_masks(
+            W_lat, H_lat, corner_select, border_width, feather_lat, mask_extent,
+            tile_priorities,
+        )
+
+        # Remap mask strength
+        if mask_strength_min > 0.0 or mask_strength_max < 1.0:
+            nonzero = border_mask_lat > 0
+            border_mask_lat = torch.where(
+                nonzero,
+                mask_strength_min + border_mask_lat * (mask_strength_max - mask_strength_min),
+                border_mask_lat,
+            )
+
+        # 4. Build latent dict
+        noise_mask = border_mask_lat.unsqueeze(0)
+        latent_dict = {"samples": composited, "noise_mask": noise_mask}
+
+        # 5. Generate mask at image resolution (for debug output)
+        H_img, W_img = center_image.shape[1], center_image.shape[2]
+        hex_radius_img = min(W_img, H_img) // 2
+        feather_img = max(0, round(feather_radius * max(1, int(border_width * hex_radius_img))))
+        border_mask_img = create_corner_masks(
+            W_img, H_img, corner_select, border_width, feather_img, mask_extent,
+            tile_priorities,
+        )
+        if mask_strength_min > 0.0 or mask_strength_max < 1.0:
+            nonzero_img = border_mask_img > 0
+            border_mask_img = torch.where(
+                nonzero_img,
+                mask_strength_min + border_mask_img * (mask_strength_max - mask_strength_min),
+                border_mask_img,
+            )
+
+        # 6. Preview
+        if enable_preview:
+            preview = composite_corner_preview(center_image, n1_image, n2_image, corner_select)
+        else:
+            preview = torch.zeros(1, 1, 1, 3, dtype=torch.float32)
+
+        # 7. Assemble outputs (same count as CentralTile for compatibility)
+        outputs = [
+            latent_dict,            # LATENT
+            border_mask_img,        # MASK (debug)
+            *[torch.zeros(1, H_img, W_img)] * 6,  # 6 directional masks (unused)
+            preview,                # composited_preview
+            torch.zeros(1, H_img, W_img, 3),       # color_mask (unused)
+            {"samples": center_latent, "noise_mask": noise_mask},  # paintbrush latent
+            torch.zeros(1, H_img, W_img, 3),       # paintbrush preview (unused)
+            torch.zeros(1, H_lat, W_lat),           # waste_mask_lat (unused)
+            torch.zeros(1, H_img, W_img),           # waste_mask_img (unused)
+        ]
+
+        logger.info(f"[CornerEdges] Total: {time.time()-t_start:.3f}s, "
+                    f"corner={corner_select}, extent={mask_extent}")
         return tuple(outputs)
