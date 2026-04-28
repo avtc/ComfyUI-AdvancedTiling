@@ -278,7 +278,7 @@ class AdvancedTilingHexInpaint:
             },
         }
 
-    RETURN_TYPES = ("LATENT", "MASK", "MASK", "MASK", "MASK", "MASK", "MASK", "MASK", "IMAGE", "IMAGE", "LATENT", "IMAGE", "MASK", "MASK")
+    RETURN_TYPES = ("LATENT", "MASK", "MASK", "MASK", "MASK", "MASK", "MASK", "MASK", "IMAGE", "IMAGE", "LATENT", "IMAGE", "MASK", "MASK", "IMAGE")
     RETURN_NAMES = (
         "LATENT", "MASK",
         *[f"{NEIGHBOR_DIRECTIONS[i]}_{DIRECTION_COLOR_NAMES[i]}"
@@ -289,6 +289,7 @@ class AdvancedTilingHexInpaint:
         "paintbrush_preview",
         "WASTE_MASK",
         "WASTE_MASK_IMG",
+        "OVERLAP_IMAGE",
     )
     FUNCTION = "run"
     CATEGORY = "conditioning"
@@ -434,18 +435,28 @@ class AdvancedTilingHexInpaint:
         for i in range(len(NEIGHBOR_DIRECTIONS)):
             outputs.append(full_neighbor_masks[i])
 
+        # Build overlap image: center + neighbor content in waste area.
+        # Always computed — connect to InpaintVAEDecode original_image for
+        # correct adjacent content at the hex boundary.
+        neighbor_map_img = _build_neighbor_map(W_img, H_img, settings)
+        dir_idx_map = {name: idx for idx, name in enumerate(NEIGHBOR_DIRECTIONS)}
+        overlap_image = center_image.clone()
+        for direction_name, neighbor_img in neighbor_images.items():
+            dir_idx = dir_idx_map[direction_name]
+            target_idx = (dir_idx - rotation_steps) % n
+            waste_region = (neighbor_map_img == target_idx)
+            if waste_region.any():
+                overlap_image[0][waste_region] = neighbor_img[0][waste_region]
+
         # output 9: composited preview (pixel-space composite, no VAE round-trip)
         if enable_preview:
             preview_image = center_image.clone()
-            neighbor_map_img = _build_neighbor_map(W_img, H_img, settings)
-            n_dirs = len(NEIGHBOR_DIRECTIONS)
-            dir_idx_map = {name: idx for idx, name in enumerate(NEIGHBOR_DIRECTIONS)}
             for direction_name, neighbor_img in neighbor_images.items():
                 dir_idx = dir_idx_map[direction_name]
-                target_idx = (dir_idx - rotation_steps) % n_dirs
-                waste_mask = (neighbor_map_img == target_idx)
-                if waste_mask.any():
-                    preview_image[0][waste_mask] = neighbor_img[0][waste_mask]
+                target_idx = (dir_idx - rotation_steps) % n
+                waste_region = (neighbor_map_img == target_idx)
+                if waste_region.any():
+                    preview_image[0][waste_region] = neighbor_img[0][waste_region]
             outputs.append(preview_image)
         else:
             outputs.append(torch.zeros(1, 1, 1, 3, dtype=torch.float32))
@@ -476,14 +487,12 @@ class AdvancedTilingHexInpaint:
         paintbrush_img = paintbrush_img.unsqueeze(0)  # (1, H, W, 3)
 
         # Composite neighbor images into waste region of paintbrush preview
-        neighbor_map_img = _build_neighbor_map(W_img, H_img, settings)
-        direction_to_idx = {name: idx for idx, name in enumerate(NEIGHBOR_DIRECTIONS)}
         for direction_name, neighbor_img in neighbor_images.items():
-            dir_idx = direction_to_idx[direction_name]
+            dir_idx = dir_idx_map[direction_name]
             target_idx = (dir_idx - rotation_steps) % n
-            waste_mask = (neighbor_map_img == target_idx)
-            if waste_mask.any():
-                paintbrush_img[0][waste_mask] = neighbor_img[0][waste_mask]
+            waste_region = (neighbor_map_img == target_idx)
+            if waste_region.any():
+                paintbrush_img[0][waste_region] = neighbor_img[0][waste_region]
 
         t_pb = time.time()
         paintbrush_latent = vae.encode(paintbrush_img)
@@ -505,6 +514,8 @@ class AdvancedTilingHexInpaint:
         outputs.append(waste_mask_lat)
         # output 14: waste-area mask (image resolution)
         outputs.append(waste_mask_img)
+        # output 15: overlap image (center + neighbors in waste area)
+        outputs.append(overlap_image)
 
         logger.info(f"[HexInpaint] Total: {time.time()-t_start:.3f}s")
         return tuple(outputs)

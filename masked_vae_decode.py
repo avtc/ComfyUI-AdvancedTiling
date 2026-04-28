@@ -126,10 +126,7 @@ def _composite_hook(ref_features, mask_base, name):
         H, W = output.shape[-2], output.shape[-1]
 
         # Scale mask to spatial resolution.
-        # Use nearest-neighbor to keep the mask binary at every resolution.
-        # Bilinear interpolation blurs the boundary at low VAE resolutions,
-        # causing reference features (original content) to leak into the
-        # inpainted area.
+        # Mask uses nearest to keep exact 1/0 boundary.
         mask = mask_base
         if mask.shape[-2] != H or mask.shape[-1] != W:
             mask = F.interpolate(
