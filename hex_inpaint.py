@@ -16,6 +16,7 @@ import torch
 from .modes import Settings
 from .modes.hex_mask import (
     NEIGHBOR_DIRECTIONS,
+    _manhattan_distance_to_region,
     compute_edge_buffer_mask,
     create_corner_masks,
     create_feathered_masks,
@@ -24,6 +25,7 @@ from .modes.hex_mask import (
 from .corner_composite import (
     CORNER_NAMES,
     CORNER_NEIGHBORS,
+    build_corner_tile_map,
     composite_corner_latents,
     composite_corner_preview,
     get_corner_offsets,
@@ -340,7 +342,7 @@ class AdvancedTilingHexInpaint:
                 settings, vae, center_image, center_latent, neighbor_latents,
                 neighbor_images, border_width, feather_radius, feather_sides,
                 mask_strength_min, mask_strength_max, corner_select, mask_extent,
-                enable_preview, kwargs,
+                edge_buffer_depth, enable_preview, kwargs,
             )
         # --- CentralTile mode (existing logic continues) ---
 
@@ -567,7 +569,7 @@ class AdvancedTilingHexInpaint:
         self, settings, vae, center_image, center_latent, neighbor_latents,
         neighbor_images, border_width, feather_radius, feather_sides,
         mask_strength_min, mask_strength_max, corner_select, mask_extent,
-        enable_preview, kwargs,
+        edge_buffer_depth, enable_preview, kwargs,
     ):
         """CornerEdges mode: compose 3 tiles at a corner and generate edge masks."""
         from .tile_priority import match_terrain_priority, TerrainPriorities
@@ -620,6 +622,53 @@ class AdvancedTilingHexInpaint:
             W_lat, H_lat, corner_select, border_width, feather_lat, mask_extent,
             tile_priorities,
         )
+
+        # 3b. Edge buffer: paste nearest tile's latent into mask boundary, exclude from mask
+        if edge_buffer_depth >= 0:
+            mask_bool = border_mask_lat.squeeze(0) > 0
+            if mask_bool.any():
+                dist_to_boundary = _manhattan_distance_to_region(~mask_bool)
+                threshold = edge_buffer_depth + 1
+                buffer = mask_bool & (torch.from_numpy(dist_to_boundary) <= threshold)
+
+                if buffer.any():
+                    offsets = get_corner_offsets(corner_select, hex_radius_lat)
+                    composited_4d_ce, _ = _normalize_latent(composited)
+                    _, _, H_ce, W_ce = composited_4d_ce.shape
+
+                    ys, xs = torch.meshgrid(
+                        torch.arange(H_ce, dtype=torch.long),
+                        torch.arange(W_ce, dtype=torch.long),
+                        indexing='ij',
+                    )
+                    cx, cy = W_ce / 2.0, H_ce / 2.0
+
+                    # Distance to each tile's center
+                    dists = []
+                    for _, (ox, oy) in enumerate(offsets):
+                        d = (xs.float() - (cx + ox)) ** 2 + (ys.float() - (cy + oy)) ** 2
+                        dists.append(d)
+                    nearest_tile = torch.stack(dists).argmin(dim=0)
+
+                    latents = [center_latent, n1_latent, n2_latent]
+                    total_buffer = 0
+                    for tile_idx in range(3):
+                        tile_buffer = buffer & (nearest_tile == tile_idx)
+                        if tile_buffer.any():
+                            ox, oy = offsets[tile_idx]
+                            src_ys = (ys[tile_buffer] - oy).clamp(0, H_ce - 1)
+                            src_xs = (xs[tile_buffer] - ox).clamp(0, W_ce - 1)
+                            tile_latent_4d, _ = _normalize_latent(latents[tile_idx])
+                            composited_4d_ce[:, :, tile_buffer] = tile_latent_4d[:, :, src_ys, src_xs]
+                            total_buffer += tile_buffer.sum().item()
+
+                    border_mask_lat = torch.where(
+                        buffer.unsqueeze(0),
+                        torch.zeros_like(border_mask_lat),
+                        border_mask_lat,
+                    )
+                    logger.info(f"[CornerEdges] Edge buffer: depth={edge_buffer_depth}, "
+                                f"pixels={total_buffer}")
 
         # Remap mask strength
         if mask_strength_min > 0.0 or mask_strength_max < 1.0:
