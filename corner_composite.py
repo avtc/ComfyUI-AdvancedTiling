@@ -197,10 +197,6 @@ def composite_corner_latents(
     return result
 
 
-# Vertical edge direction: True = up, False = down
-_VERT_EDGE_UP = {"N": True, "NE": False, "SE": True, "S": False, "SW": True, "NW": False}
-
-
 def composite_corner_preview(
     center_image: torch.Tensor,
     neighbor1_image: torch.Tensor,
@@ -208,10 +204,9 @@ def composite_corner_preview(
     corner: str,
 ) -> torch.Tensor:
     """
-    Compose 3 tile images into a corner preview, cropped to remove border artifacts.
+    Compose 3 tile images into a corner preview at pixel resolution.
 
-    Returns a square crop centered on the corner region, with the vertical hex
-    edge ending at the image boundary.
+    :return: Preview image (1, H, W, 3)
     """
     H, W = center_image.shape[1], center_image.shape[2]
     hex_radius = min(W, H) // 2
@@ -234,30 +229,5 @@ def composite_corner_preview(
 
         if mask.any():
             result[0, mask] = src[0, src_ys[mask], src_xs[mask]]
-
-    # Geometric crop
-    crop_size = round(hex_radius * math.sqrt(3))
-    cx, cy = W / 2.0, H / 2.0
-
-    half_w = crop_size / 2.0
-    c0 = max(0, int(cx - half_w))
-    c1 = min(W, int(cx + half_w))
-
-    if _VERT_EDGE_UP[corner]:
-        r0 = max(0, int(cy - hex_radius))
-        r1 = r0 + crop_size
-        r1 = min(H, r1)
-    else:
-        r1 = min(H, int(cy + hex_radius))
-        r0 = r1 - crop_size
-        r0 = max(0, r0)
-
-    result = result[:, r0:r1, c0:c1, :]
-
-    # Ensure square
-    _, rh, rw, _ = result.shape
-    if rh != rw:
-        side = min(rh, rw)
-        result = result[:, :side, :side, :]
 
     return result
