@@ -623,7 +623,13 @@ class AdvancedTilingHexInpaint:
             tile_priorities,
         )
 
-        # 3b. Edge buffer: extend higher-priority tile's latent into mask boundary, exclude from mask
+        # 3b. Edge buffer: exclude outermost mask pixels from inpainting.
+        # The tile_map filter in create_corner_masks already ensures the mask
+        # doesn't cover higher-priority tile pixels. The buffer provides a thin
+        # ring of preserved composite content at the mask boundary, giving the
+        # model a clean edge to blend from. We do NOT overwrite the composite
+        # here — that would create a visible "copy-pasted" line from the
+        # adjacent tile's latent at a different source position.
         if edge_buffer_depth >= 0:
             mask_bool = border_mask_lat.squeeze(0) > 0
             if mask_bool.any():
@@ -632,53 +638,7 @@ class AdvancedTilingHexInpaint:
                 buffer = mask_bool & (torch.from_numpy(dist_to_boundary) <= threshold)
 
                 if buffer.any():
-                    offsets = get_corner_offsets(corner_select, hex_radius_lat)
-                    composited_4d_ce, _ = _normalize_latent(composited)
-                    _, _, H_ce, W_ce = composited_4d_ce.shape
-
-                    ys, xs = torch.meshgrid(
-                        torch.arange(H_ce, dtype=torch.long),
-                        torch.arange(W_ce, dtype=torch.long),
-                        indexing='ij',
-                    )
-                    cx, cy = W_ce / 2.0, H_ce / 2.0
-
-                    # For each buffer pixel, find the two nearest tiles and
-                    # pick the one with higher priority (lower number).
-                    # This extends the higher-priority tile's content to the
-                    # edge, giving the model an anchor to blend toward.
-                    prios = tile_priorities if tile_priorities else [None, None, None]
-                    dists = []
-                    for _, (ox, oy) in enumerate(offsets):
-                        d = (xs.float() - (cx + ox)) ** 2 + (ys.float() - (cy + oy)) ** 2
-                        dists.append(d)
-                    dist_stack = torch.stack(dists)  # (3, H, W)
-                    sorted_idx = dist_stack.argsort(dim=0)  # (3, H, W)
-                    nearest = sorted_idx[0]   # (H, W)
-                    second = sorted_idx[1]    # (H, W)
-
-                    # Map priority values: None -> inf (lowest priority)
-                    pri_tensor = torch.zeros(3)
-                    for i in range(3):
-                        pri_tensor[i] = prios[i] if prios[i] is not None else float('inf')
-
-                    pri_near = pri_tensor[nearest]
-                    pri_sec = pri_tensor[second]
-                    # Pick the tile with lower priority number (higher priority)
-                    best_tile = torch.where(pri_near <= pri_sec, nearest, second)
-
-                    latents = [center_latent, n1_latent, n2_latent]
-                    total_buffer = 0
-                    for tile_idx in range(3):
-                        tile_buffer = buffer & (best_tile == tile_idx)
-                        if tile_buffer.any():
-                            ox, oy = offsets[tile_idx]
-                            src_ys = (ys[tile_buffer] - oy).clamp(0, H_ce - 1)
-                            src_xs = (xs[tile_buffer] - ox).clamp(0, W_ce - 1)
-                            tile_latent_4d, _ = _normalize_latent(latents[tile_idx])
-                            composited_4d_ce[:, :, tile_buffer] = tile_latent_4d[:, :, src_ys, src_xs]
-                            total_buffer += tile_buffer.sum().item()
-
+                    total_buffer = buffer.sum().item()
                     border_mask_lat = torch.where(
                         buffer.unsqueeze(0),
                         torch.zeros_like(border_mask_lat),
