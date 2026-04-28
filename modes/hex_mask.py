@@ -443,6 +443,18 @@ _CORNER_OFFSET_UNITS = {
     "NW": (( 0.866025404,  0.5), ( 0.0,         -1.0), (-0.866025404,  0.5)),
 }
 
+# Sector pairs for each corner's 3 edges: (tile_a, sector_a, tile_b, sector_b).
+# Tiles: 0=center, 1=neighbor1, 2=neighbor2.
+# Sectors: 0=E, 1=NE, 2=NW, 3=W, 4=SW, 5=SE (matching NEIGHBOR_DIRECTIONS).
+_CORNER_EDGE_SECTORS = {
+    "N":  [(0, 1, 1, 4), (0, 2, 2, 5), (1, 3, 2, 0)],
+    "NE": [(0, 0, 1, 3), (0, 1, 2, 4), (1, 2, 2, 5)],
+    "SE": [(0, 5, 1, 2), (0, 0, 2, 3), (1, 1, 2, 4)],
+    "S":  [(0, 4, 1, 1), (0, 5, 2, 2), (1, 0, 2, 3)],
+    "SW": [(0, 3, 1, 0), (0, 4, 2, 1), (1, 5, 2, 2)],
+    "NW": [(0, 2, 1, 5), (0, 3, 2, 0), (1, 4, 2, 1)],
+}
+
 
 def create_corner_masks(
     width: int,

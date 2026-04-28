@@ -49,6 +49,19 @@ def test_sector_map_at_offset_covers_all_sectors():
     assert set(unique) == {0, 1, 2, 3, 4, 5}, f"Expected all 6 sectors, got {unique}"
 
 
+def test_corner_edge_sectors_structure():
+    """Each corner should have 3 edges, each with 2 (tile, sector) pairs."""
+    from modes.hex_mask import _CORNER_EDGE_SECTORS
+    for corner, edges in _CORNER_EDGE_SECTORS.items():
+        assert len(edges) == 3, f"{corner}: expected 3 edges, got {len(edges)}"
+        for tile_a, sec_a, tile_b, sec_b in edges:
+            assert tile_a in {0, 1, 2}, f"{corner}: invalid tile_a={tile_a}"
+            assert tile_b in {0, 1, 2}, f"{corner}: invalid tile_b={tile_b}"
+            assert 0 <= sec_a <= 5, f"{corner}: invalid sector_a={sec_a}"
+            assert 0 <= sec_b <= 5, f"{corner}: invalid sector_b={sec_b}"
+            assert tile_a != tile_b, f"{corner}: same tile on both sides"
+
+
 def test_corner_offsets_symmetry():
     """All corners should have symmetric offsets (same magnitude, rotated)."""
     R = 256
@@ -179,6 +192,7 @@ def test_no_black_pixels_in_preview():
 if __name__ == "__main__":
     test_sector_map_at_center_matches_global()
     test_sector_map_at_offset_covers_all_sectors()
+    test_corner_edge_sectors_structure()
     test_corner_offsets_symmetry()
     test_tile_map_covers_all()
     test_corner_preview_shape()
