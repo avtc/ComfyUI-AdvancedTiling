@@ -81,7 +81,8 @@ def calculate_mapping(
 
     elif settings.mode == "Hexagon":
         import numpy as np
-        size = max(1, round(min(ow, oh) // 2 * settings.scale))
+        min_margin = getattr(settings, 'min_margin', 0)
+        size = max(1, round(min(ow, oh) // 2 * settings.scale) - min_margin)
         cx = np.arange(pw, dtype=np.float64) - pw // 2
         cy = np.arange(ph, dtype=np.float64) - ph // 2
         grid_cx, grid_cy = np.meshgrid(cx, cy, indexing='xy')
@@ -114,7 +115,8 @@ def create_crop_mask(width: int, height: int, settings: Settings):
 
     if settings.mode == "Hexagon":
         import numpy as np
-        size = max(1, round(min(width, height) // 2 * settings.scale))
+        min_margin = getattr(settings, 'min_margin', 0)
+        size = max(1, round(min(width, height) // 2 * settings.scale) - min_margin)
         cx = np.arange(width, dtype=np.float64) - width // 2
         cy = np.arange(height, dtype=np.float64) - height // 2
         grid_cx, grid_cy = np.meshgrid(cx, cy, indexing='xy')
@@ -207,8 +209,22 @@ class AdvancedTilingSettings:
                 "scale": (
                     "FLOAT",
                     {
-                        "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01,
-                        "tooltip": "Working area scale relative to latent size. 0 = auto: Conv2d/Hexagon → 1.0, DiT Rectangular → 0.875. Lower values create larger margins for latent wrapping.",
+                        "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.001,
+                        "tooltip": "Working area scale relative to latent size. 0 = auto: Conv2d/Hexagon → 1.0, DiT Rectangular → 0.875. Set to 1.0 and use min_margin for absolute pixel control.",
+                    },
+                ),
+                "min_margin": (
+                    "INT",
+                    {
+                        "default": -1, "min": -1, "max": 512, "step": 1,
+                        "tooltip": "Minimum margin in latent pixels. -1 = auto (4 for DiT Rectangular, 0 otherwise). Rectangular: floors the margin from scale. Hexagon: reduces hex radius. Set scale=1.0 + min_margin=N for exact absolute margin.",
+                    },
+                ),
+                "divisible_by": (
+                    "INT",
+                    {
+                        "default": 16, "min": 1, "max": 256, "step": 1,
+                        "tooltip": "Round working area dimensions to multiples of this value in pixels. Only applies when margin exists (scale < 1.0 or min_margin > 0). Affects final output size when crop is enabled. 1 = no rounding, 16 = ensures symmetric margins.",
                     },
                 ),
             },
@@ -218,7 +234,7 @@ class AdvancedTilingSettings:
     RETURN_NAMES = ("SETTINGS",)
     FUNCTION = "run"
 
-    def run(self, mode, rotation, scale):
+    def run(self, mode, rotation, scale, min_margin, divisible_by):
         """
         Creates tiling settings from node inputs
         """
@@ -228,7 +244,7 @@ class AdvancedTilingSettings:
         # scale=0.0 is the auto sentinel — resolved in AdvancedTiling.run()
         # once the model type is known.
 
-        settings = Settings(mode, rotation, scale)
+        settings = Settings(mode, rotation, scale, min_margin, divisible_by)
 
         return (settings,)
 
@@ -274,10 +290,18 @@ class AdvancedTiling:
             else:
                 settings.scale = round(math.sqrt(3) / 2, 3)  # 0.875
 
+        # Resolve auto min_margin (-1): 4 for DiT Rectangular, 0 otherwise
+        if settings.min_margin == -1:
+            is_conv2d = _has_conv2d(model_copy.model.diffusion_model)
+            if not is_conv2d and settings.mode == "Rectangular":
+                settings.min_margin = 4
+            else:
+                settings.min_margin = 0
+
         if _has_conv2d(model_copy.model.diffusion_model):
             patch_model(model_copy.model, settings)
 
-            if settings.mode == "Rectangular" and settings.scale < 1.0:
+            if settings.mode == "Rectangular" and (settings.scale < 1.0 or settings.min_margin > 0):
                 wrapper = _create_content_wrapper(settings)
                 model_copy.set_model_unet_function_wrapper(wrapper)
         else:
@@ -354,10 +378,10 @@ class AdvancedTilingVAEDecode:
         else:
             _, _, H_lat, W_lat = latent.shape
 
-        # For rectangular mode with scale < 1.0, crop latent to working rectangle
+        # For rectangular mode with margin, crop latent to working rectangle
         # before VAE decoding so Conv2d wrapping operates at working rect boundary.
         # Use patch-aligned dimensions for consistency with the model wrapper.
-        if crop and settings.mode == "Rectangular" and settings.scale < 1.0:
+        if crop and settings.mode == "Rectangular" and (settings.scale < 1.0 or settings.min_margin > 0):
             from .dit_tiling import _compute_working_size
             patch_size = getattr(settings, '_patch_size', 1)
             work_W, work_H, margin_W, margin_H = _compute_working_size(

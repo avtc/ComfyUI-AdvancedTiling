@@ -12,14 +12,16 @@ class Settings:
     For representing tiling settings
     """
 
-    def __init__(self, mode, rotation, scale=1.0):
+    def __init__(self, mode, rotation, scale=1.0, min_margin=0, divisible_by=8):
         self.mode = mode
         self.tiling_fn = modes[mode]
         self.rotation = rotation
         self.scale = scale
+        self.min_margin = min_margin
+        self.divisible_by = divisible_by
 
     def __hash__(self):
-        return hash((self.mode, self.rotation, self.scale))
+        return hash((self.mode, self.rotation, self.scale, self.min_margin, self.divisible_by))
 
 
 from .hex import hex_tiling

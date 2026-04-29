@@ -175,9 +175,11 @@ def _compute_rect_boundary_pairs(
 class _BaseToroidalAttentionPatch:
     """Shared logic for hex and rectangular toroidal attention patches."""
 
-    def __init__(self, pe_embedder, scale=1.0):
+    def __init__(self, pe_embedder, scale=1.0, min_margin=0, divisible_by=16):
         self.pe_embedder = pe_embedder
         self.scale = scale
+        self.min_margin = min_margin
+        self.divisible_by = divisible_by
         self._initialized = False
         self._boundary_idx = None
         self._source_idx = None
@@ -188,16 +190,37 @@ class _BaseToroidalAttentionPatch:
         raise NotImplementedError
 
     @staticmethod
-    def _compute_margins(h_patches, w_patches, scale):
-        if scale >= 1.0:
+    def _compute_margins(h_patches, w_patches, scale, min_margin=0, latent_align=1):
+        if scale >= 1.0 and min_margin == 0:
             return 0, 0
-        work_h = max(1, round(h_patches * scale))
-        work_w = max(1, round(w_patches * scale))
-        return (h_patches - work_h) // 2, (w_patches - work_w) // 2
+        if scale < 1.0:
+            work_h = max(1, round(h_patches * scale))
+            work_w = max(1, round(w_patches * scale))
+            scale_margin_h = (h_patches - work_h) // 2
+            scale_margin_w = (w_patches - work_w) // 2
+        else:
+            scale_margin_h = 0
+            scale_margin_w = 0
+        margin_h = max(scale_margin_h, min_margin)
+        margin_w = max(scale_margin_w, min_margin)
+        work_h = h_patches - 2 * margin_h
+        work_w = w_patches - 2 * margin_w
+        # Round down to alignment
+        if latent_align > 1:
+            work_h = max(latent_align, (work_h // latent_align) * latent_align)
+            work_w = max(latent_align, (work_w // latent_align) * latent_align)
+            margin_h = (h_patches - work_h) // 2
+            margin_w = (w_patches - work_w) // 2
+        if work_h < 1 or work_w < 1:
+            return 0, 0
+        return margin_h, margin_w
 
     def _initialize(self, n_img: int):
         h_patches, w_patches = _factorize(n_img)
-        margin_h, margin_w = self._compute_margins(h_patches, w_patches, self.scale)
+        latent_align = max(1, self.divisible_by // 8)
+        margin_h, margin_w = self._compute_margins(
+            h_patches, w_patches, self.scale, self.min_margin, latent_align,
+        )
 
         boundary_idx, source_idx, off_h, off_w = self._compute_boundary_pairs(
             h_patches, w_patches, margin_h, margin_w,
@@ -281,8 +304,8 @@ class HexToroidalAttentionPatch(_BaseToroidalAttentionPatch):
 class RectToroidalAttentionPatch(_BaseToroidalAttentionPatch):
     """attn1_patch for rectangular tiling: injects wrapped K/V from opposite edges."""
 
-    def __init__(self, pe_embedder, scale=1.0):
-        super().__init__(pe_embedder, scale=scale)
+    def __init__(self, pe_embedder, scale=1.0, min_margin=0, divisible_by=16):
+        super().__init__(pe_embedder, scale=scale, min_margin=min_margin, divisible_by=divisible_by)
 
     def _compute_boundary_pairs(self, h_patches, w_patches, margin_h=0, margin_w=0):
         return _compute_rect_boundary_pairs(h_patches, w_patches, margin_h, margin_w)
@@ -332,13 +355,34 @@ class LuminaWastePatch:
                         waste_source_indices.append(src_h * w_patches + src_w)
         else:  # Rectangular
             scale = self.settings.scale
-            if scale >= 1.0:
+            min_margin = getattr(self.settings, 'min_margin', 0)
+            divisible_by = getattr(self.settings, 'divisible_by', 16)
+            latent_align = max(1, divisible_by // 8)
+            if scale >= 1.0 and min_margin == 0:
                 work_h, work_w = h_patches, w_patches
+                margin_h, margin_w = 0, 0
             else:
-                work_h = max(1, round(h_patches * scale))
-                work_w = max(1, round(w_patches * scale))
-            margin_h = (h_patches - work_h) // 2
-            margin_w = (w_patches - work_w) // 2
+                if scale < 1.0:
+                    scale_work_h = max(1, round(h_patches * scale))
+                    scale_work_w = max(1, round(w_patches * scale))
+                    scale_margin_h = (h_patches - scale_work_h) // 2
+                    scale_margin_w = (w_patches - scale_work_w) // 2
+                else:
+                    scale_margin_h = 0
+                    scale_margin_w = 0
+                margin_h = max(scale_margin_h, min_margin)
+                margin_w = max(scale_margin_w, min_margin)
+                work_h = h_patches - 2 * margin_h
+                work_w = w_patches - 2 * margin_w
+                # Round down to alignment
+                if latent_align > 1:
+                    work_h = max(latent_align, (work_h // latent_align) * latent_align)
+                    work_w = max(latent_align, (work_w // latent_align) * latent_align)
+                    margin_h = (h_patches - work_h) // 2
+                    margin_w = (w_patches - work_w) // 2
+                if work_h < 1 or work_w < 1:
+                    work_h, work_w = h_patches, w_patches
+                    margin_h, margin_w = 0, 0
 
             for h in range(h_patches):
                 for w in range(w_patches):
