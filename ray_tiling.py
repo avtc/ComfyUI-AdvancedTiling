@@ -10,7 +10,7 @@ issues with custom node packages that have non-standard import paths
 """
 
 try:
-    from raylight.comfy_extra_dist.ray_patch_decorator import ray_patch
+    import raylight.comfy_extra_dist.ray_patch_decorator  # noqa: F401
     HAS_RAYLIGHT = True
 except ImportError:
     HAS_RAYLIGHT = False
@@ -46,7 +46,7 @@ if HAS_RAYLIGHT:
             # Resolve auto-scale (0.0) — Raylight only supports DiT models,
             # so no Conv2d check needed: Hexagon → 1.0, Rectangular → 0.875.
             if settings.scale == 0.0:
-                settings.scale = 1.0 if settings.mode == "Hexagon" else round(math.sqrt(3) / 2, 3)
+                settings.scale = 1.0 if settings.mode == "Hexagon" else 7 / 8
 
             # Resolve auto min_margin (-1): 4 for Rectangular, 0 for Hexagon
             if settings.min_margin == -1:

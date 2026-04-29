@@ -159,6 +159,39 @@ def create_crop_mask(width: int, height: int, settings: Settings):
     return mask
 
 
+def _mask_bounding_box(mask: torch.Tensor) -> tuple[int, int, int, int]:
+    """Find the bounding box of non-zero region in a crop mask.
+
+    :param mask: Shape (1, H, W, 1)
+    :return: (rmin, rmax, cmin, cmax) inclusive indices
+    """
+    mask_2d = mask[0, :, :, 0]
+    rows = torch.any(mask_2d, dim=1)
+    cols = torch.any(mask_2d, dim=0)
+    row_indices = torch.where(rows)[0]
+    col_indices = torch.where(cols)[0]
+    return (
+        row_indices[0].item(), row_indices[-1].item(),
+        col_indices[0].item(), col_indices[-1].item(),
+    )
+
+
+def _crop_with_mask(
+    image: torch.Tensor,
+    mask: torch.Tensor,
+    rmin: int, rmax: int, cmin: int, cmax: int,
+) -> torch.Tensor:
+    """Slice image and mask to bounding box, concatenate mask as alpha channel.
+
+    :param image: Shape (B, H, W, C)
+    :param mask: Shape (1, H, W, 1)
+    :return: Image with mask appended as last channel
+    """
+    image = image[:, rmin:rmax + 1, cmin:cmax + 1, :]
+    cropped_mask = mask[:, rmin:rmax + 1, cmin:cmax + 1, :]
+    return torch.cat((image, cropped_mask.to(device=image.device)), dim=3)
+
+
 def patch_model(model, settings: Settings):
     """
     Patch model to perform tiling - in place!
@@ -264,8 +297,6 @@ class AdvancedTilingSettings:
         Creates tiling settings from node inputs
         """
 
-        import math
-
         # scale=0.0 is the auto sentinel — resolved in AdvancedTiling.run()
         # once the model type is known.
 
@@ -313,7 +344,7 @@ class AdvancedTiling:
             if is_conv2d or settings.mode == "Hexagon":
                 settings.scale = 1.0
             else:
-                settings.scale = round(math.sqrt(3) / 2, 3)  # 0.875
+                settings.scale = 7 / 8  # 0.875
 
         # Resolve auto min_margin (-1): 4 for DiT Rectangular, 0 otherwise
         if settings.min_margin == -1:
@@ -406,29 +437,15 @@ class AdvancedTilingVAEDecode:
             if settings.mode == "Rectangular" and (settings.scale < 1.0 or settings.min_margin > 0):
                 img_h, img_w = image.shape[1], image.shape[2]
                 mask = create_crop_mask(img_w, img_h, settings)
-                mask_2d = mask[0, :, :, 0]
-                rows = torch.any(mask_2d, dim=1)
-                cols = torch.any(mask_2d, dim=0)
-                row_indices = torch.where(rows)[0]
-                col_indices = torch.where(cols)[0]
-                rmin, rmax = row_indices[0].item(), row_indices[-1].item()
-                cmin, cmax = col_indices[0].item(), col_indices[-1].item()
-
-                image = image[:, rmin:rmax + 1, cmin:cmax + 1, :]
-                cropped_mask = mask[:, rmin:rmax + 1, cmin:cmax + 1, :]
-                image = torch.cat((image, cropped_mask.to(device=image.device)), dim=3)
+                rmin, rmax, cmin, cmax = _mask_bounding_box(mask)
+                image = _crop_with_mask(image, mask, rmin, rmax, cmin, cmax)
 
             elif settings.mode == "Hexagon":
                 img_h, img_w = image.shape[1], image.shape[2]
                 mask = create_crop_mask(img_w, img_h, settings)
-                mask_2d = mask[0, :, :, 0]
-                rows = torch.any(mask_2d, dim=1)
-                cols = torch.any(mask_2d, dim=0)
-                row_indices = torch.where(rows)[0]
-                col_indices = torch.where(cols)[0]
-                rmin, rmax = row_indices[0].item(), row_indices[-1].item()
-                cmin, cmax = col_indices[0].item(), col_indices[-1].item()
+                rmin, rmax, cmin, cmax = _mask_bounding_box(mask)
 
+                # Center a square crop around the hex bounding box
                 hex_h = rmax - rmin + 1
                 center_r = (rmin + rmax) // 2
                 center_c = (cmin + cmax) // 2
@@ -440,8 +457,6 @@ class AdvancedTilingVAEDecode:
                 sq_rmin = sq_rmax + 1 - hex_h
                 sq_cmin = sq_cmax + 1 - hex_h
 
-                image = image[:, sq_rmin:sq_rmax + 1, sq_cmin:sq_cmax + 1, :]
-                cropped_mask = mask[:, sq_rmin:sq_rmax + 1, sq_cmin:sq_cmax + 1, :]
-                image = torch.cat((image, cropped_mask.to(device=image.device)), dim=3)
+                image = _crop_with_mask(image, mask, sq_rmin, sq_rmax, sq_cmin, sq_cmax)
 
         return (image,)

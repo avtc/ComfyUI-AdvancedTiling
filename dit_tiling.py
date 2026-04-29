@@ -157,7 +157,6 @@ def _patch_lumina(model_patcher, diff_model, settings=None):
        accumulation from polluting attention for working-area patches.
     """
     patch_size = diff_model.patch_size
-    settings._patch_size = patch_size
 
     # 1. Latent wrapping
     wrapper = _create_lumina_wrapper(settings, patch_size=patch_size)

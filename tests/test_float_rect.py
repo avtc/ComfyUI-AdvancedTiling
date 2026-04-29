@@ -190,6 +190,71 @@ def test_end_to_end_scale_and_divisible():
     assert mask.sum().item() > 0
 
 
+# --- edge case tests ---
+
+
+def test_zero_scale_clamps_to_minimum():
+    """scale=0.0 → dims clamped to 1.0 (no ZeroDivisionError)."""
+    s = Settings("Rectangular", 0.0, scale=0.0, min_margin=0, divisible_by=1)
+    w, h = compute_float_rect_dims(128, 128, s)
+    assert w >= 1.0
+    assert h >= 1.0
+
+
+def test_negative_dims_clamped():
+    """Large min_margin relative to dims → clamped to 1.0."""
+    s = Settings("Rectangular", 0.0, scale=0.1, min_margin=20, divisible_by=1)
+    w, h = compute_float_rect_dims(32, 32, s)
+    assert w >= 1.0
+    assert h >= 1.0
+
+
+def test_zero_scale_no_crash_in_tiling():
+    """scale=0.0 does not cause ZeroDivisionError in rect_tiling."""
+    s = Settings("Rectangular", 0.0, scale=0.0, min_margin=0, divisible_by=1)
+    result = rect_tiling(5, 5, (10, 10), (10, 10), s)
+    assert isinstance(result, tuple) and len(result) == 2
+
+
+def test_non_square_calculate_mapping():
+    """calculate_mapping works for non-square dimensions."""
+    s = Settings("Rectangular", 0.0, scale=0.5, min_margin=0, divisible_by=1)
+    src_x, src_y, new_x, new_y = at_mod.calculate_mapping((20, 10), (20, 10), s)
+    assert len(src_x) > 0
+    assert len(src_x) == len(src_y) == len(new_x) == len(new_y)
+
+
+def test_non_square_create_crop_mask():
+    """create_crop_mask works for non-square dimensions."""
+    s = Settings("Rectangular", 0.0, scale=0.5, min_margin=0, divisible_by=1)
+    mask = at_mod.create_crop_mask(20, 10, s)
+    assert mask.shape == (1, 10, 20, 1)
+    assert mask.sum().item() < 20 * 10
+    assert mask.sum().item() > 0
+
+
+def test_tiling_vs_mapping_consistency():
+    """Per-pixel rect_tiling and vectorized calculate_mapping produce same results."""
+    W, H = 16, 16
+    s = Settings("Rectangular", 0.0, scale=0.6, min_margin=2, divisible_by=1)
+    src_x, src_y, new_x, new_y = at_mod.calculate_mapping((W, H), (W, H), s)
+
+    for i in range(len(src_x)):
+        sx, sy = src_x[i].item(), src_y[i].item()
+        nx, ny = new_x[i].item(), new_y[i].item()
+        px, py = rect_tiling(sx, sy, (W, H), (W, H), s)
+        assert (px, py) == (nx, ny), f"Mismatch at ({sx},{sy}): rect_tiling={px},{py} vs mapping={nx},{ny}"
+
+
+def test_divisible_by_not_multiple_of_vae_factor():
+    """divisible_by that isn't a multiple of vae_factor still produces valid dims."""
+    s = Settings("Rectangular", 0.0, scale=1.0, min_margin=0, divisible_by=12)
+    w, h = compute_float_rect_dims(64, 64, s, vae_factor=8)
+    assert w > 0 and h > 0
+    # 12/8 = 1.5, so dims should be multiples of 1.5
+    assert w % 1.5 == 0.0
+
+
 if __name__ == "__main__":
     import sys
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

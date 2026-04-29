@@ -28,6 +28,11 @@ def compute_float_rect_dims(
             work_w = math.floor(work_w / unit_latent) * unit_latent
             work_h = math.floor(work_h / unit_latent) * unit_latent
 
+    # Clamp to minimum 1.0 to avoid ZeroDivisionError in modular arithmetic
+    # and nonsensical wrapping with negative dimensions.
+    work_w = max(work_w, 1.0)
+    work_h = max(work_h, 1.0)
+
     return work_w, work_h
 
 
