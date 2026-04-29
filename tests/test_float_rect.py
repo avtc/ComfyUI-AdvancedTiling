@@ -21,11 +21,13 @@ _spec.loader.exec_module(_pkg)
 from ComfyUI_AdvancedTiling.modes import Settings
 from ComfyUI_AdvancedTiling.modes.rect import compute_float_rect_dims, rect_tiling
 
+VAE_FACTOR = 8
+
 
 def test_no_margin_no_divisible():
     """scale=1.0, min_margin=0, divisible_by=1 → dims equal input."""
     s = Settings("Rectangular", 0.0, scale=1.0, min_margin=0, divisible_by=1)
-    w, h = compute_float_rect_dims(128, 128, s)
+    w, h = compute_float_rect_dims(128, 128, s, VAE_FACTOR)
     assert w == 128.0
     assert h == 128.0
 
@@ -33,7 +35,7 @@ def test_no_margin_no_divisible():
 def test_scale_reduces_dims():
     """scale=0.5 → dims are half."""
     s = Settings("Rectangular", 0.0, scale=0.5, min_margin=0, divisible_by=1)
-    w, h = compute_float_rect_dims(128, 128, s)
+    w, h = compute_float_rect_dims(128, 128, s, VAE_FACTOR)
     assert w == 64.0
     assert h == 64.0
 
@@ -41,7 +43,7 @@ def test_scale_reduces_dims():
 def test_min_margin_reduces_dims():
     """scale=1.0, min_margin=4 → dims reduced by 2*margin."""
     s = Settings("Rectangular", 0.0, scale=1.0, min_margin=4, divisible_by=1)
-    w, h = compute_float_rect_dims(128, 128, s)
+    w, h = compute_float_rect_dims(128, 128, s, VAE_FACTOR)
     assert w == 120.0
     assert h == 120.0
 
@@ -49,7 +51,7 @@ def test_min_margin_reduces_dims():
 def test_scale_and_margin():
     """Both scale and margin applied."""
     s = Settings("Rectangular", 0.0, scale=0.8, min_margin=4, divisible_by=1)
-    w, h = compute_float_rect_dims(128, 128, s)
+    w, h = compute_float_rect_dims(128, 128, s, VAE_FACTOR)
     assert w == 128.0 * 0.8 - 2 * 4  # 94.4
     assert h == 128.0 * 0.8 - 2 * 4
 
@@ -73,7 +75,7 @@ def test_divisible_by_no_rounding_when_exact():
 def test_non_square():
     """Non-square dimensions."""
     s = Settings("Rectangular", 0.0, scale=0.75, min_margin=2, divisible_by=1)
-    w, h = compute_float_rect_dims(100, 80, s)
+    w, h = compute_float_rect_dims(100, 80, s, VAE_FACTOR)
     assert w == 100.0 * 0.75 - 2 * 2  # 71.0
     assert h == 80.0 * 0.75 - 2 * 2   # 56.0
 
@@ -83,21 +85,21 @@ def test_non_square():
 def test_rect_identity_inside():
     """Pixels inside the float rectangle map to themselves."""
     s = Settings("Rectangular", 0.0, scale=1.0, min_margin=0, divisible_by=1)
-    result = rect_tiling(5, 5, (10, 10), (10, 10), s)
+    result = rect_tiling(5, 5, (10, 10), (10, 10), s, VAE_FACTOR)
     assert result == (5, 5)
 
 
 def test_rect_wraps_right_to_left():
     """Pixel at right edge wraps to left."""
     s = Settings("Rectangular", 0.0, scale=1.0, min_margin=0, divisible_by=1)
-    result = rect_tiling(10, 5, (10, 10), (10, 10), s)
+    result = rect_tiling(10, 5, (10, 10), (10, 10), s, VAE_FACTOR)
     assert result == (0, 5)
 
 
 def test_rect_wraps_bottom_to_top():
     """Pixel at bottom edge wraps to top."""
     s = Settings("Rectangular", 0.0, scale=1.0, min_margin=0, divisible_by=1)
-    result = rect_tiling(5, 10, (10, 10), (10, 10), s)
+    result = rect_tiling(5, 10, (10, 10), (10, 10), s, VAE_FACTOR)
     assert result == (5, 0)
 
 
@@ -106,7 +108,7 @@ def test_rect_scaled_wraps_outside():
     s = Settings("Rectangular", 0.0, scale=0.5, min_margin=0, divisible_by=1)
     # work_w = 10 * 0.5 = 5.0, center = 5.0
     # x=0 is outside the rect (rect starts at 2.5), so it wraps
-    result = rect_tiling(0, 0, (10, 10), (10, 10), s)
+    result = rect_tiling(0, 0, (10, 10), (10, 10), s, VAE_FACTOR)
     assert result != (0, 0)  # Should wrap to inside
 
 
@@ -115,7 +117,7 @@ def test_rect_scaled_identity_inside():
     s = Settings("Rectangular", 0.0, scale=0.5, min_margin=0, divisible_by=1)
     # work_w = 5.0, center = 5.0, rect spans [2.5, 7.5)
     # x=5 is inside
-    result = rect_tiling(5, 5, (10, 10), (10, 10), s)
+    result = rect_tiling(5, 5, (10, 10), (10, 10), s, VAE_FACTOR)
     assert result == (5, 5)
 
 
@@ -127,14 +129,14 @@ import ComfyUI_AdvancedTiling.advanced_tiling as at_mod
 def test_calculate_mapping_rect_identity():
     """All pixels inside rect map to themselves → empty mapping."""
     s = Settings("Rectangular", 0.0, scale=1.0, min_margin=0, divisible_by=1)
-    src_x, src_y, new_x, new_y = at_mod.calculate_mapping((10, 10), (10, 10), s)
+    src_x, src_y, new_x, new_y = at_mod.calculate_mapping((10, 10), (10, 10), s, VAE_FACTOR)
     assert len(src_x) == 0
 
 
 def test_calculate_mapping_rect_scaled_has_remapping():
     """Scaled rect produces non-empty mapping for outside pixels."""
     s = Settings("Rectangular", 0.0, scale=0.5, min_margin=0, divisible_by=1)
-    src_x, src_y, new_x, new_y = at_mod.calculate_mapping((10, 10), (10, 10), s)
+    src_x, src_y, new_x, new_y = at_mod.calculate_mapping((10, 10), (10, 10), s, VAE_FACTOR)
     assert len(src_x) > 0
 
 
@@ -144,7 +146,7 @@ def test_calculate_mapping_rect_scaled_has_remapping():
 def test_crop_mask_rect_full():
     """scale=1.0, no margin → all pixels in mask."""
     s = Settings("Rectangular", 0.0, scale=1.0, min_margin=0, divisible_by=1)
-    mask = at_mod.create_crop_mask(10, 10, s)
+    mask = at_mod.create_crop_mask(10, 10, s, vae_factor=1)
     assert mask.shape == (1, 10, 10, 1)
     assert mask.sum().item() == 100  # all ones
 
@@ -152,7 +154,7 @@ def test_crop_mask_rect_full():
 def test_crop_mask_rect_scaled():
     """scale=0.5 → mask has fewer pixels than total."""
     s = Settings("Rectangular", 0.0, scale=0.5, min_margin=0, divisible_by=1)
-    mask = at_mod.create_crop_mask(10, 10, s)
+    mask = at_mod.create_crop_mask(10, 10, s, vae_factor=1)
     assert mask.shape == (1, 10, 10, 1)
     assert mask.sum().item() < 100  # some pixels outside rect
     assert mask.sum().item() > 0    # some pixels inside
@@ -173,19 +175,19 @@ def test_end_to_end_scale_and_divisible():
     assert (work_h * 8) % 64 == 0
 
     # 2. Wrapping: center pixel is identity
-    result = rect_tiling(W // 2, H // 2, (W, H), (W, H), s)
+    result = rect_tiling(W // 2, H // 2, (W, H), (W, H), s, VAE_FACTOR)
     assert result == (W // 2, H // 2)
 
     # 3. Wrapping: corner pixel wraps
-    result = rect_tiling(0, 0, (W, H), (W, H), s)
+    result = rect_tiling(0, 0, (W, H), (W, H), s, VAE_FACTOR)
     assert result != (0, 0)
 
     # 4. Mapping is non-empty
-    mapping = at_mod.calculate_mapping((W, H), (W, H), s)
+    mapping = at_mod.calculate_mapping((W, H), (W, H), s, VAE_FACTOR)
     assert len(mapping[0]) > 0
 
     # 5. Crop mask covers fewer pixels than total
-    mask = at_mod.create_crop_mask(W, H, s)
+    mask = at_mod.create_crop_mask(W, H, s, vae_factor=1)
     assert mask.sum().item() < W * H
     assert mask.sum().item() > 0
 
@@ -196,7 +198,7 @@ def test_end_to_end_scale_and_divisible():
 def test_zero_scale_clamps_to_minimum():
     """scale=0.0 → dims clamped to 1.0 (no ZeroDivisionError)."""
     s = Settings("Rectangular", 0.0, scale=0.0, min_margin=0, divisible_by=1)
-    w, h = compute_float_rect_dims(128, 128, s)
+    w, h = compute_float_rect_dims(128, 128, s, VAE_FACTOR)
     assert w >= 1.0
     assert h >= 1.0
 
@@ -204,7 +206,7 @@ def test_zero_scale_clamps_to_minimum():
 def test_negative_dims_clamped():
     """Large min_margin relative to dims → clamped to 1.0."""
     s = Settings("Rectangular", 0.0, scale=0.1, min_margin=20, divisible_by=1)
-    w, h = compute_float_rect_dims(32, 32, s)
+    w, h = compute_float_rect_dims(32, 32, s, VAE_FACTOR)
     assert w >= 1.0
     assert h >= 1.0
 
@@ -212,14 +214,14 @@ def test_negative_dims_clamped():
 def test_zero_scale_no_crash_in_tiling():
     """scale=0.0 does not cause ZeroDivisionError in rect_tiling."""
     s = Settings("Rectangular", 0.0, scale=0.0, min_margin=0, divisible_by=1)
-    result = rect_tiling(5, 5, (10, 10), (10, 10), s)
+    result = rect_tiling(5, 5, (10, 10), (10, 10), s, VAE_FACTOR)
     assert isinstance(result, tuple) and len(result) == 2
 
 
 def test_non_square_calculate_mapping():
     """calculate_mapping works for non-square dimensions."""
     s = Settings("Rectangular", 0.0, scale=0.5, min_margin=0, divisible_by=1)
-    src_x, src_y, new_x, new_y = at_mod.calculate_mapping((20, 10), (20, 10), s)
+    src_x, src_y, new_x, new_y = at_mod.calculate_mapping((20, 10), (20, 10), s, VAE_FACTOR)
     assert len(src_x) > 0
     assert len(src_x) == len(src_y) == len(new_x) == len(new_y)
 
@@ -227,7 +229,7 @@ def test_non_square_calculate_mapping():
 def test_non_square_create_crop_mask():
     """create_crop_mask works for non-square dimensions."""
     s = Settings("Rectangular", 0.0, scale=0.5, min_margin=0, divisible_by=1)
-    mask = at_mod.create_crop_mask(20, 10, s)
+    mask = at_mod.create_crop_mask(20, 10, s, vae_factor=1)
     assert mask.shape == (1, 10, 20, 1)
     assert mask.sum().item() < 20 * 10
     assert mask.sum().item() > 0
@@ -237,12 +239,12 @@ def test_tiling_vs_mapping_consistency():
     """Per-pixel rect_tiling and vectorized calculate_mapping produce same results."""
     W, H = 16, 16
     s = Settings("Rectangular", 0.0, scale=0.6, min_margin=2, divisible_by=1)
-    src_x, src_y, new_x, new_y = at_mod.calculate_mapping((W, H), (W, H), s)
+    src_x, src_y, new_x, new_y = at_mod.calculate_mapping((W, H), (W, H), s, VAE_FACTOR)
 
     for i in range(len(src_x)):
         sx, sy = src_x[i].item(), src_y[i].item()
         nx, ny = new_x[i].item(), new_y[i].item()
-        px, py = rect_tiling(sx, sy, (W, H), (W, H), s)
+        px, py = rect_tiling(sx, sy, (W, H), (W, H), s, VAE_FACTOR)
         assert (px, py) == (nx, ny), f"Mismatch at ({sx},{sy}): rect_tiling={px},{py} vs mapping={nx},{ny}"
 
 
@@ -314,14 +316,14 @@ def test_settings_eq_different():
 def test_none_calculate_mapping_empty():
     """None mode produces empty mapping."""
     s = Settings("None", 0.0, scale=1.0, min_margin=0, divisible_by=1)
-    src_x, src_y, new_x, new_y = at_mod.calculate_mapping((10, 10), (10, 10), s)
+    src_x, src_y, new_x, new_y = at_mod.calculate_mapping((10, 10), (10, 10), s, VAE_FACTOR)
     assert len(src_x) == 0
 
 
 def test_none_create_crop_mask_full():
     """None mode mask covers all pixels."""
     s = Settings("None", 0.0, scale=1.0, min_margin=0, divisible_by=1)
-    mask = at_mod.create_crop_mask(10, 10, s)
+    mask = at_mod.create_crop_mask(10, 10, s, vae_factor=1)
     assert mask.shape == (1, 10, 10, 1)
     assert mask.sum().item() == 100
 
@@ -332,14 +334,14 @@ def test_none_create_crop_mask_full():
 def test_hex_calculate_mapping_nonempty():
     """Hex mode with scale < 1 produces non-empty mapping."""
     s = Settings("Hexagon", 0.0, scale=0.8, min_margin=0, divisible_by=1)
-    src_x, src_y, new_x, new_y = at_mod.calculate_mapping((32, 32), (32, 32), s)
+    src_x, src_y, new_x, new_y = at_mod.calculate_mapping((32, 32), (32, 32), s, VAE_FACTOR)
     assert len(src_x) > 0
 
 
 def test_hex_create_crop_mask():
     """Hex mode mask covers fewer pixels than total."""
     s = Settings("Hexagon", 0.0, scale=0.8, min_margin=0, divisible_by=1)
-    mask = at_mod.create_crop_mask(32, 32, s)
+    mask = at_mod.create_crop_mask(32, 32, s, vae_factor=1)
     assert mask.shape == (1, 32, 32, 1)
     assert mask.sum().item() < 32 * 32
     assert mask.sum().item() > 0
@@ -349,8 +351,8 @@ def test_hex_crop_mask_with_margin():
     """Hex mode with min_margin reduces mask area further."""
     s1 = Settings("Hexagon", 0.0, scale=0.8, min_margin=0, divisible_by=1)
     s2 = Settings("Hexagon", 0.0, scale=0.8, min_margin=2, divisible_by=1)
-    mask1 = at_mod.create_crop_mask(32, 32, s1)
-    mask2 = at_mod.create_crop_mask(32, 32, s2)
+    mask1 = at_mod.create_crop_mask(32, 32, s1, vae_factor=1)
+    mask2 = at_mod.create_crop_mask(32, 32, s2, vae_factor=1)
     assert mask2.sum().item() < mask1.sum().item()
 
 

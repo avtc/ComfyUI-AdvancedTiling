@@ -12,7 +12,7 @@ def compute_float_rect_dims(
     W: int,
     H: int,
     settings: Settings,
-    vae_factor: int = 8,
+    vae_factor: int,
 ) -> tuple[float, float]:
     """Compute float-point rectangle dimensions from scale, min_margin, and divisible_by.
 
@@ -42,6 +42,7 @@ def rect_tiling(
     original_size: tuple[int, int],
     padded_size: tuple[int, int],
     settings: Settings,
+    vae_factor: int,
 ) -> tuple[int, int]:
     """Rectangular tiling with float-point dimensions.
 
@@ -54,12 +55,13 @@ def rect_tiling(
     :param original_size: (width, height) of original content
     :param padded_size: (width, height) of padded tensor
     :param settings: Tiling settings
+    :param vae_factor: VAE downscale factor for divisible_by conversion
     :return: (new_x, new_y) source coordinates in padded space
     """
     ow, oh = original_size
     pw, ph = padded_size
 
-    work_w, work_h = compute_float_rect_dims(ow, oh, settings)
+    work_w, work_h = compute_float_rect_dims(ow, oh, settings, vae_factor)
 
     cx = pw / 2.0
     cy = ph / 2.0

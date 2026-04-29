@@ -30,7 +30,7 @@ def _has_conv2d(model: nn.Module) -> bool:
     return any(isinstance(m, Conv2d) for m in model.modules())
 
 
-def _apply_latent_wrapping(x: torch.Tensor, settings: Settings):
+def _apply_latent_wrapping(x: torch.Tensor, settings: Settings, vae_factor: int):
     """Fill margin/waste positions with content from opposite edges.
 
     Relies on calculate_mapping's @functools.cache for memoization.
@@ -43,7 +43,7 @@ def _apply_latent_wrapping(x: torch.Tensor, settings: Settings):
     else:
         _, _, H, W = x.shape
 
-    mapping = calculate_mapping((W, H), (W, H), settings)
+    mapping = calculate_mapping((W, H), (W, H), settings, vae_factor)
 
     if is_5d:
         x[:, :, :, mapping[1], mapping[0]] = x[:, :, :, mapping[3], mapping[2]]
@@ -51,24 +51,22 @@ def _apply_latent_wrapping(x: torch.Tensor, settings: Settings):
         x[:, :, mapping[1], mapping[0]] = x[:, :, mapping[3], mapping[2]]
 
 
-def _create_content_wrapper(settings: Settings):
+def _create_content_wrapper(settings: Settings, vae_factor: int):
     """Create a model function wrapper that applies latent wrapping each step."""
     def wrapper(apply_model, args):
-        _apply_latent_wrapping(args["input"], settings)
+        _apply_latent_wrapping(args["input"], settings, vae_factor)
         return apply_model(args["input"], args["timestep"], **args["c"])
     return wrapper
 
 
-def _create_lumina_wrapper(settings: Settings = None):
+def _create_lumina_wrapper(settings: Settings, vae_factor: int):
     """Model wrapper for Lumina: applies latent content wrapping on each step.
 
-    :param settings: Tiling settings (None disables wrapping)
+    :param settings: Tiling settings
+    :param vae_factor: VAE downscale factor
     """
-    do_wrapping = settings is not None
-
     def wrapper(apply_model, args):
-        if do_wrapping:
-            _apply_latent_wrapping(args["input"], settings)
+        _apply_latent_wrapping(args["input"], settings, vae_factor)
         return apply_model(args["input"], args["timestep"], **args["c"])
 
     return wrapper
@@ -79,7 +77,7 @@ def _is_lumina(diff_model) -> bool:
     return hasattr(diff_model, 'rope_embedder') and not hasattr(diff_model, 'pe_embedder')
 
 
-def _patch_lumina(model_patcher, diff_model, settings=None):
+def _patch_lumina(model_patcher, diff_model, settings: Settings, vae_factor: int):
     """Set up tiling for Lumina/NextDiT models.
 
     Two mechanisms work together:
@@ -92,17 +90,16 @@ def _patch_lumina(model_patcher, diff_model, settings=None):
     patch_size = diff_model.patch_size
 
     # 1. Latent wrapping
-    wrapper = _create_lumina_wrapper(settings)
+    wrapper = _create_lumina_wrapper(settings, vae_factor)
     model_patcher.set_model_unet_function_wrapper(wrapper)
 
-    if settings is not None:
-        # 2. Waste token reset
-        from .toroidal_attention import LuminaWastePatch
-        waste_patch = LuminaWastePatch(patch_size, settings)
-        model_patcher.set_model_double_block_patch(waste_patch)
+    # 2. Waste token reset
+    from .toroidal_attention import LuminaWastePatch
+    waste_patch = LuminaWastePatch(patch_size, settings, vae_factor)
+    model_patcher.set_model_double_block_patch(waste_patch)
 
 
-def patch_dit_model(model_patcher, settings: Settings):
+def patch_dit_model(model_patcher, settings: Settings, vae_factor: int):
     """
     Apply tiling to a DiT model.
 
@@ -115,21 +112,23 @@ def patch_dit_model(model_patcher, settings: Settings):
 
     :param model_patcher: ComfyUI ModelPatcher instance
     :param settings: Tiling settings
+    :param vae_factor: VAE downscale factor
     """
     diff_model = model_patcher.model.diffusion_model
 
     if settings.mode == "Hexagon":
         if _is_lumina(diff_model):
-            _patch_lumina(model_patcher, diff_model, settings)
+            _patch_lumina(model_patcher, diff_model, settings, vae_factor)
 
         elif hasattr(diff_model, 'pe_embedder'):
             from .toroidal_attention import HexToroidalAttentionPatch
 
             patch = HexToroidalAttentionPatch(settings, diff_model.pe_embedder,
-                                               patch_size=getattr(diff_model, 'patch_size', 1))
+                                               patch_size=getattr(diff_model, 'patch_size', 1),
+                                               vae_factor=vae_factor)
             model_patcher.set_model_attn1_patch(patch)
 
-            wrapper = _create_content_wrapper(settings)
+            wrapper = _create_content_wrapper(settings, vae_factor)
             model_patcher.set_model_unet_function_wrapper(wrapper)
 
         else:
@@ -140,7 +139,7 @@ def patch_dit_model(model_patcher, settings: Settings):
 
     elif settings.mode == "Rectangular":
         if _is_lumina(diff_model):
-            _patch_lumina(model_patcher, diff_model, settings)
+            _patch_lumina(model_patcher, diff_model, settings, vae_factor)
 
         elif hasattr(diff_model, 'pe_embedder'):
             from .toroidal_attention import RectToroidalAttentionPatch
@@ -148,10 +147,11 @@ def patch_dit_model(model_patcher, settings: Settings):
             patch = RectToroidalAttentionPatch(
                 settings, diff_model.pe_embedder,
                 patch_size=getattr(diff_model, 'patch_size', 1),
+                vae_factor=vae_factor,
             )
             model_patcher.set_model_attn1_patch(patch)
 
-            wrapper = _create_content_wrapper(settings)
+            wrapper = _create_content_wrapper(settings, vae_factor)
             model_patcher.set_model_unet_function_wrapper(wrapper)
 
         else:

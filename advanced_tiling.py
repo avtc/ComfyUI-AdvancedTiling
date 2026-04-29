@@ -51,7 +51,8 @@ def _hex_remap_batch(centers_x, centers_y, size, wrap_w, wrap_h, settings):
 
 @functools.cache
 def calculate_mapping(
-    original_size: tuple[int, int], padded_size: tuple[int, int], settings: Settings
+    original_size: tuple[int, int], padded_size: tuple[int, int], settings: Settings,
+    vae_factor: int,
 ):
     """
     Calculate mapping for pixels outside of the mask
@@ -59,6 +60,7 @@ def calculate_mapping(
     :param original_size: Original size of the image
     :param padded_size: Padded size of the image
     :param settings: Tiling settings
+    :param vae_factor: VAE downscale factor for divisible_by conversion
     :return: Mapping of pixels
     """
 
@@ -67,7 +69,7 @@ def calculate_mapping(
 
     if settings.mode == "Rectangular":
         from .modes.rect import compute_float_rect_dims
-        work_w, work_h = compute_float_rect_dims(ow, oh, settings)
+        work_w, work_h = compute_float_rect_dims(ow, oh, settings, vae_factor)
         cx, cy = pw / 2.0, ph / 2.0
 
         xs = torch.arange(pw, dtype=torch.float64)
@@ -92,8 +94,8 @@ def calculate_mapping(
 
     elif settings.mode == "Hexagon":
         import numpy as np
-        min_margin = settings.min_margin
-        size = max(1.0, min(ow, oh) / 2 * settings.scale - min_margin)
+        from .modes.hex import compute_float_hex_size
+        size = compute_float_hex_size(ow, oh, settings, vae_factor)
         cx = np.arange(pw, dtype=np.float64) - pw // 2
         cy = np.arange(ph, dtype=np.float64) - ph // 2
         grid_cx, grid_cy = np.meshgrid(cx, cy, indexing='xy')
@@ -115,23 +117,34 @@ def calculate_mapping(
 
 
 @functools.cache
-def create_crop_mask(width: int, height: int, settings: Settings, vae_factor: int = 1):
+def create_crop_mask(width: int, height: int, settings: Settings, vae_factor: int):
     """
     Crop image based on tiling settings
 
     :param width: Width of the image
     :param height: Height of the image
     :param settings: Tiling settings
-    :param vae_factor: VAE downscale factor (8 for SDXL/Flux). When >1, computes
-        the working rect in latent space and scales to image space so that
-        min_margin (which is in latent pixels) is applied correctly.
+    :param vae_factor: VAE downscale factor, obtained via vae.spacial_compression_decode().
+        When >1, computes the working rect in latent space and scales to image
+        space so that min_margin (which is in latent pixels) is applied correctly.
+        Also forwarded to compute_float_rect_dims for divisible_by rounding.
     :return: Cropped image
     """
 
     if settings.mode == "Hexagon":
         import numpy as np
-        min_margin = settings.min_margin
-        size = max(1.0, min(width, height) / 2 * settings.scale - min_margin)
+        from .modes.hex import compute_float_hex_size
+
+        if vae_factor > 1 and width >= vae_factor and height >= vae_factor:
+            # Image-space call: compute hex size in latent space (where
+            # min_margin is in the correct units) then scale to image pixels.
+            W_lat = width // vae_factor
+            H_lat = height // vae_factor
+            size_lat = compute_float_hex_size(W_lat, H_lat, settings, vae_factor=vae_factor)
+            size = size_lat * vae_factor
+        else:
+            # Latent-space call (or small test dimensions): use dimensions directly
+            size = compute_float_hex_size(width, height, settings, vae_factor)
         cx = np.arange(width, dtype=np.float64) - width // 2
         cy = np.arange(height, dtype=np.float64) - height // 2
         grid_cx, grid_cy = np.meshgrid(cx, cy, indexing='xy')
@@ -150,7 +163,7 @@ def create_crop_mask(width: int, height: int, settings: Settings, vae_factor: in
             # min_margin is in the correct units) then scale to image pixels.
             W_lat = width // vae_factor
             H_lat = height // vae_factor
-            work_w_lat, work_h_lat = compute_float_rect_dims(W_lat, H_lat, settings)
+            work_w_lat, work_h_lat = compute_float_rect_dims(W_lat, H_lat, settings, vae_factor=vae_factor)
             cx_lat = W_lat / 2.0
             cy_lat = H_lat / 2.0
             left_img = (cx_lat - work_w_lat / 2) * vae_factor
@@ -159,7 +172,7 @@ def create_crop_mask(width: int, height: int, settings: Settings, vae_factor: in
             bottom_img = (cy_lat + work_h_lat / 2) * vae_factor
         else:
             # Latent-space call (or small test dimensions): use dimensions directly
-            work_w, work_h = compute_float_rect_dims(width, height, settings)
+            work_w, work_h = compute_float_rect_dims(width, height, settings, vae_factor)
             cx, cy = width / 2.0, height / 2.0
             left_img = cx - work_w / 2
             right_img = cx + work_w / 2
@@ -215,12 +228,13 @@ def _crop_with_mask(
     return torch.cat((image, cropped_mask.to(device=image.device)), dim=3)
 
 
-def patch_model(model, settings: Settings):
+def patch_model(model, settings: Settings, vae_factor: int):
     """
     Patch model to perform tiling - in place!
 
     :param model: Model to patch
     :param settings: Tiling settings
+    :param vae_factor: VAE downscale factor
     """
 
     # Patch all Conv2d layers
@@ -228,6 +242,7 @@ def patch_model(model, settings: Settings):
         # pylint: disable=protected-access, no-value-for-parameter
         layer._conv_forward = tiling_conv.__get__(layer, Conv2d)
         layer.tiling_settings = settings
+        layer.tiling_vae_factor = vae_factor
     return
 
 
@@ -252,6 +267,7 @@ def tiling_conv(self, input_tensor: Tensor, weight: Tensor, bias: Optional[Tenso
         (input_tensor.shape[-1], input_tensor.shape[-2]),
         (padded.shape[-1], padded.shape[-2]),
         self.tiling_settings,
+        self.tiling_vae_factor,
     )
     # Apply tiling
     padded[:, :, mapping[1], mapping[0]] = padded[:, :, mapping[3], mapping[2]]
@@ -365,13 +381,13 @@ class AdvancedTiling:
         settings = settings._resolve_auto(is_conv2d)
 
         if is_conv2d:
-            patch_model(model_copy.model, settings)
+            patch_model(model_copy.model, settings, vae_factor=8)
 
             if settings.mode == "Rectangular" and (settings.scale < 1.0 or settings.min_margin > 0):
-                wrapper = _create_content_wrapper(settings)
+                wrapper = _create_content_wrapper(settings, vae_factor=8)
                 model_copy.set_model_unet_function_wrapper(wrapper)
         else:
-            patch_dit_model(model_copy, settings)
+            patch_dit_model(model_copy, settings, vae_factor=8)
 
         return (model_copy,)
 
@@ -422,7 +438,8 @@ class AdvancedTilingVAEDecode:
             (layer, layer._conv_forward, getattr(layer, 'tiling_settings', None))
             for layer in conv_layers
         ]
-        patch_model(vae.first_stage_model, settings)
+        vae_factor = vae.spacial_compression_decode()
+        patch_model(vae.first_stage_model, settings, vae_factor)
 
         try:
             result = self._decode_and_crop(settings, samples, vae, crop)
@@ -433,6 +450,8 @@ class AdvancedTilingVAEDecode:
                 layer._conv_forward = orig_forward
                 if hasattr(layer, 'tiling_settings'):
                     del layer.tiling_settings
+                if hasattr(layer, 'tiling_vae_factor'):
+                    del layer.tiling_vae_factor
 
         return result
 
@@ -458,7 +477,9 @@ class AdvancedTilingVAEDecode:
                 mask = create_crop_mask(img_w, img_h, settings, vae_factor=vae_factor)
                 rmin, rmax, cmin, cmax = _mask_bounding_box(mask)
 
-                # Center a square crop around the hex bounding box
+                # Center a square crop around the hex bounding box.
+                # compute_float_hex_size ensures the hex radius is divisible,
+                # but pixel-level rounding in the mask can cause 1px off.
                 hex_h = rmax - rmin + 1
                 if settings.divisible_by > 1:
                     hex_h = (hex_h // settings.divisible_by) * settings.divisible_by

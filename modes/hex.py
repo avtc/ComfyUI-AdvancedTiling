@@ -148,6 +148,34 @@ def pixel_to_hex(
     return (q, r)
 
 
+def compute_float_hex_size(
+    W: int,
+    H: int,
+    settings: Settings,
+    vae_factor: int,
+) -> float:
+    """Compute hex radius from scale, min_margin, and divisible_by.
+
+    Pipeline: min(W,H)/2 * scale -> subtract min_margin -> round down for divisible_by.
+    W, H should be in the same space as min_margin (latent pixels by default).
+    divisible_by is in image pixels, converted via vae_factor.
+    Returns float hex radius in the same space as W, H.
+
+    Equivalent to compute_float_rect_dims: hex height = 2 * size,
+    so 2*size is divisible by divisible_by means size is divisible by divisible_by/2.
+    """
+    size = min(W, H) / 2 * settings.scale - settings.min_margin
+
+    if settings.divisible_by > 1:
+        # Hex crop height = 2 * size. Ensure 2*size is divisible by divisible_by.
+        # In latent space: unit = divisible_by / (2 * vae_factor)
+        unit = settings.divisible_by / (2 * vae_factor)
+        if unit > 0:
+            size = math.floor(size / unit) * unit
+
+    return max(size, 1.0)
+
+
 @functools.cache
 def hex_tiling(
     x: int,
@@ -155,6 +183,7 @@ def hex_tiling(
     original_size: tuple[int, int],
     padded_size: tuple[int, int],
     settings: Settings,
+    vae_factor: int,
 ) -> tuple[int, int]:
     """
     Hexagonal tiling function
@@ -164,15 +193,12 @@ def hex_tiling(
     :param original_size: Original size of tensor
     :param padded_size: Padded size of tensor
     :param settings: Tiling settings
+    :param vae_factor: VAE downscale factor for divisible_by conversion
     :return (x, y): Coordinates
     """
 
-    # Hexagon size - it needs to fit in the image
-    # Scale < 1.0 shrinks the hex, creating more waste area for better wrapping
-    # min_margin further reduces the hex radius by a fixed amount
-    # Float arithmetic ensures proportional sizing across all resolutions (latent, VAE internal, image)
-    min_margin = settings.min_margin
-    size = max(1.0, min(original_size[0], original_size[1]) / 2 * settings.scale - min_margin)
+    # Hexagon size - applies scale, min_margin, divisible_by via shared function
+    size = compute_float_hex_size(original_size[0], original_size[1], settings, vae_factor)
     # Shift the origin to the center of the image and convert to fractional hexagon coordinates
     q, r = pixel_to_hex(
         (x - padded_size[0] // 2, y - padded_size[1] // 2),
