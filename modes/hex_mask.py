@@ -357,46 +357,122 @@ def create_feathered_masks(
     return inside, border_mask, neighbor_masks
 
 
-def compute_edge_buffer_mask(
+# Axial coordinate offsets for 6 neighbors of hex (0,0).
+# Used with hex basis [[sqrt(3), sqrt(3)/2], [0, 3/2]] to compute pixel offsets.
+_NEIGHBOR_AXIAL = {
+    "E":  (1,  0),
+    "NE": (1, -1),
+    "NW": (0, -1),
+    "W":  (-1, 0),
+    "SW": (-1, 1),
+    "SE": (0,  1),
+}
+
+
+def _neighbor_offset_px(direction: str, hex_radius: float) -> tuple[float, float]:
+    """Pixel offset from center hex center to neighbor hex center."""
+    q, r = _NEIGHBOR_AXIAL[direction]
+    sqrt3 = math.sqrt(3)
+    return (hex_radius * (sqrt3 * q + sqrt3 / 2 * r),
+            hex_radius * (3.0 / 2 * r))
+
+
+def create_central_tile_masks(
     width: int,
     height: int,
-    settings: Settings,
-    border_width: float,
-    edge_buffer_depth: int,
-    active_directions: set[int],
-) -> torch.Tensor:
+    hex_radius: int,
+    border_width: float = 0.2,
+    feather_pixels: int = 0,
+    active_directions: set[int] | None = None,
+    masked_directions: set[int] | None = None,
+    tile_priorities: list[int | None] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, list[torch.Tensor], torch.Tensor]:
     """
-    Compute per-direction boolean masks for the latent edge buffer zone.
+    Generate masks for CentralTile mode using hex-mask approach.
 
-    The edge buffer identifies the outermost N pixels of the border ring per
-    active direction.  These pixels will be hard-pasted with neighbor latent
-    content and excluded from the inpaint mask, seeding the diffusion boundary
-    with correct adjacent content.
+    Same approach as CornerEdges: build hex masks for center + each neighbor
+    at offset positions, create tile_map for non-overlapping ownership, and
+    mask only the lower-priority tile's border pixels.
 
-    :param border_width: Border width fraction (same as passed to create_feathered_masks).
-    :param edge_buffer_depth: 0 = edge pixels only, N = N pixels deeper from boundary.
-    :param active_directions: Direction indices (0-5) that have a neighbour.
-    :return: Boolean tensor (6, H, W) per direction.  True = buffer pixel.
+    Overlap pixels at shared edges are assigned to the higher-priority tile
+    in the tile_map, so they are automatically excluded from the mask.
+
+    :param hex_radius: Hex circumradius in pixels
+    :param active_directions: Direction indices (0-5) that have a neighbour
+    :param masked_directions: Direction indices where neighbor has higher priority
+    :param tile_priorities: [center_pri, E_pri, NE_pri, NW_pri, W_pri, SW_pri, SE_pri]
+    :return: (border_mask (1,H,W), neighbor_masks (6,H,W), hex_masks list, tile_map (H,W))
     """
-    inside = _build_inside_mask(width, height, settings)
-    hex_radius = min(width, height) // 2
-    erosion_pixels = max(1, int(border_width * hex_radius))
-    eroded = _erode_mask(inside, erosion_pixels)
-    border = inside & ~eroded
+    if active_directions is None:
+        active_directions = set(range(6))
+    if masked_directions is None:
+        masked_directions = active_directions
 
+    cx, cy = width / 2.0, height / 2.0
+    erosion = max(1, int(border_width * hex_radius))
+
+    # Build hex masks: index 0=center, 1-6=neighbors by NEIGHBOR_DIRECTIONS order
+    hex_masks = [_build_hex_mask_at(width, height, cx, cy, hex_radius)]
+    for d in NEIGHBOR_DIRECTIONS:
+        ox, oy = _neighbor_offset_px(d, hex_radius)
+        hex_masks.append(_build_hex_mask_at(width, height, cx + ox, cy + oy, hex_radius))
+
+    # Build tile_map: priority-ordered, highest priority (lowest number) first
+    tile_map = torch.full((height, width), -1, dtype=torch.long)
+    tile_order = list(range(7))
+    if tile_priorities:
+        tile_order.sort(key=lambda i: (
+            tile_priorities[i] if i < len(tile_priorities) and tile_priorities[i] is not None
+            else float('inf')
+        ))
+    for tile_idx in tile_order:
+        unassigned = tile_map < 0
+        tile_map[hex_masks[tile_idx] & unassigned] = tile_idx
+
+    # Angular fallback for uncovered pixels
+    uncovered = tile_map < 0
+    if uncovered.any():
+        sectors = _compute_sector_map(width, height)
+        tile_map[uncovered] = sectors[uncovered] + 1  # +1 because 0=center
+
+    # Erode center hex for border ring
+    pad = erosion + 1
+    padded = F.pad(
+        hex_masks[0].float().unsqueeze(0).unsqueeze(0),
+        [pad] * 4, mode='constant', value=1.0,
+    )
+    eroded_center = _erode_mask(padded.squeeze().bool(), erosion)
+    if pad > 0:
+        eroded_center = eroded_center[pad:-pad, pad:-pad]
+    border_ring = hex_masks[0] & ~eroded_center
+
+    # Sector map for directional filtering
     sectors = _compute_sector_map(width, height)
 
-    # Distance from each pixel to nearest waste pixel (hex boundary).
-    # Inside pixels at the boundary get distance 1, deeper pixels get higher values.
-    dist_to_boundary = _manhattan_distance_to_region(~inside)
-    threshold = edge_buffer_depth + 1  # depth=0 → dist<=1 (boundary only)
-
-    buffer_masks = torch.zeros((6, height, width), dtype=torch.bool)
+    # Per-direction neighbor masks (for visualization outputs)
+    neighbor_masks = torch.zeros((6, height, width), dtype=torch.float32)
     for d in active_directions:
-        sector_border = border & (sectors == d)
-        buffer_masks[d] = sector_border & (torch.from_numpy(dist_to_boundary) <= threshold)
+        neighbor_masks[d] = (border_ring & (sectors == d)).float()
 
-    return buffer_masks
+    # Build border mask: center-owned border pixels in masked directions only.
+    # tile_map == 0 excludes overlap pixels (assigned to higher-priority neighbors).
+    border_mask = torch.zeros(height, width, dtype=torch.float32)
+
+    if feather_pixels > 0:
+        dist_to_eroded = torch.from_numpy(np.clip(
+            _manhattan_distance_to_region(eroded_center) / feather_pixels, 0.0, 1.0,
+        ))
+    else:
+        dist_to_eroded = torch.ones(height, width, dtype=torch.float32)
+
+    for d in masked_directions:
+        owns_center = tile_map == 0
+        dir_border = border_ring & owns_center & (sectors == d)
+        if dir_border.any():
+            feathered = dir_border.float() * dist_to_eroded
+            border_mask = torch.max(border_mask, feathered)
+
+    return border_mask.unsqueeze(0), neighbor_masks, hex_masks, tile_map
 
 
 def _build_hex_mask_at(

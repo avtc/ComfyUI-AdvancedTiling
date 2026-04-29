@@ -16,11 +16,11 @@ import torch
 from .modes import Settings
 from .modes.hex_mask import (
     NEIGHBOR_DIRECTIONS,
-    _manhattan_distance_to_region,
-    compute_edge_buffer_mask,
+    create_central_tile_masks,
     create_corner_masks,
     create_feathered_masks,
     create_waste_mask,
+    _neighbor_offset_px,
 )
 from .corner_composite import (
     CORNER_NAMES,
@@ -30,6 +30,7 @@ from .corner_composite import (
     composite_corner_preview,
     get_corner_offsets,
 )
+from .tile_priority import match_terrain_priority
 
 logger = logging.getLogger("ComfyUI-AdvancedTiling")
 
@@ -267,15 +268,6 @@ class AdvancedTilingHexInpaint:
                         "tooltip": "half_edge: mask extends to edge midpoint (composable corners). full_edge: mask covers entire edge.",
                     },
                 ),
-                "edge_buffer_depth": (
-                    "INT",
-                    {
-                        "default": 0,
-                        "min": 0,
-                        "max": 8,
-                        "tooltip": "Latent pixels from hex boundary pre-filled with neighbor content. 0 = edge pixels only, higher = deeper buffer. Excluded from inpaint mask.",
-                    },
-                ),
             },
             "optional": {
                 **{
@@ -308,7 +300,7 @@ class AdvancedTilingHexInpaint:
     def run(self, settings, vae, center_image, inpaint_mode, border_width,
             feather_radius, feather_sides, mask_strength_min, mask_strength_max,
             skip_same_neighbors, rotate_mapping="0", enable_preview=False,
-            corner_select="NE", mask_extent="half_edge", edge_buffer_depth=0,
+            corner_select="NE", mask_extent="half_edge",
             **kwargs):
         t_start = time.time()
 
@@ -351,7 +343,7 @@ class AdvancedTilingHexInpaint:
                 settings, vae, center_image, center_latent, neighbor_latents,
                 neighbor_images, border_width, feather_radius, feather_sides,
                 mask_strength_min, mask_strength_max, skip_same_neighbors,
-                enable_preview, mask_extent, edge_buffer_depth, kwargs,
+                enable_preview, mask_extent, kwargs,
                 mode, rot, corner,
             )
             all_results.append(result)
@@ -371,7 +363,7 @@ class AdvancedTilingHexInpaint:
         self, settings, vae, center_image, center_latent, neighbor_latents,
         neighbor_images, border_width, feather_radius, feather_sides,
         mask_strength_min, mask_strength_max, skip_same_neighbors,
-        enable_preview, mask_extent, edge_buffer_depth, kwargs,
+        enable_preview, mask_extent, kwargs,
         inpaint_mode, rotation_steps, corner_select,
     ):
         """Run the pipeline for one rotation/corner. Returns tuple of 15 outputs (not lists)."""
@@ -380,7 +372,7 @@ class AdvancedTilingHexInpaint:
                 settings, vae, center_image, center_latent, neighbor_latents,
                 neighbor_images, border_width, feather_radius, feather_sides,
                 mask_strength_min, mask_strength_max, corner_select, mask_extent,
-                edge_buffer_depth, enable_preview, kwargs,
+                enable_preview, kwargs,
             )
 
         # --- CentralTile mode ---
@@ -421,7 +413,35 @@ class AdvancedTilingHexInpaint:
         else:
             logger.info("[HexInpaint] No active directions")
 
-        # 5. Generate masks at latent resolution with feathering
+        # 4b. Determine per-direction priorities for mask filtering.
+        # Only mask sectors where the neighbor has higher priority (lower number)
+        # than the center — those borders need regeneration to blend with the
+        # higher-priority neighbor. Sectors where center has higher or equal
+        # priority are excluded from the mask (preserve center content).
+        priorities = kwargs.get("priorities")
+        center_pri = match_terrain_priority(center_image, priorities) if priorities else None
+        masked_directions = active_directions  # default: all active directions
+        if center_pri is not None and priorities is not None:
+            masked_directions = set()
+            for i, direction in enumerate(NEIGHBOR_DIRECTIONS):
+                target_idx = (i - rotation_steps) % n
+                if target_idx not in active_directions:
+                    continue
+                if direction in neighbor_images:
+                    n_pri = match_terrain_priority(neighbor_images[direction], priorities)
+                    if n_pri is not None and n_pri < center_pri:
+                        masked_directions.add(target_idx)
+                        logger.info(f"[HexInpaint] {direction}(pri={n_pri}) > center(pri={center_pri}): mask")
+                    else:
+                        logger.info(f"[HexInpaint] {direction}(pri={n_pri}) <= center(pri={center_pri}): skip")
+            if not masked_directions:
+                logger.info("[HexInpaint] No directions to mask (center has highest priority)")
+
+        # 5. Generate masks at latent resolution using hex-mask approach.
+        # Same as CornerEdges: build hex masks for center + neighbors at offset
+        # positions, create tile_map for non-overlapping ownership, mask only
+        # lower-priority tile's border pixels. Overlap pixels at shared edges
+        # are assigned to the higher-priority tile and excluded from the mask.
         t3 = time.time()
         composited_4d, _ = _normalize_latent(composited)
         _, _, H_lat, W_lat = composited_4d.shape
@@ -431,38 +451,54 @@ class AdvancedTilingHexInpaint:
         erosion_lat = max(1, int(border_width * hex_radius_lat))
         feather_lat = max(0, round(feather_radius * erosion_lat))
 
-        _, border_mask_lat, neighbor_masks_lat = create_feathered_masks(
-            W_lat, H_lat, settings, border_width, feather_lat, feather_sides, active_directions
+        # Build tile priorities list: [center_pri, E_pri, NE_pri, NW_pri, W_pri, SW_pri, SE_pri]
+        tile_priorities_list = [center_pri]
+        for direction in NEIGHBOR_DIRECTIONS:
+            if direction in neighbor_images and priorities is not None:
+                tile_priorities_list.append(
+                    match_terrain_priority(neighbor_images[direction], priorities)
+                )
+            else:
+                tile_priorities_list.append(None)
+
+        border_mask_lat, neighbor_masks_lat, hex_masks_lat, tile_map_lat = (
+            create_central_tile_masks(
+                W_lat, H_lat, hex_radius_lat, border_width, feather_lat,
+                active_directions, masked_directions, tile_priorities_list,
+            )
         )
 
         # Waste-area mask at latent resolution for InpaintVAEDecode
         waste_mask_lat = create_waste_mask(W_lat, H_lat, settings)  # (1, H_lat, W_lat)
         waste_mask_img = create_waste_mask(W_img, H_img, settings)  # (1, H_img, W_img)
 
-        # 5b. Edge buffer: paste neighbor latent into border ring edge, exclude from mask
-        if edge_buffer_depth >= 0 and neighbor_latents and active_directions:
-            buffer_dir_masks = compute_edge_buffer_mask(
-                W_lat, H_lat, settings, border_width, edge_buffer_depth, active_directions
-            )
-            direction_to_idx = {name: idx for idx, name in enumerate(NEIGHBOR_DIRECTIONS)}
-            total_buffer = 0
+        # 5b. Priority-ordered neighbor paste at shared edges.
+        # Paste neighbor latent where the neighbor's hex mask overlaps with
+        # the center hex. Higher-priority neighbors paste last (overwrite).
+        if neighbor_latents and masked_directions:
+            center_hex = hex_masks_lat[0]
+            # Sort neighbors by priority: lowest priority (highest number) first
+            paste_list = []
             for direction_name, neighbor_latent in neighbor_latents.items():
-                dir_idx = direction_to_idx[direction_name]
+                dir_idx = NEIGHBOR_DIRECTIONS.index(direction_name)
                 target_idx = (dir_idx - rotation_steps) % n
-                buf_mask = buffer_dir_masks[target_idx]
-                if buf_mask.any():
+                n_pri = tile_priorities_list[target_idx + 1]
+                paste_list.append((
+                    n_pri if n_pri is not None else float('inf'),
+                    target_idx, neighbor_latent,
+                ))
+            paste_list.sort(key=lambda x: -x[0])
+
+            total_pasted = 0
+            for _, target_idx, neighbor_latent in paste_list:
+                neighbor_hex = hex_masks_lat[target_idx + 1]
+                overlap = center_hex & neighbor_hex
+                if overlap.any():
                     neighbor_4d, _ = _normalize_latent(neighbor_latent)
-                    composited_4d[:, :, buf_mask] = neighbor_4d[:, :, buf_mask]
-                    total_buffer += buf_mask.sum().item()
-            # Exclude buffer from inpaint mask
-            buffer_combined = buffer_dir_masks.any(dim=0)
-            border_mask_lat = torch.where(
-                buffer_combined.unsqueeze(0),
-                torch.zeros_like(border_mask_lat),
-                border_mask_lat,
-            )
-            logger.info(f"[HexInpaint] Edge buffer: depth={edge_buffer_depth}, "
-                        f"pixels={total_buffer}")
+                    composited_4d[:, :, overlap] = neighbor_4d[:, :, overlap]
+                    total_pasted += overlap.sum().item()
+            if total_pasted:
+                logger.info(f"[HexInpaint] Priority paste: {total_pasted} edge pixels")
 
         t4 = time.time()
         logger.info(f"[HexInpaint] Latent masks ({W_lat}x{H_lat}): {t4-t3:.3f}s, "
@@ -613,10 +649,10 @@ class AdvancedTilingHexInpaint:
         self, settings, vae, center_image, center_latent, neighbor_latents,
         neighbor_images, border_width, feather_radius, feather_sides,
         mask_strength_min, mask_strength_max, corner_select, mask_extent,
-        edge_buffer_depth, enable_preview, kwargs,
+        enable_preview, kwargs,
     ):
         """CornerEdges mode: compose 3 tiles at a corner and generate edge masks."""
-        from .tile_priority import match_terrain_priority, TerrainPriorities
+        from .tile_priority import TerrainPriorities
 
         t_start = time.time()
         priorities = kwargs.get("priorities")
