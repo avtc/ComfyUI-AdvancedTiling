@@ -6,6 +6,8 @@ so boundary patches structurally "see" opposite-edge content as spatially adjace
 Analogous to how Conv2d circular padding works for UNet models.
 """
 
+import functools
+
 import torch
 
 from .modes import Settings
@@ -14,7 +16,11 @@ from .modes.rect import rect_tiling
 
 
 def _factorize(n: int) -> tuple[int, int]:
-    """Factorize n into h * w, preferring square."""
+    """Factorize n into h * w, preferring square.
+
+    For prime n, returns (1, n) — callers should assume latent sizes are
+    highly composite (powers of 2) in practice.
+    """
     s = int(n ** 0.5)
     while s > 0:
         if n % s == 0:
@@ -27,9 +33,8 @@ def _factorize(n: int) -> tuple[int, int]:
 # Hex toroidal attention
 # ---------------------------------------------------------------------------
 
-_boundary_cache: dict = {}
 
-
+@functools.lru_cache(maxsize=32)
 def _compute_hex_boundary_pairs(
     h_patches: int,
     w_patches: int,
@@ -42,17 +47,13 @@ def _compute_hex_boundary_pairs(
     the hex, record the boundary patch index, the wrapped source index,
     and the direction offset.
 
-    Cached by (h_patches, w_patches, hash(settings)).
+    Cached by (h_patches, w_patches, settings).
 
     :param h_patches: Number of patch rows
     :param w_patches: Number of patch columns
     :param settings: Tiling settings
     :return: (boundary_idx, source_idx, off_h, off_w) as LongTensors
     """
-    cache_key = (h_patches, w_patches, hash(settings))
-    if cache_key in _boundary_cache:
-        return _boundary_cache[cache_key]
-
     boundary_idx = []
     source_idx = []
     offsets_h = []
@@ -96,7 +97,6 @@ def _compute_hex_boundary_pairs(
             torch.tensor(offsets_w, dtype=torch.long),
         )
 
-    _boundary_cache[cache_key] = result
     return result
 
 
@@ -104,9 +104,8 @@ def _compute_hex_boundary_pairs(
 # Rectangular toroidal attention
 # ---------------------------------------------------------------------------
 
-_rect_boundary_cache: dict = {}
 
-
+@functools.lru_cache(maxsize=32)
 def _compute_rect_boundary_pairs(
     h_patches: int,
     w_patches: int,
@@ -116,12 +115,8 @@ def _compute_rect_boundary_pairs(
 
     Uses rect_tiling() for boundary detection, matching hex pattern.
 
-    Cached by (h_patches, w_patches, hash(settings)).
+    Cached by (h_patches, w_patches, settings).
     """
-    cache_key = (h_patches, w_patches, hash(settings))
-    if cache_key in _rect_boundary_cache:
-        return _rect_boundary_cache[cache_key]
-
     boundary_idx = []
     source_idx = []
     offsets_h = []
@@ -165,7 +160,6 @@ def _compute_rect_boundary_pairs(
             torch.tensor(offsets_w, dtype=torch.long),
         )
 
-    _rect_boundary_cache[cache_key] = result
     return result
 
 

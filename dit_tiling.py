@@ -18,7 +18,6 @@ For Rectangular mode:
 - VAE decoder crops output to the working rectangle
 """
 
-import math
 import torch
 import torch.nn as nn
 from torch.nn import Conv2d
@@ -31,111 +30,45 @@ def _has_conv2d(model: nn.Module) -> bool:
     return any(isinstance(m, Conv2d) for m in model.modules())
 
 
-def _create_content_wrapper(settings: Settings):
-    """
-    Create a model function wrapper that fills margin/waste positions with
-    content from opposite edges on each denoising step.
+def _apply_latent_wrapping(x: torch.Tensor, settings: Settings):
+    """Fill margin/waste positions with content from opposite edges.
 
-    Combined with toroidal attention, this provides seamless infinite tiling
-    by giving the model spatial context at the edges.
-
-    For Hexagon mode: fills waste positions (outside hex) with hex source content.
-    For Rectangular mode: fills margins with content from opposite edges of the
-    working rectangle (centered in the latent).
-
-    :param settings: Tiling settings
+    Relies on calculate_mapping's @functools.cache for memoization.
     """
     from .advanced_tiling import calculate_mapping
 
-    _mapping_cache = {}
+    is_5d = x.ndim == 5
+    if is_5d:
+        _, _, _, H, W = x.shape
+    else:
+        _, _, H, W = x.shape
 
+    mapping = calculate_mapping((W, H), (W, H), settings)
+
+    if is_5d:
+        x[:, :, :, mapping[1], mapping[0]] = x[:, :, :, mapping[3], mapping[2]]
+    else:
+        x[:, :, mapping[1], mapping[0]] = x[:, :, mapping[3], mapping[2]]
+
+
+def _create_content_wrapper(settings: Settings):
+    """Create a model function wrapper that applies latent wrapping each step."""
     def wrapper(apply_model, args):
-        x = args["input"]
-        is_5d = x.ndim == 5
-
-        if is_5d:
-            _, _, _, H, W = x.shape
-        else:
-            _, _, H, W = x.shape
-
-        if settings.mode == "Hexagon":
-            cache_key = (W, H, hash(settings))
-            if cache_key not in _mapping_cache:
-                _mapping_cache[cache_key] = calculate_mapping(
-                    (W, H), (W, H), settings
-                )
-            mapping = _mapping_cache[cache_key]
-
-            if is_5d:
-                x[:, :, :, mapping[1], mapping[0]] = x[:, :, :, mapping[3], mapping[2]]
-            else:
-                x[:, :, mapping[1], mapping[0]] = x[:, :, mapping[3], mapping[2]]
-        else:
-            cache_key = (W, H, hash(settings))
-            if cache_key not in _mapping_cache:
-                _mapping_cache[cache_key] = calculate_mapping(
-                    (W, H), (W, H), settings
-                )
-            mapping = _mapping_cache[cache_key]
-
-            if is_5d:
-                x[:, :, :, mapping[1], mapping[0]] = x[:, :, :, mapping[3], mapping[2]]
-            else:
-                x[:, :, mapping[1], mapping[0]] = x[:, :, mapping[3], mapping[2]]
-
+        _apply_latent_wrapping(args["input"], settings)
         return apply_model(args["input"], args["timestep"], **args["c"])
-
     return wrapper
 
 
-def _create_lumina_wrapper(settings: Settings = None, patch_size: int = 1):
-    """Model wrapper for Lumina: applies latent content wrapping on each
-    denoising step.
-
-    The wrapping provides seamless infinite tiling by filling margin/waste
-    positions with content from opposite edges, giving the model spatial
-    context at the boundaries.
+def _create_lumina_wrapper(settings: Settings = None):
+    """Model wrapper for Lumina: applies latent content wrapping on each step.
 
     :param settings: Tiling settings (None disables wrapping)
-    :param patch_size: Model patch size for aligning working area to patch boundaries
     """
-    from .advanced_tiling import calculate_mapping
-
     do_wrapping = settings is not None
-    _mapping_cache = {}
 
     def wrapper(apply_model, args):
         if do_wrapping:
-            x = args["input"]
-            is_5d = x.ndim == 5
-
-            if is_5d:
-                _, _, _, H, W = x.shape
-            else:
-                _, _, H, W = x.shape
-
-            if settings.mode == "Hexagon":
-                cache_key = (W, H, hash(settings))
-                if cache_key not in _mapping_cache:
-                    _mapping_cache[cache_key] = calculate_mapping(
-                        (W, H), (W, H), settings
-                    )
-                mapping = _mapping_cache[cache_key]
-            else:
-                cache_key = (W, H, hash(settings))
-                if cache_key not in _mapping_cache:
-                    _mapping_cache[cache_key] = calculate_mapping(
-                        (W, H), (W, H), settings
-                    )
-                mapping = _mapping_cache[cache_key]
-
-            if mapping is not None:
-                if is_5d:
-                    x[:, :, :, mapping[1], mapping[0]] = x[:, :, :, mapping[3], mapping[2]]
-                else:
-                    x[:, :, mapping[1], mapping[0]] = x[:, :, mapping[3], mapping[2]]
-
-
+            _apply_latent_wrapping(args["input"], settings)
         return apply_model(args["input"], args["timestep"], **args["c"])
 
     return wrapper
@@ -159,7 +92,7 @@ def _patch_lumina(model_patcher, diff_model, settings=None):
     patch_size = diff_model.patch_size
 
     # 1. Latent wrapping
-    wrapper = _create_lumina_wrapper(settings, patch_size=patch_size)
+    wrapper = _create_lumina_wrapper(settings)
     model_patcher.set_model_unet_function_wrapper(wrapper)
 
     if settings is not None:

@@ -255,6 +255,105 @@ def test_divisible_by_not_multiple_of_vae_factor():
     assert w % 1.5 == 0.0
 
 
+# --- Settings._resolve_auto tests ---
+
+
+def test_resolve_auto_scale_conv2d():
+    """scale=0.0 resolves to 1.0 for Conv2d models."""
+    s = Settings("Rectangular", 0.0, scale=0.0, min_margin=-1)
+    resolved = s._resolve_auto(is_conv2d=True)
+    assert resolved.scale == 1.0
+    assert resolved.min_margin == 0
+    # Original is unchanged
+    assert s.scale == 0.0
+
+
+def test_resolve_auto_scale_dit_rect():
+    """scale=0.0 resolves to 7/8 for DiT Rectangular."""
+    s = Settings("Rectangular", 0.0, scale=0.0, min_margin=-1)
+    resolved = s._resolve_auto(is_conv2d=False)
+    assert resolved.scale == 7 / 8
+    assert resolved.min_margin == 4
+
+
+def test_resolve_auto_scale_dit_hex():
+    """scale=0.0 resolves to 1.0 for DiT Hexagon."""
+    s = Settings("Hexagon", 0.0, scale=0.0, min_margin=-1)
+    resolved = s._resolve_auto(is_conv2d=False)
+    assert resolved.scale == 1.0
+    assert resolved.min_margin == 0
+
+
+def test_resolve_auto_no_mutation():
+    """_resolve_auto returns a new Settings, original is unchanged."""
+    s = Settings("Rectangular", 0.0, scale=0.0, min_margin=-1)
+    resolved = s._resolve_auto(is_conv2d=False)
+    assert s.scale == 0.0
+    assert s.min_margin == -1
+    assert resolved is not s
+
+
+def test_settings_eq():
+    """Settings with same values are equal."""
+    s1 = Settings("Rectangular", 0.0, scale=0.8, min_margin=4, divisible_by=64)
+    s2 = Settings("Rectangular", 0.0, scale=0.8, min_margin=4, divisible_by=64)
+    assert s1 == s2
+    assert hash(s1) == hash(s2)
+
+
+def test_settings_eq_different():
+    """Settings with different values are not equal."""
+    s1 = Settings("Rectangular", 0.0, scale=0.8, min_margin=4)
+    s2 = Settings("Rectangular", 0.0, scale=0.9, min_margin=4)
+    assert s1 != s2
+
+
+# --- None mode tests ---
+
+
+def test_none_calculate_mapping_empty():
+    """None mode produces empty mapping."""
+    s = Settings("None", 0.0, scale=1.0, min_margin=0, divisible_by=1)
+    src_x, src_y, new_x, new_y = at_mod.calculate_mapping((10, 10), (10, 10), s)
+    assert len(src_x) == 0
+
+
+def test_none_create_crop_mask_full():
+    """None mode mask covers all pixels."""
+    s = Settings("None", 0.0, scale=1.0, min_margin=0, divisible_by=1)
+    mask = at_mod.create_crop_mask(10, 10, s)
+    assert mask.shape == (1, 10, 10, 1)
+    assert mask.sum().item() == 100
+
+
+# --- Hex mode basic tests ---
+
+
+def test_hex_calculate_mapping_nonempty():
+    """Hex mode with scale < 1 produces non-empty mapping."""
+    s = Settings("Hexagon", 0.0, scale=0.8, min_margin=0, divisible_by=1)
+    src_x, src_y, new_x, new_y = at_mod.calculate_mapping((32, 32), (32, 32), s)
+    assert len(src_x) > 0
+
+
+def test_hex_create_crop_mask():
+    """Hex mode mask covers fewer pixels than total."""
+    s = Settings("Hexagon", 0.0, scale=0.8, min_margin=0, divisible_by=1)
+    mask = at_mod.create_crop_mask(32, 32, s)
+    assert mask.shape == (1, 32, 32, 1)
+    assert mask.sum().item() < 32 * 32
+    assert mask.sum().item() > 0
+
+
+def test_hex_crop_mask_with_margin():
+    """Hex mode with min_margin reduces mask area further."""
+    s1 = Settings("Hexagon", 0.0, scale=0.8, min_margin=0, divisible_by=1)
+    s2 = Settings("Hexagon", 0.0, scale=0.8, min_margin=2, divisible_by=1)
+    mask1 = at_mod.create_crop_mask(32, 32, s1)
+    mask2 = at_mod.create_crop_mask(32, 32, s2)
+    assert mask2.sum().item() < mask1.sum().item()
+
+
 if __name__ == "__main__":
     import sys
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

@@ -10,7 +10,7 @@ from torch import Tensor
 from torch.nn import Conv2d
 from torch.nn import functional as F
 from torch.nn.modules.utils import _pair
-from .modes import modes, Settings
+from .modes import MODE_NAMES, Settings
 from .dit_tiling import patch_dit_model, _has_conv2d, _create_content_wrapper
 
 
@@ -254,7 +254,7 @@ class AdvancedTilingSettings:
 
         return {
             "required": {
-                "mode": (list(modes.keys()), {
+                "mode": (MODE_NAMES, {
                     "tooltip": "Tiling mode. 'None' disables tiling, 'Hexagon' wraps edges in a hexagonal pattern, 'Rectangular' wraps right→left and bottom→top.",
                 }),
                 "rotation": (
@@ -334,27 +334,14 @@ class AdvancedTiling:
         Does the actual patching of the model
         """
 
-        import math
-
         model_copy = model.clone()
 
-        # Resolve auto-scale (0.0): Conv2d=1.0, DiT Rectangular=0.875, DiT Hexagon=1.0
-        if settings.scale == 0.0:
-            is_conv2d = _has_conv2d(model_copy.model.diffusion_model)
-            if is_conv2d or settings.mode == "Hexagon":
-                settings.scale = 1.0
-            else:
-                settings.scale = 7 / 8  # 0.875
+        is_conv2d = _has_conv2d(model_copy.model.diffusion_model)
 
-        # Resolve auto min_margin (-1): 4 for DiT Rectangular, 0 otherwise
-        if settings.min_margin == -1:
-            is_conv2d = _has_conv2d(model_copy.model.diffusion_model)
-            if not is_conv2d and settings.mode == "Rectangular":
-                settings.min_margin = 4
-            else:
-                settings.min_margin = 0
+        # Resolve auto-sentinel values into a new Settings (no in-place mutation)
+        settings = settings._resolve_auto(is_conv2d)
 
-        if _has_conv2d(model_copy.model.diffusion_model):
+        if is_conv2d:
             patch_model(model_copy.model, settings)
 
             if settings.mode == "Rectangular" and (settings.scale < 1.0 or settings.min_margin > 0):
@@ -417,6 +404,8 @@ class AdvancedTilingVAEDecode:
         try:
             result = self._decode_and_crop(settings, samples, vae, crop)
         finally:
+            # Restore original state — patch_model added tiling_settings to
+            # every Conv2d layer, so deleting it is always safe here.
             for layer, orig_forward, _ in saved:
                 layer._conv_forward = orig_forward
                 if hasattr(layer, 'tiling_settings'):
@@ -454,8 +443,8 @@ class AdvancedTilingVAEDecode:
                 sq_cmin = max(0, center_c - half)
                 sq_rmax = min(img_h, sq_rmin + hex_h) - 1
                 sq_cmax = min(img_w, sq_cmin + hex_h) - 1
-                sq_rmin = sq_rmax + 1 - hex_h
-                sq_cmin = sq_cmax + 1 - hex_h
+                sq_rmin = max(0, sq_rmax + 1 - hex_h)
+                sq_cmin = max(0, sq_cmax + 1 - hex_h)
 
                 image = _crop_with_mask(image, mask, sq_rmin, sq_rmax, sq_cmin, sq_cmax)
 

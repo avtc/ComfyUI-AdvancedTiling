@@ -41,16 +41,8 @@ if HAS_RAYLIGHT:
         CATEGORY = "conditioning"
 
         def run(self, settings, ray_actors):
-            import math
-
-            # Resolve auto-scale (0.0) — Raylight only supports DiT models,
-            # so no Conv2d check needed: Hexagon → 1.0, Rectangular → 0.875.
-            if settings.scale == 0.0:
-                settings.scale = 1.0 if settings.mode == "Hexagon" else 7 / 8
-
-            # Resolve auto min_margin (-1): 4 for Rectangular, 0 for Hexagon
-            if settings.min_margin == -1:
-                settings.min_margin = 4 if settings.mode == "Rectangular" else 0
+            # Raylight only supports DiT models (is_conv2d=False)
+            settings = settings._resolve_auto(is_conv2d=False)
 
             # Defined inside run() so cloudpickle serializes it as a nested
             # function (by value) instead of by module reference.  Module-level
