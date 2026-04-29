@@ -73,17 +73,17 @@ def _compute_working_size(W, H, settings, patch_size=1):
         work_h = h_patches - 2 * margin_h
         work_w = w_patches - 2 * margin_w
 
+        if work_h < 1 or work_w < 1:
+            return W, H, 0, 0
+
         # Round down to alignment
         patch_align = max(latent_align // patch_size, 1)
-        work_h = max(patch_align, (work_h // patch_align) * patch_align)
-        work_w = max(patch_align, (work_w // patch_align) * patch_align)
+        work_h = (work_h // patch_align) * patch_align
+        work_w = (work_w // patch_align) * patch_align
 
         # Recompute margin from rounded work
         margin_h = (h_patches - work_h) // 2
         margin_w = (w_patches - work_w) // 2
-
-        if work_h < 1 or work_w < 1:
-            return W, H, 0, 0
 
         return (work_w * patch_size, work_h * patch_size,
                 margin_w * patch_size, margin_h * patch_size)
@@ -102,16 +102,16 @@ def _compute_working_size(W, H, settings, patch_size=1):
     work_W = W - 2 * margin_W
     work_H = H - 2 * margin_H
 
+    if work_W < 1 or work_H < 1:
+        return W, H, 0, 0
+
     # Round down to alignment
-    work_W = max(latent_align, (work_W // latent_align) * latent_align)
-    work_H = max(latent_align, (work_H // latent_align) * latent_align)
+    work_W = (work_W // latent_align) * latent_align
+    work_H = (work_H // latent_align) * latent_align
 
     # Recompute margin from rounded work
     margin_W = (W - work_W) // 2
     margin_H = (H - work_H) // 2
-
-    if work_W < 1 or work_H < 1:
-        return W, H, 0, 0
 
     return work_W, work_H, margin_W, margin_H
 
@@ -309,6 +309,7 @@ def patch_dit_model(model_patcher, settings: Settings):
                 diff_model.pe_embedder, scale=settings.scale,
                 min_margin=getattr(settings, 'min_margin', 0),
                 divisible_by=getattr(settings, 'divisible_by', 16),
+                patch_size=getattr(diff_model, 'patch_size', 1),
             )
             model_patcher.set_model_attn1_patch(patch)
 
