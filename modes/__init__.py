@@ -12,7 +12,7 @@ class Settings:
     For representing tiling settings
     """
 
-    def __init__(self, mode, rotation, scale=1.0, min_margin=0, divisible_by=16):
+    def __init__(self, mode, rotation, scale=1.0, min_margin=0, divisible_by=1):
         self.mode = mode
         self.tiling_fn = modes[mode]
         self.rotation = rotation

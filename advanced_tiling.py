@@ -66,22 +66,33 @@ def calculate_mapping(
     ow, oh = original_size
 
     if settings.mode == "Rectangular":
-        pad_x = (pw - ow) // 2
-        pad_y = (ph - oh) // 2
-        xs = torch.arange(pw)
-        ys = torch.arange(ph)
+        from .modes.rect import compute_float_rect_dims
+        work_w, work_h = compute_float_rect_dims(ow, oh, settings)
+        cx, cy = pw / 2.0, ph / 2.0
+
+        xs = torch.arange(pw, dtype=torch.float64)
+        ys = torch.arange(ph, dtype=torch.float64)
         grid_x, grid_y = torch.meshgrid(xs, ys, indexing='xy')
-        src_x = grid_x.flatten()
-        src_y = grid_y.flatten()
-        new_x = (src_x - pad_x) % ow + pad_x
-        new_y = (src_y - pad_y) % oh + pad_y
-        # Only keep pixels that actually change position
+
+        rel_x = grid_x - cx
+        rel_y = grid_y - cy
+
+        new_x = cx + torch.fmod(torch.fmod(rel_x + work_w / 2, work_w) + work_w, work_w) - work_w / 2
+        new_y = cy + torch.fmod(torch.fmod(rel_y + work_h / 2, work_h) + work_h, work_h) - work_h / 2
+
+        new_x = new_x.round().to(torch.long)
+        new_y = new_y.round().to(torch.long)
+        src_x = grid_x.flatten().to(torch.long)
+        src_y = grid_y.flatten().to(torch.long)
+        new_x = new_x.flatten()
+        new_y = new_y.flatten()
+
         non_id = (src_x != new_x) | (src_y != new_y)
         result = (src_x[non_id], src_y[non_id], new_x[non_id], new_y[non_id])
 
     elif settings.mode == "Hexagon":
         import numpy as np
-        min_margin = getattr(settings, 'min_margin', 0)
+        min_margin = settings.min_margin
         size = max(1, round(min(ow, oh) // 2 * settings.scale) - min_margin)
         cx = np.arange(pw, dtype=np.float64) - pw // 2
         cy = np.arange(ph, dtype=np.float64) - ph // 2
@@ -115,7 +126,7 @@ def create_crop_mask(width: int, height: int, settings: Settings):
 
     if settings.mode == "Hexagon":
         import numpy as np
-        min_margin = getattr(settings, 'min_margin', 0)
+        min_margin = settings.min_margin
         size = max(1, round(min(width, height) // 2 * settings.scale) - min_margin)
         cx = np.arange(width, dtype=np.float64) - width // 2
         cy = np.arange(height, dtype=np.float64) - height // 2
@@ -127,8 +138,22 @@ def create_crop_mask(width: int, height: int, settings: Settings):
         is_identity = torch.from_numpy(((new_x == src_x) & (new_y == src_y)).reshape(height, width))
         mask = torch.zeros((1, height, width, 1), dtype=torch.float32)
         mask[0, :, :, 0] = is_identity.float()
+    elif settings.mode == "Rectangular":
+        from .modes.rect import compute_float_rect_dims
+        work_w, work_h = compute_float_rect_dims(width, height, settings)
+        cx, cy = width / 2.0, height / 2.0
+
+        xs = torch.arange(width, dtype=torch.float64)
+        ys = torch.arange(height, dtype=torch.float64)
+        grid_x, grid_y = torch.meshgrid(xs, ys, indexing='xy')
+
+        inside_x = (grid_x >= cx - work_w / 2) & (grid_x < cx + work_w / 2)
+        inside_y = (grid_y >= cy - work_h / 2) & (grid_y < cy + work_h / 2)
+        is_identity = inside_x & inside_y
+
+        mask = torch.zeros((1, height, width, 1), dtype=torch.float32)
+        mask[0, :, :, 0] = is_identity.float()
     else:
-        # Rectangular/None: all pixels are in the mask
         mask = torch.ones((1, height, width, 1), dtype=torch.float32)
 
     return mask
@@ -223,8 +248,8 @@ class AdvancedTilingSettings:
                 "divisible_by": (
                     "INT",
                     {
-                        "default": 16, "min": 1, "max": 256, "step": 1,
-                        "tooltip": "Round working area dimensions to multiples of this value in pixels. Only applies when margin exists (scale < 1.0 or min_margin > 0). Affects final output size when crop is enabled. 1 = no rounding, 16 = ensures symmetric margins.",
+                        "default": 1, "min": 1, "max": 256, "step": 1,
+                        "tooltip": "Round output image to multiples of this value in pixels. Only applies to Rectangular mode when crop is enabled. 1 = no rounding.",
                     },
                 ),
             },
@@ -342,9 +367,8 @@ class AdvancedTilingVAEDecode:
         Optionally crop the image based on tiling settings
 
         For Hexagon mode: applies alpha mask for hex-shaped cropping.
-        For Rectangular mode with scale < 1.0: crops the latent to the centered
-        working rectangle before VAE decoding, so the VAE's Conv2d wrapping
-        operates at the working rectangle boundary.
+        For Rectangular mode with scale < 1.0 or margin: decodes full latent
+        then crops using mask-based post-decode crop.
         """
 
         # Patch VAE in-place instead of deepcopy (avoids copying ~167MB of weights).
@@ -371,36 +395,15 @@ class AdvancedTilingVAEDecode:
 
     def _decode_and_crop(self, settings, samples, vae, crop):
         latent = samples["samples"]
-        is_5d = latent.ndim == 5
 
-        if is_5d:
-            _, _, _, H_lat, W_lat = latent.shape
-        else:
-            _, _, H_lat, W_lat = latent.shape
-
-        # For rectangular mode with margin, crop latent to working rectangle
-        # before VAE decoding so Conv2d wrapping operates at working rect boundary.
-        # Use patch-aligned dimensions for consistency with the model wrapper.
-        if crop and settings.mode == "Rectangular" and (settings.scale < 1.0 or settings.min_margin > 0):
-            from .dit_tiling import _compute_working_size
-            patch_size = getattr(settings, '_patch_size', 1)
-            work_W, work_H, margin_W, margin_H = _compute_working_size(
-                W_lat, H_lat, settings, patch_size=patch_size,
-            )
-            if is_5d:
-                latent = latent[:, :, :, margin_H:margin_H + work_H, margin_W:margin_W + work_W]
-            else:
-                latent = latent[:, :, margin_H:margin_H + work_H, margin_W:margin_W + work_W]
-
-        # Decode latents to image
+        # Decode full latent — crop after decode using mask
         image = vae.decode(latent)
 
-        # WanVAE returns 5D (B, T, H, W, C), standard VAE returns 4D (B, H, W, C)
         if image.ndim == 5:
             image = image.squeeze(1)
 
         if crop:
-            if settings.mode == "Hexagon":
+            if settings.mode == "Rectangular" and (settings.scale < 1.0 or settings.min_margin > 0):
                 img_h, img_w = image.shape[1], image.shape[2]
                 mask = create_crop_mask(img_w, img_h, settings)
                 mask_2d = mask[0, :, :, 0]
@@ -411,7 +414,21 @@ class AdvancedTilingVAEDecode:
                 rmin, rmax = row_indices[0].item(), row_indices[-1].item()
                 cmin, cmax = col_indices[0].item(), col_indices[-1].item()
 
-                # Crop to square based on hex height, centered on hex center
+                image = image[:, rmin:rmax + 1, cmin:cmax + 1, :]
+                cropped_mask = mask[:, rmin:rmax + 1, cmin:cmax + 1, :]
+                image = torch.cat((image, cropped_mask.to(device=image.device)), dim=3)
+
+            elif settings.mode == "Hexagon":
+                img_h, img_w = image.shape[1], image.shape[2]
+                mask = create_crop_mask(img_w, img_h, settings)
+                mask_2d = mask[0, :, :, 0]
+                rows = torch.any(mask_2d, dim=1)
+                cols = torch.any(mask_2d, dim=0)
+                row_indices = torch.where(rows)[0]
+                col_indices = torch.where(cols)[0]
+                rmin, rmax = row_indices[0].item(), row_indices[-1].item()
+                cmin, cmax = col_indices[0].item(), col_indices[-1].item()
+
                 hex_h = rmax - rmin + 1
                 center_r = (rmin + rmax) // 2
                 center_c = (cmin + cmax) // 2

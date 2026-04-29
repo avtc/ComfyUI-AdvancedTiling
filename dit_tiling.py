@@ -31,91 +31,6 @@ def _has_conv2d(model: nn.Module) -> bool:
     return any(isinstance(m, Conv2d) for m in model.modules())
 
 
-def _compute_working_size(W, H, settings, patch_size=1):
-    """Compute working area dimensions from scale + min_margin, centered in the latent.
-
-    When patch_size > 1, computes at the patch level and converts to pixel
-    coordinates, ensuring alignment with patch boundaries. This prevents
-    misalignment between pixel-level latent wrapping and patch-level operations
-    (waste token reset, attention).
-
-    :param W: Latent width in pixels
-    :param H: Latent height in pixels
-    :param settings: Tiling settings with scale, min_margin, and divisible_by
-    :param patch_size: Model patch size (1 = no alignment, for UNet/Conv2d)
-    :return: (work_W, work_H, margin_W, margin_H) in pixel coordinates
-    """
-    scale = settings.scale
-    min_margin = getattr(settings, 'min_margin', 0)
-    divisible_by = getattr(settings, 'divisible_by', 16)
-
-    if scale >= 1.0 and min_margin == 0:
-        return W, H, 0, 0
-
-    # Convert image-pixel alignment to latent-pixel alignment (assume 8x VAE)
-    latent_align = max(1, divisible_by // 8)
-
-    if patch_size > 1:
-        h_patches = H // patch_size
-        w_patches = W // patch_size
-
-        if scale < 1.0:
-            scale_work_h = max(1, round(h_patches * scale))
-            scale_work_w = max(1, round(w_patches * scale))
-            scale_margin_h = (h_patches - scale_work_h) // 2
-            scale_margin_w = (w_patches - scale_work_w) // 2
-        else:
-            scale_margin_h = 0
-            scale_margin_w = 0
-
-        margin_h = max(scale_margin_h, min_margin)
-        margin_w = max(scale_margin_w, min_margin)
-        work_h = h_patches - 2 * margin_h
-        work_w = w_patches - 2 * margin_w
-
-        if work_h < 1 or work_w < 1:
-            return W, H, 0, 0
-
-        # Round down to alignment
-        patch_align = max(latent_align // patch_size, 1)
-        work_h = (work_h // patch_align) * patch_align
-        work_w = (work_w // patch_align) * patch_align
-
-        # Recompute margin from rounded work
-        margin_h = (h_patches - work_h) // 2
-        margin_w = (w_patches - work_w) // 2
-
-        return (work_w * patch_size, work_h * patch_size,
-                margin_w * patch_size, margin_h * patch_size)
-
-    if scale < 1.0:
-        scale_work_W = max(1, round(W * scale))
-        scale_work_H = max(1, round(H * scale))
-        scale_margin_W = (W - scale_work_W) // 2
-        scale_margin_H = (H - scale_work_H) // 2
-    else:
-        scale_margin_W = 0
-        scale_margin_H = 0
-
-    margin_W = max(scale_margin_W, min_margin)
-    margin_H = max(scale_margin_H, min_margin)
-    work_W = W - 2 * margin_W
-    work_H = H - 2 * margin_H
-
-    if work_W < 1 or work_H < 1:
-        return W, H, 0, 0
-
-    # Round down to alignment
-    work_W = (work_W // latent_align) * latent_align
-    work_H = (work_H // latent_align) * latent_align
-
-    # Recompute margin from rounded work
-    margin_W = (W - work_W) // 2
-    margin_H = (H - work_H) // 2
-
-    return work_W, work_H, margin_W, margin_H
-
-
 def _create_content_wrapper(settings: Settings):
     """
     Create a model function wrapper that fills margin/waste positions with
@@ -156,19 +71,17 @@ def _create_content_wrapper(settings: Settings):
             else:
                 x[:, :, mapping[1], mapping[0]] = x[:, :, mapping[3], mapping[2]]
         else:
-            work_W, work_H, margin_W, margin_H = _compute_working_size(W, H, settings)
-            if margin_W > 0 or margin_H > 0:
-                cache_key = (W, H, settings.scale, getattr(settings, 'min_margin', 0), getattr(settings, 'divisible_by', 16))
-                if cache_key not in _mapping_cache:
-                    _mapping_cache[cache_key] = calculate_mapping(
-                        (work_W, work_H), (W, H), settings
-                    )
-                mapping = _mapping_cache[cache_key]
+            cache_key = (W, H, hash(settings))
+            if cache_key not in _mapping_cache:
+                _mapping_cache[cache_key] = calculate_mapping(
+                    (W, H), (W, H), settings
+                )
+            mapping = _mapping_cache[cache_key]
 
-                if is_5d:
-                    x[:, :, :, mapping[1], mapping[0]] = x[:, :, :, mapping[3], mapping[2]]
-                else:
-                    x[:, :, mapping[1], mapping[0]] = x[:, :, mapping[3], mapping[2]]
+            if is_5d:
+                x[:, :, :, mapping[1], mapping[0]] = x[:, :, :, mapping[3], mapping[2]]
+            else:
+                x[:, :, mapping[1], mapping[0]] = x[:, :, mapping[3], mapping[2]]
 
         return apply_model(args["input"], args["timestep"], **args["c"])
 
@@ -209,18 +122,12 @@ def _create_lumina_wrapper(settings: Settings = None, patch_size: int = 1):
                     )
                 mapping = _mapping_cache[cache_key]
             else:
-                work_W, work_H, margin_W, margin_H = _compute_working_size(
-                    W, H, settings, patch_size=patch_size,
-                )
-                if margin_W > 0 or margin_H > 0:
-                    cache_key = (W, H, work_W, work_H)
-                    if cache_key not in _mapping_cache:
-                        _mapping_cache[cache_key] = calculate_mapping(
-                            (work_W, work_H), (W, H), settings
-                        )
-                    mapping = _mapping_cache[cache_key]
-                else:
-                    mapping = None
+                cache_key = (W, H, hash(settings))
+                if cache_key not in _mapping_cache:
+                    _mapping_cache[cache_key] = calculate_mapping(
+                        (W, H), (W, H), settings
+                    )
+                mapping = _mapping_cache[cache_key]
 
             if mapping is not None:
                 if is_5d:
@@ -286,7 +193,8 @@ def patch_dit_model(model_patcher, settings: Settings):
         elif hasattr(diff_model, 'pe_embedder'):
             from .toroidal_attention import HexToroidalAttentionPatch
 
-            patch = HexToroidalAttentionPatch(settings, diff_model.pe_embedder)
+            patch = HexToroidalAttentionPatch(settings, diff_model.pe_embedder,
+                                               patch_size=getattr(diff_model, 'patch_size', 1))
             model_patcher.set_model_attn1_patch(patch)
 
             wrapper = _create_content_wrapper(settings)
@@ -306,9 +214,7 @@ def patch_dit_model(model_patcher, settings: Settings):
             from .toroidal_attention import RectToroidalAttentionPatch
 
             patch = RectToroidalAttentionPatch(
-                diff_model.pe_embedder, scale=settings.scale,
-                min_margin=getattr(settings, 'min_margin', 0),
-                divisible_by=getattr(settings, 'divisible_by', 16),
+                settings, diff_model.pe_embedder,
                 patch_size=getattr(diff_model, 'patch_size', 1),
             )
             model_patcher.set_model_attn1_patch(patch)

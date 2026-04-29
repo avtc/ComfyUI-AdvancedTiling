@@ -10,6 +10,7 @@ import torch
 
 from .modes import Settings
 from .modes.hex import hex_tiling
+from .modes.rect import rect_tiling
 
 
 def _factorize(n: int) -> tuple[int, int]:
@@ -109,47 +110,47 @@ _rect_boundary_cache: dict = {}
 def _compute_rect_boundary_pairs(
     h_patches: int,
     w_patches: int,
-    margin_h: int = 0,
-    margin_w: int = 0,
+    settings: Settings,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute rectangular boundary pairs using float-point rect dims.
+
+    Uses rect_tiling() for boundary detection, matching hex pattern.
+
+    Cached by (h_patches, w_patches, hash(settings)).
     """
-    Compute rectangular boundary pairs for toroidal wrapping.
-
-    For each patch on the edge of the working rectangle (inside the margins),
-    records the boundary patch index, the wrapped source index from the
-    opposite edge of the working rectangle, and the direction offset.
-
-    Cached by (h_patches, w_patches, margin_h, margin_w).
-
-    :param h_patches: Number of patch rows (full grid)
-    :param w_patches: Number of patch columns (full grid)
-    :param margin_h: Margin rows on each side
-    :param margin_w: Margin columns on each side
-    :return: (boundary_idx, source_idx, off_h, off_w) as LongTensors
-    """
-    cache_key = (h_patches, w_patches, margin_h, margin_w)
+    cache_key = (h_patches, w_patches, hash(settings))
     if cache_key in _rect_boundary_cache:
         return _rect_boundary_cache[cache_key]
-
-    work_h = h_patches - 2 * margin_h
-    work_w = w_patches - 2 * margin_w
 
     boundary_idx = []
     source_idx = []
     offsets_h = []
     offsets_w = []
 
-    for h in range(margin_h, margin_h + work_h):
-        for w in range(margin_w, margin_w + work_w):
+    for h in range(h_patches):
+        for w in range(w_patches):
+            src_w, src_h = rect_tiling(
+                w, h,
+                (w_patches, h_patches),
+                (w_patches, h_patches),
+                settings,
+            )
+            if src_w != w or src_h != h:
+                continue
+
             for dh, dw in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
                 nh, nw = h + dh, w + dw
 
-                if nh < margin_h or nh >= margin_h + work_h or nw < margin_w or nw >= margin_w + work_w:
-                    wrapped_h = margin_h + (nh - margin_h) % work_h
-                    wrapped_w = margin_w + (nw - margin_w) % work_w
+                n_src_w, n_src_h = rect_tiling(
+                    nw, nh,
+                    (w_patches, h_patches),
+                    (w_patches, h_patches),
+                    settings,
+                )
 
+                if n_src_w != nw or n_src_h != nh:
                     boundary_idx.append(h * w_patches + w)
-                    source_idx.append(wrapped_h * w_patches + wrapped_w)
+                    source_idx.append(n_src_h * w_patches + n_src_w)
                     offsets_h.append(dh)
                     offsets_w.append(dw)
 
@@ -175,11 +176,10 @@ def _compute_rect_boundary_pairs(
 class _BaseToroidalAttentionPatch:
     """Shared logic for hex and rectangular toroidal attention patches."""
 
-    def __init__(self, pe_embedder, scale=1.0, min_margin=0, divisible_by=16, patch_size=1):
+    def __init__(self, pe_embedder, scale=1.0, min_margin=0, patch_size=1):
         self.pe_embedder = pe_embedder
         self.scale = scale
         self.min_margin = min_margin
-        self.divisible_by = divisible_by
         self.patch_size = patch_size
         self._initialized = False
         self._boundary_idx = None
@@ -190,42 +190,11 @@ class _BaseToroidalAttentionPatch:
     def _compute_boundary_pairs(self, h_patches, w_patches, margin_h=0, margin_w=0):
         raise NotImplementedError
 
-    @staticmethod
-    def _compute_margins(h_patches, w_patches, scale, min_margin=0, patch_align=1):
-        if scale >= 1.0 and min_margin == 0:
-            return 0, 0
-        if scale < 1.0:
-            work_h = max(1, round(h_patches * scale))
-            work_w = max(1, round(w_patches * scale))
-            scale_margin_h = (h_patches - work_h) // 2
-            scale_margin_w = (w_patches - work_w) // 2
-        else:
-            scale_margin_h = 0
-            scale_margin_w = 0
-        margin_h = max(scale_margin_h, min_margin)
-        margin_w = max(scale_margin_w, min_margin)
-        work_h = h_patches - 2 * margin_h
-        work_w = w_patches - 2 * margin_w
-        if work_h < 1 or work_w < 1:
-            return 0, 0
-        # Round down to alignment
-        if patch_align > 1:
-            work_h = (work_h // patch_align) * patch_align
-            work_w = (work_w // patch_align) * patch_align
-            margin_h = (h_patches - work_h) // 2
-            margin_w = (w_patches - work_w) // 2
-        return margin_h, margin_w
-
     def _initialize(self, n_img: int):
         h_patches, w_patches = _factorize(n_img)
-        latent_align = max(1, self.divisible_by // 8)
-        patch_align = max(1, latent_align // self.patch_size)
-        margin_h, margin_w = self._compute_margins(
-            h_patches, w_patches, self.scale, self.min_margin, patch_align,
-        )
 
         boundary_idx, source_idx, off_h, off_w = self._compute_boundary_pairs(
-            h_patches, w_patches, margin_h, margin_w,
+            h_patches, w_patches,
         )
 
         self._boundary_idx = boundary_idx
@@ -295,8 +264,10 @@ class _BaseToroidalAttentionPatch:
 class HexToroidalAttentionPatch(_BaseToroidalAttentionPatch):
     """attn1_patch for hex tiling: injects wrapped K/V for hex boundary patches."""
 
-    def __init__(self, settings: Settings, pe_embedder):
-        super().__init__(pe_embedder, scale=settings.scale)
+    def __init__(self, settings: Settings, pe_embedder, patch_size=1):
+        super().__init__(pe_embedder, scale=settings.scale,
+                         min_margin=settings.min_margin,
+                         patch_size=patch_size)
         self.settings = settings
 
     def _compute_boundary_pairs(self, h_patches, w_patches, margin_h=0, margin_w=0):
@@ -306,11 +277,14 @@ class HexToroidalAttentionPatch(_BaseToroidalAttentionPatch):
 class RectToroidalAttentionPatch(_BaseToroidalAttentionPatch):
     """attn1_patch for rectangular tiling: injects wrapped K/V from opposite edges."""
 
-    def __init__(self, pe_embedder, scale=1.0, min_margin=0, divisible_by=16, patch_size=1):
-        super().__init__(pe_embedder, scale=scale, min_margin=min_margin, divisible_by=divisible_by, patch_size=patch_size)
+    def __init__(self, settings: Settings, pe_embedder, patch_size=1):
+        super().__init__(pe_embedder, scale=settings.scale,
+                         min_margin=settings.min_margin,
+                         patch_size=patch_size)
+        self.settings = settings
 
     def _compute_boundary_pairs(self, h_patches, w_patches, margin_h=0, margin_w=0):
-        return _compute_rect_boundary_pairs(h_patches, w_patches, margin_h, margin_w)
+        return _compute_rect_boundary_pairs(h_patches, w_patches, self.settings)
 
 
 # ---------------------------------------------------------------------------
@@ -356,46 +330,16 @@ class LuminaWastePatch:
                         waste_indices.append(h * w_patches + w)
                         waste_source_indices.append(src_h * w_patches + src_w)
         else:  # Rectangular
-            scale = self.settings.scale
-            min_margin = getattr(self.settings, 'min_margin', 0)
-            divisible_by = getattr(self.settings, 'divisible_by', 16)
-            latent_align = max(1, divisible_by // 8)
-            patch_align = max(1, latent_align // self.patch_size)
-            if scale >= 1.0 and min_margin == 0:
-                work_h, work_w = h_patches, w_patches
-                margin_h, margin_w = 0, 0
-            else:
-                if scale < 1.0:
-                    scale_work_h = max(1, round(h_patches * scale))
-                    scale_work_w = max(1, round(w_patches * scale))
-                    scale_margin_h = (h_patches - scale_work_h) // 2
-                    scale_margin_w = (w_patches - scale_work_w) // 2
-                else:
-                    scale_margin_h = 0
-                    scale_margin_w = 0
-                margin_h = max(scale_margin_h, min_margin)
-                margin_w = max(scale_margin_w, min_margin)
-                work_h = h_patches - 2 * margin_h
-                work_w = w_patches - 2 * margin_w
-                if work_h < 1 or work_w < 1:
-                    work_h, work_w = h_patches, w_patches
-                    margin_h, margin_w = 0, 0
-                elif patch_align > 1:
-                    work_h = (work_h // patch_align) * patch_align
-                    work_w = (work_w // patch_align) * patch_align
-                    margin_h = (h_patches - work_h) // 2
-                    margin_w = (w_patches - work_w) // 2
-
             for h in range(h_patches):
                 for w in range(w_patches):
-                    is_margin = (
-                        h < margin_h or h >= margin_h + work_h
-                        or w < margin_w or w >= margin_w + work_w
+                    src_w, src_h = rect_tiling(
+                        w, h,
+                        (w_patches, h_patches),
+                        (w_patches, h_patches),
+                        self.settings,
                     )
-                    if is_margin:
+                    if src_w != w or src_h != h:
                         waste_indices.append(h * w_patches + w)
-                        src_h = margin_h + (h - margin_h) % work_h
-                        src_w = margin_w + (w - margin_w) % work_w
                         waste_source_indices.append(src_h * w_patches + src_w)
 
         if waste_indices:

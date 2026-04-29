@@ -170,7 +170,7 @@ def hex_tiling(
     # Hexagon size - it needs to fit in the image
     # Scale < 1.0 shrinks the hex, creating more waste area for better wrapping
     # min_margin further reduces the hex radius by a fixed amount
-    min_margin = getattr(settings, 'min_margin', 0)
+    min_margin = settings.min_margin
     size = max(1, round(min(original_size[0], original_size[1]) // 2 * settings.scale) - min_margin)
     # Shift the origin to the center of the image and convert to fractional hexagon coordinates
     q, r = pixel_to_hex(
@@ -216,7 +216,7 @@ def hex_patch_tiling(
     :param settings: Tiling settings
     :return: (source_h, source_w) in the original patch grid
     """
-    min_margin = getattr(settings, 'min_margin', 0)
+    min_margin = settings.min_margin
     size = max(1, round(min(original_h_patches, original_w_patches) // 2 * settings.scale) - min_margin)
     q, r = pixel_to_hex(
         (patch_w - padded_w_patches // 2, patch_h - padded_h_patches // 2),
