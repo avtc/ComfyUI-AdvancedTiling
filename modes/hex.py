@@ -170,8 +170,9 @@ def hex_tiling(
     # Hexagon size - it needs to fit in the image
     # Scale < 1.0 shrinks the hex, creating more waste area for better wrapping
     # min_margin further reduces the hex radius by a fixed amount
+    # Float arithmetic ensures proportional sizing across all resolutions (latent, VAE internal, image)
     min_margin = settings.min_margin
-    size = max(1, round(min(original_size[0], original_size[1]) // 2 * settings.scale) - min_margin)
+    size = max(1.0, min(original_size[0], original_size[1]) / 2 * settings.scale - min_margin)
     # Shift the origin to the center of the image and convert to fractional hexagon coordinates
     q, r = pixel_to_hex(
         (x - padded_size[0] // 2, y - padded_size[1] // 2),
