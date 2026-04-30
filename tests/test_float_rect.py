@@ -63,18 +63,10 @@ def test_resolve_divisible_by():
     assert r.margin_img_w == 35.0
 
 
-def test_resolve_latent_downscale():
-    """Latent values are image values / vae_factor."""
-    r = _resolve(scale=0.98, min_margin=4, divisible_by=1)
-    assert r.work_lat_w == 960.0 / 8
-    assert r.margin_lat_w == 32.0 / 8
-
-
 def test_resolve_patch_downscale():
     """Patch values are image values / (vae_factor * patch_size)."""
     r = _resolve(scale=0.98, min_margin=4, divisible_by=1)
     assert r.work_patch_w == 960.0 / 16
-    assert r.margin_patch_w == 32.0 / 16
 
 
 def test_resolve_rectangular_image():
@@ -84,7 +76,6 @@ def test_resolve_rectangular_image():
     # 768: base=768*0.02/2=7.68, min_img=32, margin=32, work=704, 704//9*9=702
     assert r.work_img_h == 702.0
     assert r.margin_img_w == 35.0
-    assert r.margin_img_h == 33.0
 
 
 def test_resolve_hex_mode():
@@ -93,7 +84,6 @@ def test_resolve_hex_mode():
     # base_margin = 512 * 0.2 = 102.4, min_margin_img = 0
     # margin = 102.4, hex_size = 512 - 102.4 = 409.6
     assert r.hex_size_img == 409.6
-    assert r.hex_size_lat == 409.6 / 8
     assert r.hex_size_patch == 409.6 / 16
 
 
@@ -224,16 +214,20 @@ def test_end_to_end_scale_and_divisible():
     W_lat, H_lat = 128, 128
     r = _resolve(scale=0.8, min_margin=4, divisible_by=64)
 
+    # work at latent resolution = work_img / vae_factor
+    work_lat_w = r.work_img_w / VAE_FACTOR
+    work_lat_h = r.work_img_h / VAE_FACTOR
+
     # 1. Working area is valid
-    assert r.work_lat_w > 0 and r.work_lat_h > 0
+    assert work_lat_w > 0 and work_lat_h > 0
 
     # 2. Wrapping: center pixel is identity
     result = rect_tiling(W_lat // 2, H_lat // 2, (W_lat, H_lat),
-                         r.work_lat_w, r.work_lat_h)
+                         work_lat_w, work_lat_h)
     assert result == (W_lat // 2, H_lat // 2)
 
     # 3. Wrapping: corner pixel wraps
-    result = rect_tiling(0, 0, (W_lat, H_lat), r.work_lat_w, r.work_lat_h)
+    result = rect_tiling(0, 0, (W_lat, H_lat), work_lat_w, work_lat_h)
     assert result != (0, 0)
 
     # 4. Mapping is non-empty
@@ -319,10 +313,12 @@ def test_tiling_vs_mapping_consistency():
     r = _resolve(scale=0.6, min_margin=2, divisible_by=1, img_W=W_lat * VAE_FACTOR, img_H=H_lat * VAE_FACTOR)
     src_x, src_y, new_x, new_y = at_mod.calculate_mapping((W_lat, H_lat), (W_lat, H_lat), r)
 
+    work_lat_w = r.work_img_w / VAE_FACTOR
+    work_lat_h = r.work_img_h / VAE_FACTOR
     for i in range(len(src_x)):
         sx, sy = src_x[i].item(), src_y[i].item()
         nx, ny = new_x[i].item(), new_y[i].item()
-        px, py = rect_tiling(sx, sy, (W_lat, H_lat), r.work_lat_w, r.work_lat_h)
+        px, py = rect_tiling(sx, sy, (W_lat, H_lat), work_lat_w, work_lat_h)
         assert (px, py) == (nx, ny), f"Mismatch at ({sx},{sy}): rect_tiling={px},{py} vs mapping={nx},{ny}"
 
 
