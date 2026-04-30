@@ -173,6 +173,39 @@ def create_crop_mask(width: int, height: int, resolved: ResolvedSettings):
     return mask
 
 
+def compute_crop_bounds(img_w: int, img_h: int, resolved: ResolvedSettings):
+    """Compute crop bounding box (rmin, rmax, cmin, cmax) inclusive.
+
+    :param img_w: Image width
+    :param img_h: Image height
+    :param resolved: Resolved tiling settings
+    :return: (rmin, rmax, cmin, cmax) inclusive pixel indices
+    """
+    if resolved.mode == "Rectangular" and resolved.margin_img_w > 0:
+        crop_w = int(math.floor(resolved.work_img_w + 0.5))
+        crop_h = int(math.floor(resolved.work_img_h + 0.5))
+        center_c = img_w // 2
+        center_r = img_h // 2
+        cmin = center_c - crop_w // 2
+        cmax = cmin + crop_w - 1
+        rmin = center_r - crop_h // 2
+        rmax = rmin + crop_h - 1
+    elif resolved.mode == "Hexagon":
+        hex_side = int(math.floor(2 * resolved.hex_size_img + 0.5))
+        center_r = img_h // 2
+        center_c = img_w // 2
+        half = hex_side // 2
+        rmin = max(0, center_r - half)
+        cmin = max(0, center_c - half)
+        rmax = min(img_h, rmin + hex_side) - 1
+        cmax = min(img_w, cmin + hex_side) - 1
+        rmin = max(0, rmax + 1 - hex_side)
+        cmin = max(0, cmax + 1 - hex_side)
+    else:
+        rmin, rmax, cmin, cmax = 0, img_h - 1, 0, img_w - 1
+    return rmin, rmax, cmin, cmax
+
+
 def _mask_bounding_box(mask: torch.Tensor) -> tuple[int, int, int, int]:
     """Find the bounding box of non-zero region in a crop mask.
 
@@ -456,29 +489,8 @@ class AdvancedTilingVAEDecode:
             img_h, img_w = image.shape[1], image.shape[2]
             mask = create_crop_mask(img_w, img_h, resolved_settings)
 
-            if resolved_settings.mode == "Rectangular" and resolved_settings.margin_img_w > 0:
-                # Crop to working rectangle using pre-computed margins
-                cx, cy = img_w / 2.0, img_h / 2.0
-                half_w = resolved_settings.work_img_w / 2.0
-                half_h = resolved_settings.work_img_h / 2.0
-                cmin = int(math.floor(cx - half_w + 0.5))
-                cmax = int(math.floor(cx + half_w + 0.5)) - 1
-                rmin = int(math.floor(cy - half_h + 0.5))
-                rmax = int(math.floor(cy + half_h + 0.5)) - 1
-                image = _crop_with_mask(image, mask, rmin, rmax, cmin, cmax)
-
-            elif resolved_settings.mode == "Hexagon":
-                # Crop to square hex bounding box using pre-computed hex size
-                hex_side = int(math.floor(2 * resolved_settings.hex_size_img + 0.5))
-                center_r = img_h // 2
-                center_c = img_w // 2
-                half = hex_side // 2
-                rmin = max(0, center_r - half)
-                cmin = max(0, center_c - half)
-                rmax = min(img_h, rmin + hex_side) - 1
-                cmax = min(img_w, cmin + hex_side) - 1
-                rmin = max(0, rmax + 1 - hex_side)
-                cmin = max(0, cmax + 1 - hex_side)
+            if resolved_settings.mode != "None":
+                rmin, rmax, cmin, cmax = compute_crop_bounds(img_w, img_h, resolved_settings)
                 image = _crop_with_mask(image, mask, rmin, rmax, cmin, cmax)
 
         return (image,)

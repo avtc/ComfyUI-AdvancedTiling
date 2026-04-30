@@ -18,7 +18,6 @@ Prints ASCII visualizations and asserts all four agree on the working area.
 
 import sys
 import os
-import math
 
 _test_dir = os.path.dirname(os.path.abspath(__file__))
 _pkg_dir = os.path.dirname(_test_dir)
@@ -79,9 +78,13 @@ def build_tiling_identity(W, H, resolved, mode):
     for y in range(H):
         for x in range(W):
             if mode == "Rectangular":
-                nx, ny = rect_tiling(x, y, (W, H), resolved.work_lat_w, resolved.work_lat_h)
+                work_w = W * resolved.work_img_w / resolved.img_w
+                work_h = H * resolved.work_img_h / resolved.img_h
+                nx, ny = rect_tiling(x, y, (W, H), work_w, work_h)
             else:
-                nx, ny = hex_tiling(x, y, (W, H), resolved.hex_size_lat, resolved.rotation)
+                min_dim = min(resolved.img_w, resolved.img_h)
+                hex_size = min(W, H) * resolved.hex_size_img / min_dim
+                nx, ny = hex_tiling(x, y, (W, H), hex_size, resolved.rotation)
             if nx != x or ny != y:
                 identity[y, x] = False
     return identity
@@ -563,13 +566,9 @@ def check_realistic_borders(label, mode, scale, min_margin, div_by,
     print(ascii_border_region(wrap_np, border_px=5))
 
     # Crop dimensions from ResolvedSettings
-    if mode == "Hexagon":
-        hex_side = int(math.floor(2 * resolved.hex_size_img + 0.5))
-        crop_w = hex_side
-        crop_h = hex_side
-    else:
-        crop_w = int(math.floor(resolved.work_img_w + 0.5))
-        crop_h = int(math.floor(resolved.work_img_h + 0.5))
+    rmin, rmax, cmin, cmax = at_mod.compute_crop_bounds(img_w, img_h, resolved)
+    crop_w = cmax - cmin + 1
+    crop_h = rmax - rmin + 1
 
     print(f"\n  Image crop: {crop_w}x{crop_h} (from {img_w}x{img_h})")
 
@@ -684,25 +683,8 @@ def _compare_subsystems_at_boundary(label, mode, scale, min_margin, div_by, is_c
     mask_img = mask[0, :, :, 0].bool().numpy()
 
     # 4. Crop using ResolvedSettings dimensions
-    if mode == "Hexagon":
-        hex_side = int(math.floor(2 * resolved.hex_size_img + 0.5))
-        center_r, center_c = H_img // 2, W_img // 2
-        half = hex_side // 2
-        cr_rmin = max(0, center_r - half)
-        cr_cmin = max(0, center_c - half)
-        cr_rmax = min(H_img, cr_rmin + hex_side) - 1
-        cr_cmax = min(W_img, cr_cmin + hex_side) - 1
-        cr_rmin = max(0, cr_rmax + 1 - hex_side)
-        cr_cmin = max(0, cr_cmax + 1 - hex_side)
-        cr = (cr_rmin, cr_rmax, cr_cmin, cr_cmax)
-    else:
-        cx, cy = W_img / 2.0, H_img / 2.0
-        half_w = resolved.work_img_w / 2.0
-        half_h = resolved.work_img_h / 2.0
-        cr = (
-            int(math.floor(cy - half_h + 0.5)), int(math.floor(cy + half_h + 0.5)) - 1,
-            int(math.floor(cx - half_w + 0.5)), int(math.floor(cx + half_w + 0.5)) - 1,
-        )
+    cr_rmin, cr_rmax, cr_cmin, cr_cmax = at_mod.compute_crop_bounds(W_img, H_img, resolved)
+    cr = (cr_rmin, cr_rmax, cr_cmin, cr_cmax)
     crop_img = np.zeros((H_img, W_img), dtype=bool)
     crop_img[cr[0]:cr[1]+1, cr[2]:cr[3]+1] = mask_img[cr[0]:cr[1]+1, cr[2]:cr[3]+1]
 
