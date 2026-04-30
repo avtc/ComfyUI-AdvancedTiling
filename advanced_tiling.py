@@ -381,7 +381,7 @@ class AdvancedTilingVAEDecode:
 
         return {
             "required": {
-                "settings": ("RESOLVED_TILING_SETTINGS",),
+                "resolved_settings": ("RESOLVED_TILING_SETTINGS",),
                 "samples": ("LATENT",),
                 "vae": ("VAE",),
                 "crop": ("BOOLEAN", {"default": True}),
@@ -392,7 +392,7 @@ class AdvancedTilingVAEDecode:
     FUNCTION = "run"
     CATEGORY = "latent"
 
-    def run(self, settings, samples, vae, crop):
+    def run(self, resolved_settings, samples, vae, crop):
         """
         Decode latents to image with tiling
         Optionally crop the image based on tiling settings
@@ -404,7 +404,7 @@ class AdvancedTilingVAEDecode:
         Settings must be pre-resolved (from AdvancedTiling node output).
         """
 
-        if settings.mode == "None":
+        if resolved_settings.mode == "None":
             image = vae.decode(samples["samples"])
             if image.ndim == 5:
                 image = image.squeeze(1)
@@ -423,10 +423,10 @@ class AdvancedTilingVAEDecode:
 
         # Use settings as-is — they were resolved by AdvancedTiling.run()
         # to match the generation model's working area.
-        patch_model(vae.first_stage_model, settings)
+        patch_model(vae.first_stage_model, resolved_settings)
 
         try:
-            result = self._decode_and_crop(settings, samples, vae, crop)
+            result = self._decode_and_crop(resolved_settings, samples, vae, crop)
         finally:
             # Restore original state — patch_model added tiling_resolved to
             # every Conv2d layer, so deleting it is always safe here.
@@ -437,7 +437,7 @@ class AdvancedTilingVAEDecode:
 
         return result
 
-    def _decode_and_crop(self, settings, samples, vae, crop):
+    def _decode_and_crop(self, resolved_settings, samples, vae, crop):
         latent = samples["samples"]
 
         # Decode full latent — crop after decode using mask
@@ -448,22 +448,22 @@ class AdvancedTilingVAEDecode:
 
         if crop:
             img_h, img_w = image.shape[1], image.shape[2]
-            mask = create_crop_mask(img_w, img_h, settings)
+            mask = create_crop_mask(img_w, img_h, resolved_settings)
 
-            if settings.mode == "Rectangular" and settings.margin_img_w > 0:
+            if resolved_settings.mode == "Rectangular" and resolved_settings.margin_img_w > 0:
                 # Crop to working rectangle using pre-computed margins
                 cx, cy = img_w / 2.0, img_h / 2.0
-                half_w = settings.work_img_w / 2.0
-                half_h = settings.work_img_h / 2.0
+                half_w = resolved_settings.work_img_w / 2.0
+                half_h = resolved_settings.work_img_h / 2.0
                 cmin = int(round(cx - half_w))
                 cmax = int(round(cx + half_w)) - 1
                 rmin = int(round(cy - half_h))
                 rmax = int(round(cy + half_h)) - 1
                 image = _crop_with_mask(image, mask, rmin, rmax, cmin, cmax)
 
-            elif settings.mode == "Hexagon":
+            elif resolved_settings.mode == "Hexagon":
                 # Crop to square hex bounding box using pre-computed hex size
-                hex_side = int(round(2 * settings.hex_size_img))
+                hex_side = int(round(2 * resolved_settings.hex_size_img))
                 center_r = img_h // 2
                 center_c = img_w // 2
                 half = hex_side // 2
