@@ -64,6 +64,7 @@ def calculate_mapping(
     :return: Mapping of pixels
     """
 
+    assert settings.resolved, "Settings must be resolved before use"
     pw, ph = padded_size
     ow, oh = original_size
 
@@ -131,45 +132,71 @@ def create_crop_mask(width: int, height: int, settings: Settings, vae_factor: in
     :return: Cropped image
     """
 
+    assert settings.resolved, "Settings must be resolved before use"
     if settings.mode == "Hexagon":
         import numpy as np
         from .modes.hex import compute_float_hex_size
 
         if vae_factor > 1 and width >= vae_factor and height >= vae_factor:
-            # Image-space call: compute hex size in latent space (where
-            # min_margin is in the correct units) then scale to image pixels.
+            # Image-space call: compute identity at latent resolution (where
+            # Conv2d wrapping operates) then upscale to image pixels.
             W_lat = width // vae_factor
             H_lat = height // vae_factor
             size_lat = compute_float_hex_size(W_lat, H_lat, settings, vae_factor=vae_factor)
-            size = size_lat * vae_factor
+
+            cx_lat = np.arange(W_lat, dtype=np.float64) - W_lat // 2
+            cy_lat = np.arange(H_lat, dtype=np.float64) - H_lat // 2
+            grid_cx, grid_cy = np.meshgrid(cx_lat, cy_lat, indexing='xy')
+            new_x, new_y = _hex_remap_batch(grid_cx, grid_cy, size_lat, W_lat, H_lat, settings)
+
+            src_x = np.tile(np.arange(W_lat, dtype=np.int64), H_lat)
+            src_y = np.repeat(np.arange(H_lat, dtype=np.int64), W_lat)
+            is_identity_lat = ((new_x == src_x) & (new_y == src_y)).reshape(H_lat, W_lat)
+
+            is_identity = np.repeat(np.repeat(is_identity_lat, vae_factor, axis=0), vae_factor, axis=1)
+            mask = torch.zeros((1, height, width, 1), dtype=torch.float32)
+            mask[0, :, :, 0] = torch.from_numpy(is_identity.astype(np.float32))
         else:
             # Latent-space call (or small test dimensions): use dimensions directly
             size = compute_float_hex_size(width, height, settings, vae_factor)
-        cx = np.arange(width, dtype=np.float64) - width // 2
-        cy = np.arange(height, dtype=np.float64) - height // 2
-        grid_cx, grid_cy = np.meshgrid(cx, cy, indexing='xy')
-        new_x, new_y = _hex_remap_batch(grid_cx, grid_cy, size, width, height, settings)
+            cx = np.arange(width, dtype=np.float64) - width // 2
+            cy = np.arange(height, dtype=np.float64) - height // 2
+            grid_cx, grid_cy = np.meshgrid(cx, cy, indexing='xy')
+            new_x, new_y = _hex_remap_batch(grid_cx, grid_cy, size, width, height, settings)
 
-        src_x = np.tile(np.arange(width, dtype=np.int64), height)
-        src_y = np.repeat(np.arange(height, dtype=np.int64), width)
-        is_identity = torch.from_numpy(((new_x == src_x) & (new_y == src_y)).reshape(height, width))
-        mask = torch.zeros((1, height, width, 1), dtype=torch.float32)
-        mask[0, :, :, 0] = is_identity.float()
+            src_x = np.tile(np.arange(width, dtype=np.int64), height)
+            src_y = np.repeat(np.arange(height, dtype=np.int64), width)
+            is_identity = torch.from_numpy(((new_x == src_x) & (new_y == src_y)).reshape(height, width))
+            mask = torch.zeros((1, height, width, 1), dtype=torch.float32)
+            mask[0, :, :, 0] = is_identity.float()
     elif settings.mode == "Rectangular":
         from .modes.rect import compute_float_rect_dims
 
         if vae_factor > 1 and width >= vae_factor and height >= vae_factor:
-            # Image-space call: compute working rect in latent space (where
-            # min_margin is in the correct units) then scale to image pixels.
+            # Image-space call: compute identity at latent resolution (where
+            # Conv2d wrapping operates) then upscale to image pixels.
             W_lat = width // vae_factor
             H_lat = height // vae_factor
             work_w_lat, work_h_lat = compute_float_rect_dims(W_lat, H_lat, settings, vae_factor=vae_factor)
             cx_lat = W_lat / 2.0
             cy_lat = H_lat / 2.0
-            left_img = (cx_lat - work_w_lat / 2) * vae_factor
-            right_img = (cx_lat + work_w_lat / 2) * vae_factor
-            top_img = (cy_lat - work_h_lat / 2) * vae_factor
-            bottom_img = (cy_lat + work_h_lat / 2) * vae_factor
+            left_lat = cx_lat - work_w_lat / 2
+            right_lat = cx_lat + work_w_lat / 2
+            top_lat = cy_lat - work_h_lat / 2
+            bottom_lat = cy_lat + work_h_lat / 2
+
+            xs = torch.arange(W_lat, dtype=torch.float64)
+            ys = torch.arange(H_lat, dtype=torch.float64)
+            inside_x = (xs >= left_lat) & (xs < right_lat)
+            inside_y = (ys >= top_lat) & (ys < bottom_lat)
+            is_identity_lat = inside_y.unsqueeze(1) & inside_x.unsqueeze(0)
+
+            is_identity = torch.repeat_interleave(
+                torch.repeat_interleave(is_identity_lat, vae_factor, dim=0),
+                vae_factor, dim=1,
+            )
+            mask = torch.zeros((1, height, width, 1), dtype=torch.float32)
+            mask[0, :, :, 0] = is_identity.float()
         else:
             # Latent-space call (or small test dimensions): use dimensions directly
             work_w, work_h = compute_float_rect_dims(width, height, settings, vae_factor)
@@ -179,16 +206,16 @@ def create_crop_mask(width: int, height: int, settings: Settings, vae_factor: in
             top_img = cy - work_h / 2
             bottom_img = cy + work_h / 2
 
-        xs = torch.arange(width, dtype=torch.float64)
-        ys = torch.arange(height, dtype=torch.float64)
-        grid_x, grid_y = torch.meshgrid(xs, ys, indexing='xy')
+            xs = torch.arange(width, dtype=torch.float64)
+            ys = torch.arange(height, dtype=torch.float64)
+            grid_x, grid_y = torch.meshgrid(xs, ys, indexing='xy')
 
-        inside_x = (grid_x >= left_img) & (grid_x < right_img)
-        inside_y = (grid_y >= top_img) & (grid_y < bottom_img)
-        is_identity = inside_x & inside_y
+            inside_x = (grid_x >= left_img) & (grid_x < right_img)
+            inside_y = (grid_y >= top_img) & (grid_y < bottom_img)
+            is_identity = inside_x & inside_y
 
-        mask = torch.zeros((1, height, width, 1), dtype=torch.float32)
-        mask[0, :, :, 0] = is_identity.float()
+            mask = torch.zeros((1, height, width, 1), dtype=torch.float32)
+            mask[0, :, :, 0] = is_identity.float()
     else:
         mask = torch.ones((1, height, width, 1), dtype=torch.float32)
 
@@ -237,6 +264,7 @@ def patch_model(model, settings: Settings, vae_factor: int):
     :param vae_factor: VAE downscale factor
     """
 
+    assert settings.resolved, "Settings must be resolved before use"
     # Patch all Conv2d layers
     for layer in [layer for layer in model.modules() if isinstance(layer, Conv2d)]:
         # pylint: disable=protected-access, no-value-for-parameter
@@ -365,7 +393,8 @@ class AdvancedTiling:
         }
 
     CATEGORY = "conditioning"
-    RETURN_TYPES = ("MODEL",)
+    RETURN_TYPES = ("MODEL", "ADVANCED_TILING_SETTINGS")
+    RETURN_NAMES = ("MODEL", "resolved_settings")
     FUNCTION = "run"
 
     def run(self, settings, model):
@@ -377,7 +406,9 @@ class AdvancedTiling:
 
         is_conv2d = _has_conv2d(model_copy.model.diffusion_model)
 
-        # Resolve auto-sentinel values into a new Settings (no in-place mutation)
+        # Resolve auto-sentinel values into a new Settings (no in-place mutation).
+        # This is the single resolution point — all downstream consumers
+        # (VAE decode, crop mask, wrapping) use these resolved values.
         settings = settings._resolve_auto(is_conv2d)
 
         if is_conv2d:
@@ -389,7 +420,30 @@ class AdvancedTiling:
         else:
             patch_dit_model(model_copy, settings, vae_factor=8)
 
-        return (model_copy,)
+        return (model_copy, settings)
+
+
+def hex_square_crop(rmin, rmax, cmin, cmax, img_h, img_w, divisible_by):
+    """Compute square crop bounds centered on the hex bounding box.
+
+    Hex height == hex width (square crop). If divisible_by > 1, rounds down
+    to the nearest multiple for both dimensions.
+
+    :return: (sq_rmin, sq_rmax, sq_cmin, sq_cmax) inclusive indices
+    """
+    hex_h = rmax - rmin + 1
+    if divisible_by > 1:
+        hex_h = (hex_h // divisible_by) * divisible_by
+    center_r = (rmin + rmax) // 2
+    center_c = (cmin + cmax) // 2
+    half = hex_h // 2
+    sq_rmin = max(0, center_r - half)
+    sq_cmin = max(0, center_c - half)
+    sq_rmax = min(img_h, sq_rmin + hex_h) - 1
+    sq_cmax = min(img_w, sq_cmin + hex_h) - 1
+    sq_rmin = max(0, sq_rmax + 1 - hex_h)
+    sq_cmin = max(0, sq_cmax + 1 - hex_h)
+    return sq_rmin, sq_rmax, sq_cmin, sq_cmax
 
 
 class AdvancedTilingVAEDecode:
@@ -426,6 +480,8 @@ class AdvancedTilingVAEDecode:
         For Hexagon mode: applies alpha mask for hex-shaped cropping.
         For Rectangular mode with scale < 1.0 or margin: decodes full latent
         then crops using mask-based post-decode crop.
+
+        Settings must be pre-resolved (from AdvancedTiling node output).
         """
 
         # Patch VAE in-place instead of deepcopy (avoids copying ~167MB of weights).
@@ -439,6 +495,9 @@ class AdvancedTilingVAEDecode:
             for layer in conv_layers
         ]
         vae_factor = vae.spacial_compression_decode()
+
+        # Use settings as-is — they were resolved by AdvancedTiling.run()
+        # to match the generation model's working area.
         patch_model(vae.first_stage_model, settings, vae_factor)
 
         try:
@@ -476,23 +535,9 @@ class AdvancedTilingVAEDecode:
                 img_h, img_w = image.shape[1], image.shape[2]
                 mask = create_crop_mask(img_w, img_h, settings, vae_factor=vae_factor)
                 rmin, rmax, cmin, cmax = _mask_bounding_box(mask)
-
-                # Center a square crop around the hex bounding box.
-                # compute_float_hex_size ensures the hex radius is divisible,
-                # but pixel-level rounding in the mask can cause 1px off.
-                hex_h = rmax - rmin + 1
-                if settings.divisible_by > 1:
-                    hex_h = (hex_h // settings.divisible_by) * settings.divisible_by
-                center_r = (rmin + rmax) // 2
-                center_c = (cmin + cmax) // 2
-                half = hex_h // 2
-                sq_rmin = max(0, center_r - half)
-                sq_cmin = max(0, center_c - half)
-                sq_rmax = min(img_h, sq_rmin + hex_h) - 1
-                sq_cmax = min(img_w, sq_cmin + hex_h) - 1
-                sq_rmin = max(0, sq_rmax + 1 - hex_h)
-                sq_cmin = max(0, sq_cmax + 1 - hex_h)
-
+                sq_rmin, sq_rmax, sq_cmin, sq_cmax = hex_square_crop(
+                    rmin, rmax, cmin, cmax, img_h, img_w, settings.divisible_by,
+                )
                 image = _crop_with_mask(image, mask, sq_rmin, sq_rmax, sq_cmin, sq_cmax)
 
         return (image,)

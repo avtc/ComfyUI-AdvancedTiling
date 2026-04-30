@@ -114,6 +114,7 @@ def patch_dit_model(model_patcher, settings: Settings, vae_factor: int):
     :param settings: Tiling settings
     :param vae_factor: VAE downscale factor
     """
+    assert settings.resolved, "Settings must be resolved before use"
     diff_model = model_patcher.model.diffusion_model
 
     if settings.mode == "Hexagon":

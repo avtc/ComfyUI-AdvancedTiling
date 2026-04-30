@@ -35,8 +35,8 @@ if HAS_RAYLIGHT:
                 },
             }
 
-        RETURN_TYPES = ("RAY_ACTORS",)
-        RETURN_NAMES = ("ray_actors",)
+        RETURN_TYPES = ("RAY_ACTORS", "ADVANCED_TILING_SETTINGS")
+        RETURN_NAMES = ("ray_actors", "resolved_settings")
         FUNCTION = "run"
         CATEGORY = "conditioning"
 
@@ -81,4 +81,4 @@ if HAS_RAYLIGHT:
                 for actor in gpu_workers
             ]
             ray.get(futures)
-            return (ray_actors,)
+            return (ray_actors, settings)

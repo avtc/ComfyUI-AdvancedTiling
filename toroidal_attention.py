@@ -15,6 +15,22 @@ from .modes.hex import hex_tiling
 from .modes.rect import rect_tiling
 
 
+def _make_patch_settings(settings: Settings, patch_size: int, vae_factor: int) -> tuple[Settings, int]:
+    """Create settings and vae_factor for patch-space tiling functions.
+
+    Tiling functions receive patch-space dimensions (latent/patch_size),
+    so min_margin must be divided by patch_size and vae_factor multiplied
+    by patch_size to maintain correct geometry.
+    """
+    if patch_size == 1:
+        return settings, vae_factor
+    scaled = Settings(
+        settings.mode, settings.rotation, settings.scale,
+        settings.min_margin / patch_size, settings.divisible_by,
+    )
+    return scaled, vae_factor * patch_size
+
+
 def _factorize(n: int) -> tuple[int, int]:
     """Factorize n into h * w, preferring square.
 
@@ -267,9 +283,12 @@ class HexToroidalAttentionPatch(_BaseToroidalAttentionPatch):
     def __init__(self, settings: Settings, pe_embedder, patch_size: int, vae_factor: int):
         super().__init__(pe_embedder, vae_factor=vae_factor, patch_size=patch_size)
         self.settings = settings
+        self._patch_settings, self._patch_vae_factor = _make_patch_settings(
+            settings, patch_size, vae_factor,
+        )
 
     def _compute_boundary_pairs(self, h_patches, w_patches):
-        return _compute_hex_boundary_pairs(h_patches, w_patches, self.settings, self.vae_factor)
+        return _compute_hex_boundary_pairs(h_patches, w_patches, self._patch_settings, self._patch_vae_factor)
 
 
 class RectToroidalAttentionPatch(_BaseToroidalAttentionPatch):
@@ -278,9 +297,12 @@ class RectToroidalAttentionPatch(_BaseToroidalAttentionPatch):
     def __init__(self, settings: Settings, pe_embedder, patch_size: int, vae_factor: int):
         super().__init__(pe_embedder, vae_factor=vae_factor, patch_size=patch_size)
         self.settings = settings
+        self._patch_settings, self._patch_vae_factor = _make_patch_settings(
+            settings, patch_size, vae_factor,
+        )
 
     def _compute_boundary_pairs(self, h_patches, w_patches):
-        return _compute_rect_boundary_pairs(h_patches, w_patches, self.settings, self.vae_factor)
+        return _compute_rect_boundary_pairs(h_patches, w_patches, self._patch_settings, self._patch_vae_factor)
 
 
 # ---------------------------------------------------------------------------
@@ -302,6 +324,9 @@ class LuminaWastePatch:
         self.patch_size = patch_size
         self.settings = settings
         self.vae_factor = vae_factor
+        self._patch_settings, self._patch_vae_factor = _make_patch_settings(
+            settings, patch_size, vae_factor,
+        )
         self._initialized = False
         self._waste_idx = None
         self._waste_source_idx = None
@@ -321,8 +346,8 @@ class LuminaWastePatch:
                         w, h,
                         (w_patches, h_patches),
                         (w_patches, h_patches),
-                        self.settings,
-                        self.vae_factor,
+                        self._patch_settings,
+                        self._patch_vae_factor,
                     )
                     if src_w != w or src_h != h:
                         waste_indices.append(h * w_patches + w)
@@ -334,8 +359,8 @@ class LuminaWastePatch:
                         w, h,
                         (w_patches, h_patches),
                         (w_patches, h_patches),
-                        self.settings,
-                        self.vae_factor,
+                        self._patch_settings,
+                        self._patch_vae_factor,
                     )
                     if src_w != w or src_h != h:
                         waste_indices.append(h * w_patches + w)

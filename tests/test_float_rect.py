@@ -41,19 +41,19 @@ def test_scale_reduces_dims():
 
 
 def test_min_margin_reduces_dims():
-    """scale=1.0, min_margin=4 → dims reduced by 2*margin."""
+    """scale=1.0, min_margin=4 -> dims reduced by 2*margin."""
     s = Settings("Rectangular", 0.0, scale=1.0, min_margin=4, divisible_by=1)
     w, h = compute_float_rect_dims(128, 128, s, VAE_FACTOR)
-    assert w == 120.0
-    assert h == 120.0
+    assert w == 128.0 - 2 * s.min_margin
+    assert h == 128.0 - 2 * s.min_margin
 
 
 def test_scale_and_margin():
     """Both scale and margin applied."""
     s = Settings("Rectangular", 0.0, scale=0.8, min_margin=4, divisible_by=1)
     w, h = compute_float_rect_dims(128, 128, s, VAE_FACTOR)
-    assert w == 128.0 * 0.8 - 2 * 4  # 94.4
-    assert h == 128.0 * 0.8 - 2 * 4
+    assert w == 128.0 * s.scale - 2 * s.min_margin
+    assert h == 128.0 * s.scale - 2 * s.min_margin
 
 
 def test_divisible_by_rounds_down():
@@ -76,8 +76,8 @@ def test_non_square():
     """Non-square dimensions."""
     s = Settings("Rectangular", 0.0, scale=0.75, min_margin=2, divisible_by=1)
     w, h = compute_float_rect_dims(100, 80, s, VAE_FACTOR)
-    assert w == 100.0 * 0.75 - 2 * 2  # 71.0
-    assert h == 80.0 * 0.75 - 2 * 2   # 56.0
+    assert w == 100.0 * s.scale - 2 * s.min_margin
+    assert h == 80.0 * s.scale - 2 * s.min_margin
 
 
 # --- rect_tiling tests ---
@@ -164,15 +164,15 @@ def test_crop_mask_rect_scaled():
 
 
 def test_end_to_end_scale_and_divisible():
-    """Full pipeline: scale → min_margin → divisible_by → wrapping → crop mask."""
+    """Full pipeline: scale -> min_margin -> divisible_by -> wrapping -> crop mask."""
     W, H = 128, 128
     s = Settings("Rectangular", 0.0, scale=0.8, min_margin=4, divisible_by=64)
 
-    # 1. Float dims
+    # 1. Float dims are valid and divisible_by is respected
     work_w, work_h = compute_float_rect_dims(W, H, s, vae_factor=8)
     assert work_w > 0 and work_h > 0
-    assert (work_w * 8) % 64 == 0
-    assert (work_h * 8) % 64 == 0
+    assert (work_w * VAE_FACTOR) % s.divisible_by == 0
+    assert (work_h * VAE_FACTOR) % s.divisible_by == 0
 
     # 2. Wrapping: center pixel is identity
     result = rect_tiling(W // 2, H // 2, (W, H), (W, H), s, VAE_FACTOR)
@@ -253,8 +253,9 @@ def test_divisible_by_not_multiple_of_vae_factor():
     s = Settings("Rectangular", 0.0, scale=1.0, min_margin=0, divisible_by=12)
     w, h = compute_float_rect_dims(64, 64, s, vae_factor=8)
     assert w > 0 and h > 0
-    # 12/8 = 1.5, so dims should be multiples of 1.5
-    assert w % 1.5 == 0.0
+    # Latent unit = divisible_by / vae_factor
+    unit_latent = s.divisible_by / VAE_FACTOR
+    assert w % unit_latent == 0.0
 
 
 # --- Settings._resolve_auto tests ---
@@ -262,7 +263,7 @@ def test_divisible_by_not_multiple_of_vae_factor():
 
 def test_resolve_auto_scale_conv2d():
     """scale=0.0 resolves to 1.0 for Conv2d models."""
-    s = Settings("Rectangular", 0.0, scale=0.0, min_margin=-1)
+    s = Settings("Rectangular", 0.0, scale=0.0, min_margin=-1, divisible_by=1)
     resolved = s._resolve_auto(is_conv2d=True)
     assert resolved.scale == 1.0
     assert resolved.min_margin == 0
@@ -272,7 +273,7 @@ def test_resolve_auto_scale_conv2d():
 
 def test_resolve_auto_scale_dit_rect():
     """scale=0.0 resolves to 7/8 for DiT Rectangular."""
-    s = Settings("Rectangular", 0.0, scale=0.0, min_margin=-1)
+    s = Settings("Rectangular", 0.0, scale=0.0, min_margin=-1, divisible_by=1)
     resolved = s._resolve_auto(is_conv2d=False)
     assert resolved.scale == 7 / 8
     assert resolved.min_margin == 4
@@ -280,7 +281,7 @@ def test_resolve_auto_scale_dit_rect():
 
 def test_resolve_auto_scale_dit_hex():
     """scale=0.0 resolves to 1.0 for DiT Hexagon."""
-    s = Settings("Hexagon", 0.0, scale=0.0, min_margin=-1)
+    s = Settings("Hexagon", 0.0, scale=0.0, min_margin=-1, divisible_by=1)
     resolved = s._resolve_auto(is_conv2d=False)
     assert resolved.scale == 1.0
     assert resolved.min_margin == 0
@@ -288,7 +289,7 @@ def test_resolve_auto_scale_dit_hex():
 
 def test_resolve_auto_no_mutation():
     """_resolve_auto returns a new Settings, original is unchanged."""
-    s = Settings("Rectangular", 0.0, scale=0.0, min_margin=-1)
+    s = Settings("Rectangular", 0.0, scale=0.0, min_margin=-1, divisible_by=1)
     resolved = s._resolve_auto(is_conv2d=False)
     assert s.scale == 0.0
     assert s.min_margin == -1
@@ -305,8 +306,8 @@ def test_settings_eq():
 
 def test_settings_eq_different():
     """Settings with different values are not equal."""
-    s1 = Settings("Rectangular", 0.0, scale=0.8, min_margin=4)
-    s2 = Settings("Rectangular", 0.0, scale=0.9, min_margin=4)
+    s1 = Settings("Rectangular", 0.0, scale=0.8, min_margin=4, divisible_by=1)
+    s2 = Settings("Rectangular", 0.0, scale=0.9, min_margin=4, divisible_by=1)
     assert s1 != s2
 
 
