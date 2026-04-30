@@ -56,9 +56,9 @@ def cube_round(frac_coords: tuple[float, float, float]) -> tuple[int, int, int]:
     :return: Cube coordinates
     """
 
-    q = round(frac_coords[0])
-    r = round(frac_coords[1])
-    s = round(frac_coords[2])
+    q = math.floor(frac_coords[0] + 0.5)
+    r = math.floor(frac_coords[1] + 0.5)
+    s = math.floor(frac_coords[2] + 0.5)
 
     q_diff = abs(q - frac_coords[0])
     r_diff = abs(r - frac_coords[1])
@@ -122,8 +122,7 @@ def hex_to_pixel(
         ).flatten()
     )
 
-    # We need to round!
-    return (round(x), round(y))
+    return (int(math.floor(x + 0.5)), int(math.floor(y + 0.5)))
 
 
 def pixel_to_hex(

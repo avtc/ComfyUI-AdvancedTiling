@@ -4,6 +4,7 @@ Main advanced tiling implementation
 
 from typing import Optional
 import functools
+import math
 
 import torch
 from torch import Tensor
@@ -31,8 +32,9 @@ def _hex_remap_batch(centers_x, centers_y, size, wrap_w, wrap_h, rotation):
     q, r = qr[0], qr[1]
     s = -q - r
 
-    # cube_round (vectorized)
-    rq, rr, rs = np.rint(q), np.rint(r), np.rint(s)
+    # cube_round (vectorized) — floor(x+0.5) for consistent half-up rounding
+    _half_up = lambda v: np.floor(v + 0.5)
+    rq, rr, rs = _half_up(q), _half_up(r), _half_up(s)
     q_diff, r_diff, s_diff = np.abs(rq - q), np.abs(rr - r), np.abs(rs - s)
     mask_q = (q_diff > r_diff) & (q_diff > s_diff)
     mask_r = ~mask_q & (r_diff > s_diff)
@@ -41,8 +43,12 @@ def _hex_remap_batch(centers_x, centers_y, size, wrap_w, wrap_h, rotation):
 
     # Fractional parts -> hex_to_pixel
     pixel = size * (mat @ np.stack([q - rq, r - rr], axis=0))
-    new_x = np.rint(pixel[0]).astype(np.int64)
-    new_y = np.rint(pixel[1]).astype(np.int64)
+    # Use floor(x+0.5) instead of rint to avoid banker's rounding on exact 0.5:
+    # when hex_size is an integer at a VAE decoder resolution, size*3/2 becomes a
+    # half-integer, causing pixel offsets to land exactly on X.5 boundaries where
+    # np.rint rounds to even — producing discontinuities in the wrapped image.
+    new_x = np.floor(pixel[0] + 0.5).astype(np.int64)
+    new_y = np.floor(pixel[1] + 0.5).astype(np.int64)
 
     new_x = (new_x + wrap_w // 2) % wrap_w
     new_y = (new_y + wrap_h // 2) % wrap_h
@@ -83,8 +89,8 @@ def calculate_mapping(
         new_x = cx + torch.fmod(torch.fmod(rel_x + work_w / 2, work_w) + work_w, work_w) - work_w / 2
         new_y = cy + torch.fmod(torch.fmod(rel_y + work_h / 2, work_h) + work_h, work_h) - work_h / 2
 
-        new_x = new_x.round().to(torch.long)
-        new_y = new_y.round().to(torch.long)
+        new_x = torch.floor(new_x + 0.5).to(torch.long)
+        new_y = torch.floor(new_y + 0.5).to(torch.long)
         src_x = grid_x.flatten().to(torch.long)
         src_y = grid_y.flatten().to(torch.long)
         new_x = new_x.flatten()
@@ -288,7 +294,7 @@ class AdvancedTilingSettings:
                     "INT",
                     {
                         "default": 1, "min": 1, "max": 256, "step": 1,
-                        "tooltip": "Round output image to multiples of this value in pixels. Only applies to Rectangular mode when crop is enabled. 1 = no rounding.",
+                        "tooltip": "Round working area down to multiples of this value. Affects wrapping and crop. 1 = no rounding.",
                     },
                 ),
             },
@@ -455,15 +461,15 @@ class AdvancedTilingVAEDecode:
                 cx, cy = img_w / 2.0, img_h / 2.0
                 half_w = resolved_settings.work_img_w / 2.0
                 half_h = resolved_settings.work_img_h / 2.0
-                cmin = int(round(cx - half_w))
-                cmax = int(round(cx + half_w)) - 1
-                rmin = int(round(cy - half_h))
-                rmax = int(round(cy + half_h)) - 1
+                cmin = int(math.floor(cx - half_w + 0.5))
+                cmax = int(math.floor(cx + half_w + 0.5)) - 1
+                rmin = int(math.floor(cy - half_h + 0.5))
+                rmax = int(math.floor(cy + half_h + 0.5)) - 1
                 image = _crop_with_mask(image, mask, rmin, rmax, cmin, cmax)
 
             elif resolved_settings.mode == "Hexagon":
                 # Crop to square hex bounding box using pre-computed hex size
-                hex_side = int(round(2 * resolved_settings.hex_size_img))
+                hex_side = int(math.floor(2 * resolved_settings.hex_size_img + 0.5))
                 center_r = img_h // 2
                 center_c = img_w // 2
                 half = hex_side // 2

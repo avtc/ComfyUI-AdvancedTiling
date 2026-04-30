@@ -18,6 +18,7 @@ Prints ASCII visualizations and asserts all four agree on the working area.
 
 import sys
 import os
+import math
 
 _test_dir = os.path.dirname(os.path.abspath(__file__))
 _pkg_dir = os.path.dirname(_test_dir)
@@ -563,12 +564,12 @@ def check_realistic_borders(label, mode, scale, min_margin, div_by,
 
     # Crop dimensions from ResolvedSettings
     if mode == "Hexagon":
-        hex_side = int(round(2 * resolved.hex_size_img))
+        hex_side = int(math.floor(2 * resolved.hex_size_img + 0.5))
         crop_w = hex_side
         crop_h = hex_side
     else:
-        crop_w = int(round(resolved.work_img_w))
-        crop_h = int(round(resolved.work_img_h))
+        crop_w = int(math.floor(resolved.work_img_w + 0.5))
+        crop_h = int(math.floor(resolved.work_img_h + 0.5))
 
     print(f"\n  Image crop: {crop_w}x{crop_h} (from {img_w}x{img_h})")
 
@@ -684,7 +685,7 @@ def _compare_subsystems_at_boundary(label, mode, scale, min_margin, div_by, is_c
 
     # 4. Crop using ResolvedSettings dimensions
     if mode == "Hexagon":
-        hex_side = int(round(2 * resolved.hex_size_img))
+        hex_side = int(math.floor(2 * resolved.hex_size_img + 0.5))
         center_r, center_c = H_img // 2, W_img // 2
         half = hex_side // 2
         cr_rmin = max(0, center_r - half)
@@ -699,8 +700,8 @@ def _compare_subsystems_at_boundary(label, mode, scale, min_margin, div_by, is_c
         half_w = resolved.work_img_w / 2.0
         half_h = resolved.work_img_h / 2.0
         cr = (
-            int(round(cy - half_h)), int(round(cy + half_h)) - 1,
-            int(round(cx - half_w)), int(round(cx + half_w)) - 1,
+            int(math.floor(cy - half_h + 0.5)), int(math.floor(cy + half_h + 0.5)) - 1,
+            int(math.floor(cx - half_w + 0.5)), int(math.floor(cx + half_w + 0.5)) - 1,
         )
     crop_img = np.zeros((H_img, W_img), dtype=bool)
     crop_img[cr[0]:cr[1]+1, cr[2]:cr[3]+1] = mask_img[cr[0]:cr[1]+1, cr[2]:cr[3]+1]

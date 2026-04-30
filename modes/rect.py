@@ -4,6 +4,8 @@ Rectangular (toroidal) tiling implementation
 Wraps coordinates modularly: right edge wraps to left, bottom wraps to top.
 """
 
+import math
+
 
 def rect_tiling(
     x: int,
@@ -36,4 +38,4 @@ def rect_tiling(
     new_x = cx + ((rel_x + work_w / 2) % work_w) - work_w / 2
     new_y = cy + ((rel_y + work_h / 2) % work_h) - work_h / 2
 
-    return (round(new_x), round(new_y))
+    return (math.floor(new_x + 0.5), math.floor(new_y + 0.5))
