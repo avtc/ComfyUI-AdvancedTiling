@@ -178,3 +178,13 @@ def hex_tiling(
     new_y = (new_y + padded_size[1] // 2) % padded_size[1]
 
     return (new_x, new_y)
+
+
+def hex_tiling_at(x, y, padded_size, resolved):
+    """Hexagonal tiling with automatic resolution scaling from ResolvedSettings.
+
+    Scales hex size to the tensor resolution of padded_size,
+    then delegates to hex_tiling().
+    """
+    size = resolved.hex_size_at(padded_size[0], padded_size[1])
+    return hex_tiling(x, y, padded_size, size, resolved.rotation)

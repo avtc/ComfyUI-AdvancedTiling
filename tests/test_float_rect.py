@@ -66,7 +66,7 @@ def test_resolve_divisible_by():
 def test_resolve_patch_downscale():
     """Patch values are image values / (vae_factor * patch_size)."""
     r = _resolve(scale=0.98, min_margin=4, divisible_by=1)
-    assert r.work_patch_w == 960.0 / 16
+    assert r.work_patch_w == r.work_img_w / (VAE_FACTOR * PATCH_SIZE)
 
 
 def test_resolve_rectangular_image():
@@ -84,7 +84,7 @@ def test_resolve_hex_mode():
     # base_margin = 512 * 0.2 = 102.4, min_margin_img = 0
     # margin = 102.4, hex_size = 512 - 102.4 = 409.6
     assert r.hex_size_img == 409.6
-    assert r.hex_size_patch == 409.6 / 16
+    assert r.hex_size_patch == r.hex_size_img / (VAE_FACTOR * PATCH_SIZE)
 
 
 def test_resolve_none_mode():
@@ -214,11 +214,8 @@ def test_end_to_end_scale_and_divisible():
     W_lat, H_lat = 128, 128
     r = _resolve(scale=0.8, min_margin=4, divisible_by=64)
 
-    # work at latent resolution = work_img / vae_factor
-    work_lat_w = r.work_img_w / VAE_FACTOR
-    work_lat_h = r.work_img_h / VAE_FACTOR
-
     # 1. Working area is valid
+    work_lat_w, work_lat_h = r.work_at(W_lat, H_lat)
     assert work_lat_w > 0 and work_lat_h > 0
 
     # 2. Wrapping: center pixel is identity
@@ -313,8 +310,7 @@ def test_tiling_vs_mapping_consistency():
     r = _resolve(scale=0.6, min_margin=2, divisible_by=1, img_W=W_lat * VAE_FACTOR, img_H=H_lat * VAE_FACTOR)
     src_x, src_y, new_x, new_y = at_mod.calculate_mapping((W_lat, H_lat), (W_lat, H_lat), r)
 
-    work_lat_w = r.work_img_w / VAE_FACTOR
-    work_lat_h = r.work_img_h / VAE_FACTOR
+    work_lat_w, work_lat_h = r.work_at(W_lat, H_lat)
     for i in range(len(src_x)):
         sx, sy = src_x[i].item(), src_y[i].item()
         nx, ny = new_x[i].item(), new_y[i].item()

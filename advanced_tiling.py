@@ -75,8 +75,7 @@ def calculate_mapping(
         # Scale working area to actual tensor resolution.
         # At diffusion latent resolution ow=img_w/vae_factor, scale=1.0.
         # VAE decoder Conv2d layers at 2x/4x/8x get proportionally scaled.
-        work_w = ow * resolved.work_img_w / resolved.img_w
-        work_h = oh * resolved.work_img_h / resolved.img_h
+        work_w, work_h = resolved.work_at(ow, oh)
         cx, cy = pw / 2.0, ph / 2.0
 
         xs = torch.arange(pw, dtype=torch.float64)
@@ -102,8 +101,7 @@ def calculate_mapping(
     elif resolved.mode == "Hexagon":
         import numpy as np
         # Scale hex size to actual tensor resolution.
-        min_dim = min(resolved.img_w, resolved.img_h)
-        size = min(ow, oh) * resolved.hex_size_img / min_dim
+        size = resolved.hex_size_at(ow, oh)
         cx = np.arange(pw, dtype=np.float64) - pw // 2
         cy = np.arange(ph, dtype=np.float64) - ph // 2
         grid_cx, grid_cy = np.meshgrid(cx, cy, indexing='xy')

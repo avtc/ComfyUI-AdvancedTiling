@@ -39,3 +39,13 @@ def rect_tiling(
     new_y = cy + ((rel_y + work_h / 2) % work_h) - work_h / 2
 
     return (math.floor(new_x + 0.5), math.floor(new_y + 0.5))
+
+
+def rect_tiling_at(x, y, padded_size, resolved):
+    """Rectangular tiling with automatic resolution scaling from ResolvedSettings.
+
+    Scales working area to the tensor resolution of padded_size,
+    then delegates to rect_tiling().
+    """
+    work_w, work_h = resolved.work_at(padded_size[0], padded_size[1])
+    return rect_tiling(x, y, padded_size, work_w, work_h)

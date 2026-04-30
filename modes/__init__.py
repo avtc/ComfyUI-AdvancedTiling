@@ -177,5 +177,15 @@ class ResolvedSettings:
                      self.hex_size_img, self.hex_size_patch,
                      self.img_w, self.img_h))
 
+    def work_at(self, tensor_w, tensor_h):
+        """Scale working area dimensions to tensor resolution."""
+        return (tensor_w * self.work_img_w / self.img_w,
+                tensor_h * self.work_img_h / self.img_h)
+
+    def hex_size_at(self, tensor_w, tensor_h):
+        """Scale hex size to tensor resolution."""
+        min_dim = min(self.img_w, self.img_h)
+        return min(tensor_w, tensor_h) * self.hex_size_img / min_dim
+
 
 __all__ = ["MODE_NAMES", "Settings", "ResolvedSettings", "AUTO_SCALE", "AUTO_MARGIN"]

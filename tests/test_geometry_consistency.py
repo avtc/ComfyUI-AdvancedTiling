@@ -38,8 +38,8 @@ _spec.loader.exec_module(_pkg)
 import torch
 import numpy as np
 from ComfyUI_AdvancedTiling.modes import Settings, ResolvedSettings
-from ComfyUI_AdvancedTiling.modes.rect import rect_tiling
-from ComfyUI_AdvancedTiling.modes.hex import hex_tiling
+from ComfyUI_AdvancedTiling.modes.rect import rect_tiling_at
+from ComfyUI_AdvancedTiling.modes.hex import hex_tiling_at
 import ComfyUI_AdvancedTiling.advanced_tiling as at_mod
 import ComfyUI_AdvancedTiling.toroidal_attention as ta_mod
 
@@ -78,13 +78,9 @@ def build_tiling_identity(W, H, resolved, mode):
     for y in range(H):
         for x in range(W):
             if mode == "Rectangular":
-                work_w = W * resolved.work_img_w / resolved.img_w
-                work_h = H * resolved.work_img_h / resolved.img_h
-                nx, ny = rect_tiling(x, y, (W, H), work_w, work_h)
+                nx, ny = rect_tiling_at(x, y, (W, H), resolved)
             else:
-                min_dim = min(resolved.img_w, resolved.img_h)
-                hex_size = min(W, H) * resolved.hex_size_img / min_dim
-                nx, ny = hex_tiling(x, y, (W, H), hex_size, resolved.rotation)
+                nx, ny = hex_tiling_at(x, y, (W, H), resolved)
             if nx != x or ny != y:
                 identity[y, x] = False
     return identity
