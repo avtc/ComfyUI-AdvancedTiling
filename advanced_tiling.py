@@ -11,7 +11,7 @@ from torch.nn import Conv2d
 from torch.nn import functional as F
 from torch.nn.modules.utils import _pair
 from .modes import MODE_NAMES, Settings, ResolvedSettings
-from .dit_tiling import patch_dit_model, _has_conv2d, _create_content_wrapper
+from .dit_tiling import patch_dit_model, _has_conv2d
 
 
 def _hex_remap_batch(centers_x, centers_y, size, wrap_w, wrap_h, rotation):
@@ -291,13 +291,6 @@ class AdvancedTilingSettings:
                         "tooltip": "Round output image to multiples of this value in pixels. Only applies to Rectangular mode when crop is enabled. 1 = no rounding.",
                     },
                 ),
-                "conv2d_content_wrapping": (
-                    "BOOLEAN",
-                    {
-                        "default": True,
-                        "tooltip": "Enable per-step latent wrapping for Conv2D (UNet) models. Fills margin/waste positions with opposite-edge content each denoising step. Disable if tiling artifacts appear.",
-                    },
-                ),
             },
         }
 
@@ -305,12 +298,12 @@ class AdvancedTilingSettings:
     RETURN_NAMES = ("SETTINGS",)
     FUNCTION = "run"
 
-    def run(self, mode, rotation, scale, min_margin, divisible_by, conv2d_content_wrapping):
+    def run(self, mode, rotation, scale, min_margin, divisible_by):
         """
         Creates tiling settings from node inputs
         """
 
-        settings = Settings(mode, rotation, scale, min_margin, divisible_by, conv2d_content_wrapping)
+        settings = Settings(mode, rotation, scale, min_margin, divisible_by)
 
         return (settings,)
 
@@ -366,10 +359,6 @@ class AdvancedTiling:
 
         if is_conv2d:
             patch_model(model_copy.model, resolved)
-
-            if settings.conv2d_content_wrapping and resolved.margin_lat_w > 0:
-                wrapper = _create_content_wrapper(resolved)
-                model_copy.set_model_unet_function_wrapper(wrapper)
         else:
             patch_dit_model(model_copy, resolved)
 

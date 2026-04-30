@@ -22,15 +22,14 @@ class Settings:
     and resolution-dependent properties pre-computed.
     """
 
-    __slots__ = ("mode", "rotation", "scale", "min_margin", "divisible_by", "conv2d_content_wrapping")
+    __slots__ = ("mode", "rotation", "scale", "min_margin", "divisible_by")
 
-    def __init__(self, mode, rotation, scale, min_margin, divisible_by, conv2d_content_wrapping):
+    def __init__(self, mode, rotation, scale, min_margin, divisible_by):
         self.mode = mode
         self.rotation = rotation
         self.scale = scale
         self.min_margin = min_margin
         self.divisible_by = divisible_by
-        self.conv2d_content_wrapping = conv2d_content_wrapping
 
     def _resolve_auto(self, is_conv2d: bool, vae_factor: int, patch_size: int,
                       img_w: int, img_h: int) -> "ResolvedSettings":
@@ -125,13 +124,13 @@ class Settings:
         if not isinstance(other, Settings):
             return NotImplemented
         return (self.mode, self.rotation, self.scale, self.min_margin,
-                self.divisible_by, self.conv2d_content_wrapping) == (
+                self.divisible_by) == (
                     other.mode, other.rotation, other.scale,
-                    other.min_margin, other.divisible_by, other.conv2d_content_wrapping)
+                    other.min_margin, other.divisible_by)
 
     def __hash__(self):
         return hash((self.mode, self.rotation, self.scale, self.min_margin,
-                     self.divisible_by, self.conv2d_content_wrapping))
+                     self.divisible_by))
 
 
 class ResolvedSettings:
