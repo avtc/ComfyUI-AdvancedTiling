@@ -65,7 +65,7 @@ def _compute_hex_boundary_pairs(
                 w, h,
                 (w_patches, h_patches),
                 resolved.hex_size_patch,
-                resolved,
+                resolved.rotation,
             )
             if src_w != w or src_h != h:
                 continue
@@ -77,7 +77,7 @@ def _compute_hex_boundary_pairs(
                     nw, nh,
                     (w_patches, h_patches),
                     resolved.hex_size_patch,
-                    resolved,
+                    resolved.rotation,
                 )
 
                 if n_src_w != nw or n_src_h != nh:
@@ -310,7 +310,7 @@ class LuminaWastePatch:
                         w, h,
                         (w_patches, h_patches),
                         self.resolved.hex_size_patch,
-                        self.resolved,
+                        self.resolved.rotation,
                     )
                     if src_w != w or src_h != h:
                         waste_indices.append(h * w_patches + w)

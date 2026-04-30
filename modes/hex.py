@@ -7,7 +7,6 @@ Some of this code is taken from excelent guide https://www.redblobgames.com/grid
 import math
 import functools
 
-from . import Settings
 from .utils import rotation_matrix
 import numpy as np
 
@@ -76,48 +75,49 @@ def cube_round(frac_coords: tuple[float, float, float]) -> tuple[int, int, int]:
 
 
 @functools.cache
-def get_matrix(settings: Settings) -> np.ndarray:
+def get_matrix(rotation: float) -> np.ndarray:
     """
     Get rotation matrix
 
-    :param settings: Tiling settings
+    :param rotation: Rotation angle in degrees
     :return: Rotation matrix
     """
 
     return np.matmul(
-        rotation_matrix(settings.rotation),
+        rotation_matrix(rotation),
         # Hexagon basis vectors
         np.array([[math.sqrt(3), math.sqrt(3) / 2], [0, 3 / 2]]),
     )
 
 
 @functools.cache
-def get_inverse_matrix(settings: Settings) -> np.ndarray:
+def get_inverse_matrix(rotation: float) -> np.ndarray:
     """
     Get inverse rotation matrix
 
-    :param settings: Tiling settings
+    :param rotation: Rotation angle in degrees
     :return: Inverse rotation matrix
     """
 
-    return np.linalg.inv(get_matrix(settings))
+    return np.linalg.inv(get_matrix(rotation))
 
 
 def hex_to_pixel(
-    hex_coords: tuple[int, int], size: int, settings: Settings
+    hex_coords: tuple[int, int], size: int, rotation: float
 ) -> tuple[int, int]:
     """
     Convert hexagonal coordinates to pixel coordinates
 
     :param hex_coords: Hexagonal coordinates
     :param size: Size of hexagon
+    :param rotation: Rotation angle in degrees
     :return: Pixel coordinates
     """
 
     (x, y) = (
         size
         * np.matmul(
-            get_matrix(settings),
+            get_matrix(rotation),
             np.array([[hex_coords[0]], [hex_coords[1]]]),
         ).flatten()
     )
@@ -127,19 +127,20 @@ def hex_to_pixel(
 
 
 def pixel_to_hex(
-    pixel_coords: tuple[int, int], size: int, settings: Settings
+    pixel_coords: tuple[int, int], size: int, rotation: float
 ) -> tuple[float, float]:
     """
     Convert pixel coordinates to fractional hexagonal coordinates
 
     :param pixel_coords: Pixel coordinates
     :param size: Size of hexagon
+    :param rotation: Rotation angle in degrees
     :return: Fractional hexagonal coordinates
     """
 
     (q, r) = (
         np.matmul(
-            get_inverse_matrix(settings),
+            get_inverse_matrix(rotation),
             np.array([[pixel_coords[0]], [pixel_coords[1]]]),
         ).flatten()
         / size
@@ -154,7 +155,7 @@ def hex_tiling(
     y: int,
     padded_size: tuple[int, int],
     hex_size: float,
-    settings: Settings,
+    rotation: float,
 ) -> tuple[int, int]:
     """Hexagonal tiling with pre-computed hex radius.
 
@@ -162,18 +163,18 @@ def hex_tiling(
     :param y: Y coordinate in padded space
     :param padded_size: (width, height) of padded tensor
     :param hex_size: Hex radius (pre-computed at appropriate resolution)
-    :param settings: Tiling settings (used for rotation matrix only)
+    :param rotation: Rotation angle in degrees
     :return: (new_x, new_y) source coordinates in padded space
     """
     q, r = pixel_to_hex(
         (x - padded_size[0] // 2, y - padded_size[1] // 2),
         hex_size,
-        settings,
+        rotation,
     )
     rounded = axial_round((q, r))
     q -= rounded[0]
     r -= rounded[1]
-    new_x, new_y = hex_to_pixel((q, r), hex_size, settings)
+    new_x, new_y = hex_to_pixel((q, r), hex_size, rotation)
     new_x = (new_x + padded_size[0] // 2) % padded_size[0]
     new_y = (new_y + padded_size[1] // 2) % padded_size[1]
 

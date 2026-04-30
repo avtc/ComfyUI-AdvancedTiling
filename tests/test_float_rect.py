@@ -30,7 +30,7 @@ def _resolve(scale, min_margin, divisible_by, mode="Rectangular",
              is_conv2d=False, vae_factor=VAE_FACTOR, patch_size=PATCH_SIZE,
              img_W=IMG_W, img_H=IMG_H):
     """Helper: create Settings and resolve."""
-    s = Settings(mode, 0.0, scale=scale, min_margin=min_margin, divisible_by=divisible_by)
+    s = Settings(mode, 0.0, scale=scale, min_margin=min_margin, divisible_by=divisible_by, conv2d_content_wrapping=True)
     return s._resolve_auto(is_conv2d, vae_factor, patch_size, img_W, img_H)
 
 
@@ -134,7 +134,7 @@ def test_resolve_auto_scale_dit_hex():
 
 def test_resolve_no_mutation():
     """_resolve_auto returns a new ResolvedSettings, original Settings is unchanged."""
-    s = Settings("Rectangular", 0.0, scale=0.0, min_margin=-1, divisible_by=1)
+    s = Settings("Rectangular", 0.0, scale=0.0, min_margin=-1, divisible_by=1, conv2d_content_wrapping=True)
     r = s._resolve_auto(False, VAE_FACTOR, PATCH_SIZE, IMG_W, IMG_H)
     assert s.scale == 0.0
     assert s.min_margin == -1
@@ -251,16 +251,16 @@ def test_end_to_end_scale_and_divisible():
 
 def test_settings_eq():
     """Settings with same values are equal."""
-    s1 = Settings("Rectangular", 0.0, scale=0.8, min_margin=4, divisible_by=64)
-    s2 = Settings("Rectangular", 0.0, scale=0.8, min_margin=4, divisible_by=64)
+    s1 = Settings("Rectangular", 0.0, scale=0.8, min_margin=4, divisible_by=64, conv2d_content_wrapping=True)
+    s2 = Settings("Rectangular", 0.0, scale=0.8, min_margin=4, divisible_by=64, conv2d_content_wrapping=True)
     assert s1 == s2
     assert hash(s1) == hash(s2)
 
 
 def test_settings_eq_different():
     """Settings with different values are not equal."""
-    s1 = Settings("Rectangular", 0.0, scale=0.8, min_margin=4, divisible_by=1)
-    s2 = Settings("Rectangular", 0.0, scale=0.9, min_margin=4, divisible_by=1)
+    s1 = Settings("Rectangular", 0.0, scale=0.8, min_margin=4, divisible_by=1, conv2d_content_wrapping=True)
+    s2 = Settings("Rectangular", 0.0, scale=0.9, min_margin=4, divisible_by=1, conv2d_content_wrapping=True)
     assert s1 != s2
 
 

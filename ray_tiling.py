@@ -54,17 +54,14 @@ if HAS_RAYLIGHT:
             vae = vae_list[0]
             vae_factor = vae.spacial_compression_decode()
 
-            # Resolve per-latent with image dimensions
-            resolved_list = []
-            for latent in latent_list:
-                _, _, H_lat, W_lat = latent["samples"].shape
-                img_W = W_lat * vae_factor
-                img_H = H_lat * vae_factor
-                # Raylight only supports DiT models (is_conv2d=False, patch_size=2)
-                resolved = settings._resolve_auto(False, vae_factor, 2, img_W, img_H)
-                resolved_list.append(resolved)
-
-            if resolved_list[0].mode == "None":
+            if settings.mode == "None":
+                resolved_list = []
+                for latent in latent_list:
+                    _, _, H_lat, W_lat = latent["samples"].shape
+                    img_W = W_lat * vae_factor
+                    img_H = H_lat * vae_factor
+                    resolved = settings._resolve_auto(False, vae_factor, 2, img_W, img_H)
+                    resolved_list.append(resolved)
                 return (ray_actors, resolved_list)
 
             gpu_workers = ray_actors["workers"]
@@ -101,7 +98,7 @@ if HAS_RAYLIGHT:
 
                 diff_model = model.model.diffusion_model
                 patch_size = getattr(diff_model, 'patch_size', 1)
-                raw = Settings(mode, rotation, scale, min_margin, divisible_by)
+                raw = Settings(mode, rotation, scale, min_margin, divisible_by, conv2d_content_wrapping=True)
                 resolved = raw._resolve_auto(False, vae_factor, patch_size, img_W, img_H)
                 patch_dit_model(model, resolved)
                 return resolved

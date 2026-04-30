@@ -14,7 +14,7 @@ from .modes import MODE_NAMES, Settings, ResolvedSettings
 from .dit_tiling import patch_dit_model, _has_conv2d, _create_content_wrapper
 
 
-def _hex_remap_batch(centers_x, centers_y, size, wrap_w, wrap_h, settings):
+def _hex_remap_batch(centers_x, centers_y, size, wrap_w, wrap_h, rotation):
     """Vectorized hex coordinate remapping for all pixels at once."""
     import numpy as np
     from .modes.hex import get_inverse_matrix, get_matrix
@@ -22,8 +22,8 @@ def _hex_remap_batch(centers_x, centers_y, size, wrap_w, wrap_h, settings):
     flat_x = np.asarray(centers_x).ravel().astype(np.float64)
     flat_y = np.asarray(centers_y).ravel().astype(np.float64)
 
-    inv_mat = get_inverse_matrix(settings)
-    mat = get_matrix(settings)
+    inv_mat = get_inverse_matrix(rotation)
+    mat = get_matrix(rotation)
 
     # pixel_to_hex (batch): inverse matrix multiply + divide by size
     pts = np.stack([flat_x, flat_y], axis=0)
@@ -95,7 +95,7 @@ def calculate_mapping(
         cx = np.arange(pw, dtype=np.float64) - pw // 2
         cy = np.arange(ph, dtype=np.float64) - ph // 2
         grid_cx, grid_cy = np.meshgrid(cx, cy, indexing='xy')
-        new_x, new_y = _hex_remap_batch(grid_cx, grid_cy, size, pw, ph, resolved)
+        new_x, new_y = _hex_remap_batch(grid_cx, grid_cy, size, pw, ph, resolved.rotation)
 
         src_x = np.tile(np.arange(pw, dtype=np.int64), ph)
         src_y = np.repeat(np.arange(ph, dtype=np.int64), pw)
@@ -129,7 +129,7 @@ def create_crop_mask(width: int, height: int, resolved: ResolvedSettings):
         cx = np.arange(width, dtype=np.float64) - width // 2
         cy = np.arange(height, dtype=np.float64) - height // 2
         grid_cx, grid_cy = np.meshgrid(cx, cy, indexing='xy')
-        new_x, new_y = _hex_remap_batch(grid_cx, grid_cy, size, width, height, resolved)
+        new_x, new_y = _hex_remap_batch(grid_cx, grid_cy, size, width, height, resolved.rotation)
 
         src_x = np.tile(np.arange(width, dtype=np.int64), height)
         src_y = np.repeat(np.arange(height, dtype=np.int64), width)
@@ -285,6 +285,13 @@ class AdvancedTilingSettings:
                         "tooltip": "Round output image to multiples of this value in pixels. Only applies to Rectangular mode when crop is enabled. 1 = no rounding.",
                     },
                 ),
+                "conv2d_content_wrapping": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "Enable per-step latent wrapping for Conv2D (UNet) models. Fills margin/waste positions with opposite-edge content each denoising step. Disable if tiling artifacts appear.",
+                    },
+                ),
             },
         }
 
@@ -292,12 +299,12 @@ class AdvancedTilingSettings:
     RETURN_NAMES = ("SETTINGS",)
     FUNCTION = "run"
 
-    def run(self, mode, rotation, scale, min_margin, divisible_by):
+    def run(self, mode, rotation, scale, min_margin, divisible_by, conv2d_content_wrapping):
         """
         Creates tiling settings from node inputs
         """
 
-        settings = Settings(mode, rotation, scale, min_margin, divisible_by)
+        settings = Settings(mode, rotation, scale, min_margin, divisible_by, conv2d_content_wrapping)
 
         return (settings,)
 
@@ -354,7 +361,7 @@ class AdvancedTiling:
         if is_conv2d:
             patch_model(model_copy.model, resolved)
 
-            if resolved.mode == "Rectangular" and resolved.margin_lat_w > 0:
+            if settings.conv2d_content_wrapping and resolved.margin_lat_w > 0:
                 wrapper = _create_content_wrapper(resolved)
                 model_copy.set_model_unet_function_wrapper(wrapper)
         else:
@@ -362,28 +369,6 @@ class AdvancedTiling:
 
         return (model_copy, resolved)
 
-
-def hex_square_crop(rmin, rmax, cmin, cmax, img_h, img_w, divisible_by):
-    """Compute square crop bounds centered on the hex bounding box.
-
-    Hex height == hex width (square crop). If divisible_by > 1, rounds down
-    to the nearest multiple for both dimensions.
-
-    :return: (sq_rmin, sq_rmax, sq_cmin, sq_cmax) inclusive indices
-    """
-    hex_h = rmax - rmin + 1
-    if divisible_by > 1:
-        hex_h = (hex_h // divisible_by) * divisible_by
-    center_r = (rmin + rmax) // 2
-    center_c = (cmin + cmax) // 2
-    half = hex_h // 2
-    sq_rmin = max(0, center_r - half)
-    sq_cmin = max(0, center_c - half)
-    sq_rmax = min(img_h, sq_rmin + hex_h) - 1
-    sq_cmax = min(img_w, sq_cmin + hex_h) - 1
-    sq_rmin = max(0, sq_rmax + 1 - hex_h)
-    sq_cmin = max(0, sq_cmax + 1 - hex_h)
-    return sq_rmin, sq_rmax, sq_cmin, sq_cmax
 
 
 class AdvancedTilingVAEDecode:
@@ -467,19 +452,32 @@ class AdvancedTilingVAEDecode:
             image = image.squeeze(1)
 
         if crop:
+            img_h, img_w = image.shape[1], image.shape[2]
+            mask = create_crop_mask(img_w, img_h, settings)
+
             if settings.mode == "Rectangular" and settings.margin_img_w > 0:
-                img_h, img_w = image.shape[1], image.shape[2]
-                mask = create_crop_mask(img_w, img_h, settings)
-                rmin, rmax, cmin, cmax = _mask_bounding_box(mask)
+                # Crop to working rectangle using pre-computed margins
+                cx, cy = img_w / 2.0, img_h / 2.0
+                half_w = settings.work_img_w / 2.0
+                half_h = settings.work_img_h / 2.0
+                cmin = int(round(cx - half_w))
+                cmax = int(round(cx + half_w)) - 1
+                rmin = int(round(cy - half_h))
+                rmax = int(round(cy + half_h)) - 1
                 image = _crop_with_mask(image, mask, rmin, rmax, cmin, cmax)
 
             elif settings.mode == "Hexagon":
-                img_h, img_w = image.shape[1], image.shape[2]
-                mask = create_crop_mask(img_w, img_h, settings)
-                rmin, rmax, cmin, cmax = _mask_bounding_box(mask)
-                sq_rmin, sq_rmax, sq_cmin, sq_cmax = hex_square_crop(
-                    rmin, rmax, cmin, cmax, img_h, img_w, settings.divisible_by,
-                )
-                image = _crop_with_mask(image, mask, sq_rmin, sq_rmax, sq_cmin, sq_cmax)
+                # Crop to square hex bounding box using pre-computed hex size
+                hex_side = int(round(2 * settings.hex_size_img))
+                center_r = img_h // 2
+                center_c = img_w // 2
+                half = hex_side // 2
+                rmin = max(0, center_r - half)
+                cmin = max(0, center_c - half)
+                rmax = min(img_h, rmin + hex_side) - 1
+                cmax = min(img_w, cmin + hex_side) - 1
+                rmin = max(0, rmax + 1 - hex_side)
+                cmin = max(0, cmax + 1 - hex_side)
+                image = _crop_with_mask(image, mask, rmin, rmax, cmin, cmax)
 
         return (image,)
