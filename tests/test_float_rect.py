@@ -1,6 +1,5 @@
 import sys
 import os
-import math
 
 _test_dir = os.path.dirname(os.path.abspath(__file__))
 _pkg_dir = os.path.dirname(_test_dir)
@@ -18,106 +17,163 @@ sys.modules["ComfyUI_AdvancedTiling"] = _pkg
 sys.modules["ComfyUI-AdvancedTiling"] = _pkg
 _spec.loader.exec_module(_pkg)
 
-from ComfyUI_AdvancedTiling.modes import Settings
-from ComfyUI_AdvancedTiling.modes.rect import compute_float_rect_dims, rect_tiling
+from ComfyUI_AdvancedTiling.modes import Settings, ResolvedSettings
+from ComfyUI_AdvancedTiling.modes.rect import rect_tiling
 
 VAE_FACTOR = 8
+PATCH_SIZE = 2
+IMG_W = 1024
+IMG_H = 1024
 
 
-def test_no_margin_no_divisible():
-    """scale=1.0, min_margin=0, divisible_by=1 → dims equal input."""
-    s = Settings("Rectangular", 0.0, scale=1.0, min_margin=0, divisible_by=1)
-    w, h = compute_float_rect_dims(128, 128, s, VAE_FACTOR)
-    assert w == 128.0
-    assert h == 128.0
+def _resolve(scale, min_margin, divisible_by, mode="Rectangular",
+             is_conv2d=False, vae_factor=VAE_FACTOR, patch_size=PATCH_SIZE,
+             img_W=IMG_W, img_H=IMG_H):
+    """Helper: create Settings and resolve."""
+    s = Settings(mode, 0.0, scale=scale, min_margin=min_margin, divisible_by=divisible_by)
+    return s._resolve_auto(is_conv2d, vae_factor, patch_size, img_W, img_H)
 
 
-def test_scale_reduces_dims():
-    """scale=0.5 → dims are half."""
-    s = Settings("Rectangular", 0.0, scale=0.5, min_margin=0, divisible_by=1)
-    w, h = compute_float_rect_dims(128, 128, s, VAE_FACTOR)
-    assert w == 64.0
-    assert h == 64.0
+# --- ResolvedSettings tests ---
 
 
-def test_min_margin_reduces_dims():
-    """scale=1.0, min_margin=4 -> dims reduced by 2*margin."""
-    s = Settings("Rectangular", 0.0, scale=1.0, min_margin=4, divisible_by=1)
-    w, h = compute_float_rect_dims(128, 128, s, VAE_FACTOR)
-    assert w == 128.0 - 2 * s.min_margin
-    assert h == 128.0 - 2 * s.min_margin
+def test_resolve_floor_margin_scale_dominates():
+    """scale=0.875 gives base_margin=64 > min_margin_img=32, so margin=64."""
+    r = _resolve(scale=0.875, min_margin=4, divisible_by=1)
+    # base_margin = 1024 * 0.125 / 2 = 64, min_margin_img = 4 * 8 = 32
+    # margin = max(64, 32) = 64, work = 1024 - 128 = 896
+    assert r.work_img_w == 896.0
+    assert r.margin_img_w == 64.0
 
 
-def test_scale_and_margin():
-    """Both scale and margin applied."""
-    s = Settings("Rectangular", 0.0, scale=0.8, min_margin=4, divisible_by=1)
-    w, h = compute_float_rect_dims(128, 128, s, VAE_FACTOR)
-    assert w == 128.0 * s.scale - 2 * s.min_margin
-    assert h == 128.0 * s.scale - 2 * s.min_margin
+def test_resolve_floor_margin_min_dominates():
+    """scale=0.98 gives base_margin=10.24 < min_margin_img=32, so margin=32."""
+    r = _resolve(scale=0.98, min_margin=4, divisible_by=1)
+    # base_margin = 1024 * 0.02 / 2 = 10.24, min_margin_img = 32
+    # margin = max(10.24, 32) = 32, work = 1024 - 64 = 960
+    assert r.work_img_w == 960.0
+    assert r.margin_img_w == 32.0
 
 
-def test_divisible_by_rounds_down():
-    """divisible_by rounds dims down to nearest valid image-pixel multiple."""
-    s = Settings("Rectangular", 0.0, scale=0.8, min_margin=4, divisible_by=64)
-    w, h = compute_float_rect_dims(128, 128, s, vae_factor=8)
-    assert w == 88.0
-    assert h == 88.0
+def test_resolve_divisible_by():
+    """divisible_by=9 rounds working area down."""
+    r = _resolve(scale=0.98, min_margin=4, divisible_by=9)
+    # margin=32, work=960, 960//9*9=954, final_margin=(1024-954)/2=35
+    assert r.work_img_w == 954.0
+    assert r.margin_img_w == 35.0
 
 
-def test_divisible_by_no_rounding_when_exact():
-    """divisible_by=8 with dims already divisible → no change."""
-    s = Settings("Rectangular", 0.0, scale=0.5, min_margin=0, divisible_by=8)
-    w, h = compute_float_rect_dims(128, 128, s, vae_factor=8)
-    assert w == 64.0
-    assert h == 64.0
+def test_resolve_latent_downscale():
+    """Latent values are image values / vae_factor."""
+    r = _resolve(scale=0.98, min_margin=4, divisible_by=1)
+    assert r.work_lat_w == 960.0 / 8
+    assert r.margin_lat_w == 32.0 / 8
 
 
-def test_non_square():
-    """Non-square dimensions."""
-    s = Settings("Rectangular", 0.0, scale=0.75, min_margin=2, divisible_by=1)
-    w, h = compute_float_rect_dims(100, 80, s, VAE_FACTOR)
-    assert w == 100.0 * s.scale - 2 * s.min_margin
-    assert h == 80.0 * s.scale - 2 * s.min_margin
+def test_resolve_patch_downscale():
+    """Patch values are image values / (vae_factor * patch_size)."""
+    r = _resolve(scale=0.98, min_margin=4, divisible_by=1)
+    assert r.work_patch_w == 960.0 / 16
+    assert r.margin_patch_w == 32.0 / 16
 
 
-# --- rect_tiling tests ---
+def test_resolve_rectangular_image():
+    """Non-square image: margins differ per dimension."""
+    r = _resolve(scale=0.98, min_margin=4, divisible_by=9, img_W=1024, img_H=768)
+    assert r.work_img_w == 954.0
+    # 768: base=768*0.02/2=7.68, min_img=32, margin=32, work=704, 704//9*9=702
+    assert r.work_img_h == 702.0
+    assert r.margin_img_w == 35.0
+    assert r.margin_img_h == 33.0
+
+
+def test_resolve_hex_mode():
+    """Hex mode computes hex_size from min(W,H)."""
+    r = _resolve(scale=0.8, min_margin=0, divisible_by=1, mode="Hexagon")
+    # base_margin = 512 * 0.2 = 102.4, min_margin_img = 0
+    # margin = 102.4, hex_size = 512 - 102.4 = 409.6
+    assert r.hex_size_img == 409.6
+    assert r.hex_size_lat == 409.6 / 8
+    assert r.hex_size_patch == 409.6 / 16
+
+
+def test_resolve_none_mode():
+    """None mode has all zeros."""
+    r = _resolve(scale=0.8, min_margin=4, divisible_by=1, mode="None")
+    assert r.mode == "None"
+    assert r.work_img_w == 0.0
+    assert r.hex_size_img == 0.0
+
+
+def test_resolve_auto_scale_conv2d():
+    """scale=0.0 resolves to 1.0 for Conv2d models."""
+    r = _resolve(scale=0.0, min_margin=-1, divisible_by=1, is_conv2d=True)
+    # Conv2d Rect: scale=1.0, min_margin=0
+    # base_margin = 0, min_margin_img = 0, work = 1024
+    assert r.work_img_w == 1024.0
+    assert r.margin_img_w == 0.0
+
+
+def test_resolve_auto_scale_dit_rect():
+    """scale=0.0 resolves to 7/8 for DiT Rectangular."""
+    r = _resolve(scale=0.0, min_margin=-1, divisible_by=1, is_conv2d=False)
+    # scale=7/8, min_margin=4
+    # base_margin = 1024*0.125/2 = 64, min_margin_img = 32
+    # margin = 64, work = 896
+    assert r.work_img_w == 896.0
+    assert r.margin_img_w == 64.0
+
+
+def test_resolve_auto_scale_dit_hex():
+    """scale=0.0 resolves to 1.0 for DiT Hexagon."""
+    r = _resolve(scale=0.0, min_margin=-1, divisible_by=1, mode="Hexagon", is_conv2d=False)
+    # scale=1.0, min_margin=0
+    # base_margin = 0, hex_size = 512
+    assert r.hex_size_img == 512.0
+
+
+def test_resolve_no_mutation():
+    """_resolve_auto returns a new ResolvedSettings, original Settings is unchanged."""
+    s = Settings("Rectangular", 0.0, scale=0.0, min_margin=-1, divisible_by=1)
+    r = s._resolve_auto(False, VAE_FACTOR, PATCH_SIZE, IMG_W, IMG_H)
+    assert s.scale == 0.0
+    assert s.min_margin == -1
+    assert isinstance(r, ResolvedSettings)
+
+
+# --- rect_tiling tests (new API) ---
+
 
 def test_rect_identity_inside():
     """Pixels inside the float rectangle map to themselves."""
-    s = Settings("Rectangular", 0.0, scale=1.0, min_margin=0, divisible_by=1)
-    result = rect_tiling(5, 5, (10, 10), (10, 10), s, VAE_FACTOR)
+    # work_w=10, work_h=10 at 10x10 → no margin, all identity
+    result = rect_tiling(5, 5, (10, 10), 10.0, 10.0)
     assert result == (5, 5)
 
 
 def test_rect_wraps_right_to_left():
     """Pixel at right edge wraps to left."""
-    s = Settings("Rectangular", 0.0, scale=1.0, min_margin=0, divisible_by=1)
-    result = rect_tiling(10, 5, (10, 10), (10, 10), s, VAE_FACTOR)
+    result = rect_tiling(10, 5, (10, 10), 10.0, 10.0)
     assert result == (0, 5)
 
 
 def test_rect_wraps_bottom_to_top():
     """Pixel at bottom edge wraps to top."""
-    s = Settings("Rectangular", 0.0, scale=1.0, min_margin=0, divisible_by=1)
-    result = rect_tiling(5, 10, (10, 10), (10, 10), s, VAE_FACTOR)
+    result = rect_tiling(5, 10, (10, 10), 10.0, 10.0)
     assert result == (5, 0)
 
 
 def test_rect_scaled_wraps_outside():
     """Pixel outside scaled rectangle wraps to inside."""
-    s = Settings("Rectangular", 0.0, scale=0.5, min_margin=0, divisible_by=1)
-    # work_w = 10 * 0.5 = 5.0, center = 5.0
-    # x=0 is outside the rect (rect starts at 2.5), so it wraps
-    result = rect_tiling(0, 0, (10, 10), (10, 10), s, VAE_FACTOR)
-    assert result != (0, 0)  # Should wrap to inside
+    # work_w=5.0, center=5.0, x=0 is outside [2.5, 7.5)
+    result = rect_tiling(0, 0, (10, 10), 5.0, 5.0)
+    assert result != (0, 0)
 
 
 def test_rect_scaled_identity_inside():
     """Pixel inside scaled rectangle maps to itself."""
-    s = Settings("Rectangular", 0.0, scale=0.5, min_margin=0, divisible_by=1)
-    # work_w = 5.0, center = 5.0, rect spans [2.5, 7.5)
-    # x=5 is inside
-    result = rect_tiling(5, 5, (10, 10), (10, 10), s, VAE_FACTOR)
+    # work_w=5.0, center=5.0, rect spans [2.5, 7.5), x=5 is inside
+    result = rect_tiling(5, 5, (10, 10), 5.0, 5.0)
     assert result == (5, 5)
 
 
@@ -127,16 +183,16 @@ import ComfyUI_AdvancedTiling.advanced_tiling as at_mod
 
 
 def test_calculate_mapping_rect_identity():
-    """All pixels inside rect map to themselves → empty mapping."""
-    s = Settings("Rectangular", 0.0, scale=1.0, min_margin=0, divisible_by=1)
-    src_x, src_y, new_x, new_y = at_mod.calculate_mapping((10, 10), (10, 10), s, VAE_FACTOR)
+    """All pixels inside rect map to themselves -> empty mapping."""
+    r = _resolve(scale=1.0, min_margin=0, divisible_by=1)
+    src_x, src_y, new_x, new_y = at_mod.calculate_mapping((10, 10), (10, 10), r)
     assert len(src_x) == 0
 
 
 def test_calculate_mapping_rect_scaled_has_remapping():
     """Scaled rect produces non-empty mapping for outside pixels."""
-    s = Settings("Rectangular", 0.0, scale=0.5, min_margin=0, divisible_by=1)
-    src_x, src_y, new_x, new_y = at_mod.calculate_mapping((10, 10), (10, 10), s, VAE_FACTOR)
+    r = _resolve(scale=0.5, min_margin=0, divisible_by=1, img_W=10, img_H=10)
+    src_x, src_y, new_x, new_y = at_mod.calculate_mapping((10, 10), (10, 10), r)
     assert len(src_x) > 0
 
 
@@ -144,156 +200,53 @@ def test_calculate_mapping_rect_scaled_has_remapping():
 
 
 def test_crop_mask_rect_full():
-    """scale=1.0, no margin → all pixels in mask."""
-    s = Settings("Rectangular", 0.0, scale=1.0, min_margin=0, divisible_by=1)
-    mask = at_mod.create_crop_mask(10, 10, s, vae_factor=1)
+    """scale=1.0, no margin -> all pixels in mask."""
+    r = _resolve(scale=1.0, min_margin=0, divisible_by=1)
+    mask = at_mod.create_crop_mask(10, 10, r)
     assert mask.shape == (1, 10, 10, 1)
-    assert mask.sum().item() == 100  # all ones
+    assert mask.sum().item() == 100
 
 
 def test_crop_mask_rect_scaled():
-    """scale=0.5 → mask has fewer pixels than total."""
-    s = Settings("Rectangular", 0.0, scale=0.5, min_margin=0, divisible_by=1)
-    mask = at_mod.create_crop_mask(10, 10, s, vae_factor=1)
+    """scale=0.5 -> mask has fewer pixels than total."""
+    r = _resolve(scale=0.5, min_margin=0, divisible_by=1, img_W=10, img_H=10)
+    mask = at_mod.create_crop_mask(10, 10, r)
     assert mask.shape == (1, 10, 10, 1)
-    assert mask.sum().item() < 100  # some pixels outside rect
-    assert mask.sum().item() > 0    # some pixels inside
+    assert mask.sum().item() < 100
+    assert mask.sum().item() > 0
 
 
 # --- integration tests ---
 
 
 def test_end_to_end_scale_and_divisible():
-    """Full pipeline: scale -> min_margin -> divisible_by -> wrapping -> crop mask."""
-    W, H = 128, 128
-    s = Settings("Rectangular", 0.0, scale=0.8, min_margin=4, divisible_by=64)
+    """Full pipeline: resolve -> wrapping -> crop mask."""
+    W_lat, H_lat = 128, 128
+    r = _resolve(scale=0.8, min_margin=4, divisible_by=64)
 
-    # 1. Float dims are valid and divisible_by is respected
-    work_w, work_h = compute_float_rect_dims(W, H, s, vae_factor=8)
-    assert work_w > 0 and work_h > 0
-    assert (work_w * VAE_FACTOR) % s.divisible_by == 0
-    assert (work_h * VAE_FACTOR) % s.divisible_by == 0
+    # 1. Working area is valid
+    assert r.work_lat_w > 0 and r.work_lat_h > 0
 
     # 2. Wrapping: center pixel is identity
-    result = rect_tiling(W // 2, H // 2, (W, H), (W, H), s, VAE_FACTOR)
-    assert result == (W // 2, H // 2)
+    result = rect_tiling(W_lat // 2, H_lat // 2, (W_lat, H_lat),
+                         r.work_lat_w, r.work_lat_h)
+    assert result == (W_lat // 2, H_lat // 2)
 
     # 3. Wrapping: corner pixel wraps
-    result = rect_tiling(0, 0, (W, H), (W, H), s, VAE_FACTOR)
+    result = rect_tiling(0, 0, (W_lat, H_lat), r.work_lat_w, r.work_lat_h)
     assert result != (0, 0)
 
     # 4. Mapping is non-empty
-    mapping = at_mod.calculate_mapping((W, H), (W, H), s, VAE_FACTOR)
+    mapping = at_mod.calculate_mapping((W_lat, H_lat), (W_lat, H_lat), r)
     assert len(mapping[0]) > 0
 
     # 5. Crop mask covers fewer pixels than total
-    mask = at_mod.create_crop_mask(W, H, s, vae_factor=1)
-    assert mask.sum().item() < W * H
+    mask = at_mod.create_crop_mask(IMG_W, IMG_H, r)
+    assert mask.sum().item() < IMG_W * IMG_H
     assert mask.sum().item() > 0
 
 
-# --- edge case tests ---
-
-
-def test_zero_scale_clamps_to_minimum():
-    """scale=0.0 → dims clamped to 1.0 (no ZeroDivisionError)."""
-    s = Settings("Rectangular", 0.0, scale=0.0, min_margin=0, divisible_by=1)
-    w, h = compute_float_rect_dims(128, 128, s, VAE_FACTOR)
-    assert w >= 1.0
-    assert h >= 1.0
-
-
-def test_negative_dims_clamped():
-    """Large min_margin relative to dims → clamped to 1.0."""
-    s = Settings("Rectangular", 0.0, scale=0.1, min_margin=20, divisible_by=1)
-    w, h = compute_float_rect_dims(32, 32, s, VAE_FACTOR)
-    assert w >= 1.0
-    assert h >= 1.0
-
-
-def test_zero_scale_no_crash_in_tiling():
-    """scale=0.0 does not cause ZeroDivisionError in rect_tiling."""
-    s = Settings("Rectangular", 0.0, scale=0.0, min_margin=0, divisible_by=1)
-    result = rect_tiling(5, 5, (10, 10), (10, 10), s, VAE_FACTOR)
-    assert isinstance(result, tuple) and len(result) == 2
-
-
-def test_non_square_calculate_mapping():
-    """calculate_mapping works for non-square dimensions."""
-    s = Settings("Rectangular", 0.0, scale=0.5, min_margin=0, divisible_by=1)
-    src_x, src_y, new_x, new_y = at_mod.calculate_mapping((20, 10), (20, 10), s, VAE_FACTOR)
-    assert len(src_x) > 0
-    assert len(src_x) == len(src_y) == len(new_x) == len(new_y)
-
-
-def test_non_square_create_crop_mask():
-    """create_crop_mask works for non-square dimensions."""
-    s = Settings("Rectangular", 0.0, scale=0.5, min_margin=0, divisible_by=1)
-    mask = at_mod.create_crop_mask(20, 10, s, vae_factor=1)
-    assert mask.shape == (1, 10, 20, 1)
-    assert mask.sum().item() < 20 * 10
-    assert mask.sum().item() > 0
-
-
-def test_tiling_vs_mapping_consistency():
-    """Per-pixel rect_tiling and vectorized calculate_mapping produce same results."""
-    W, H = 16, 16
-    s = Settings("Rectangular", 0.0, scale=0.6, min_margin=2, divisible_by=1)
-    src_x, src_y, new_x, new_y = at_mod.calculate_mapping((W, H), (W, H), s, VAE_FACTOR)
-
-    for i in range(len(src_x)):
-        sx, sy = src_x[i].item(), src_y[i].item()
-        nx, ny = new_x[i].item(), new_y[i].item()
-        px, py = rect_tiling(sx, sy, (W, H), (W, H), s, VAE_FACTOR)
-        assert (px, py) == (nx, ny), f"Mismatch at ({sx},{sy}): rect_tiling={px},{py} vs mapping={nx},{ny}"
-
-
-def test_divisible_by_not_multiple_of_vae_factor():
-    """divisible_by that isn't a multiple of vae_factor still produces valid dims."""
-    s = Settings("Rectangular", 0.0, scale=1.0, min_margin=0, divisible_by=12)
-    w, h = compute_float_rect_dims(64, 64, s, vae_factor=8)
-    assert w > 0 and h > 0
-    # Latent unit = divisible_by / vae_factor
-    unit_latent = s.divisible_by / VAE_FACTOR
-    assert w % unit_latent == 0.0
-
-
-# --- Settings._resolve_auto tests ---
-
-
-def test_resolve_auto_scale_conv2d():
-    """scale=0.0 resolves to 1.0 for Conv2d models."""
-    s = Settings("Rectangular", 0.0, scale=0.0, min_margin=-1, divisible_by=1)
-    resolved = s._resolve_auto(is_conv2d=True)
-    assert resolved.scale == 1.0
-    assert resolved.min_margin == 0
-    # Original is unchanged
-    assert s.scale == 0.0
-
-
-def test_resolve_auto_scale_dit_rect():
-    """scale=0.0 resolves to 7/8 for DiT Rectangular."""
-    s = Settings("Rectangular", 0.0, scale=0.0, min_margin=-1, divisible_by=1)
-    resolved = s._resolve_auto(is_conv2d=False)
-    assert resolved.scale == 7 / 8
-    assert resolved.min_margin == 4
-
-
-def test_resolve_auto_scale_dit_hex():
-    """scale=0.0 resolves to 1.0 for DiT Hexagon."""
-    s = Settings("Hexagon", 0.0, scale=0.0, min_margin=-1, divisible_by=1)
-    resolved = s._resolve_auto(is_conv2d=False)
-    assert resolved.scale == 1.0
-    assert resolved.min_margin == 0
-
-
-def test_resolve_auto_no_mutation():
-    """_resolve_auto returns a new Settings, original is unchanged."""
-    s = Settings("Rectangular", 0.0, scale=0.0, min_margin=-1, divisible_by=1)
-    resolved = s._resolve_auto(is_conv2d=False)
-    assert s.scale == 0.0
-    assert s.min_margin == -1
-    assert resolved is not s
+# --- Settings equality tests ---
 
 
 def test_settings_eq():
@@ -316,15 +269,15 @@ def test_settings_eq_different():
 
 def test_none_calculate_mapping_empty():
     """None mode produces empty mapping."""
-    s = Settings("None", 0.0, scale=1.0, min_margin=0, divisible_by=1)
-    src_x, src_y, new_x, new_y = at_mod.calculate_mapping((10, 10), (10, 10), s, VAE_FACTOR)
+    r = _resolve(scale=1.0, min_margin=0, divisible_by=1, mode="None")
+    src_x, src_y, new_x, new_y = at_mod.calculate_mapping((10, 10), (10, 10), r)
     assert len(src_x) == 0
 
 
 def test_none_create_crop_mask_full():
     """None mode mask covers all pixels."""
-    s = Settings("None", 0.0, scale=1.0, min_margin=0, divisible_by=1)
-    mask = at_mod.create_crop_mask(10, 10, s, vae_factor=1)
+    r = _resolve(scale=1.0, min_margin=0, divisible_by=1, mode="None")
+    mask = at_mod.create_crop_mask(10, 10, r)
     assert mask.shape == (1, 10, 10, 1)
     assert mask.sum().item() == 100
 
@@ -334,15 +287,15 @@ def test_none_create_crop_mask_full():
 
 def test_hex_calculate_mapping_nonempty():
     """Hex mode with scale < 1 produces non-empty mapping."""
-    s = Settings("Hexagon", 0.0, scale=0.8, min_margin=0, divisible_by=1)
-    src_x, src_y, new_x, new_y = at_mod.calculate_mapping((32, 32), (32, 32), s, VAE_FACTOR)
+    r = _resolve(scale=0.8, min_margin=0, divisible_by=1, mode="Hexagon", img_W=32, img_H=32)
+    src_x, src_y, new_x, new_y = at_mod.calculate_mapping((4, 4), (4, 4), r)
     assert len(src_x) > 0
 
 
 def test_hex_create_crop_mask():
     """Hex mode mask covers fewer pixels than total."""
-    s = Settings("Hexagon", 0.0, scale=0.8, min_margin=0, divisible_by=1)
-    mask = at_mod.create_crop_mask(32, 32, s, vae_factor=1)
+    r = _resolve(scale=0.8, min_margin=0, divisible_by=1, mode="Hexagon", img_W=32, img_H=32)
+    mask = at_mod.create_crop_mask(32, 32, r)
     assert mask.shape == (1, 32, 32, 1)
     assert mask.sum().item() < 32 * 32
     assert mask.sum().item() > 0
@@ -350,15 +303,50 @@ def test_hex_create_crop_mask():
 
 def test_hex_crop_mask_with_margin():
     """Hex mode with min_margin reduces mask area further."""
-    s1 = Settings("Hexagon", 0.0, scale=0.8, min_margin=0, divisible_by=1)
-    s2 = Settings("Hexagon", 0.0, scale=0.8, min_margin=2, divisible_by=1)
-    mask1 = at_mod.create_crop_mask(32, 32, s1, vae_factor=1)
-    mask2 = at_mod.create_crop_mask(32, 32, s2, vae_factor=1)
+    r1 = _resolve(scale=0.8, min_margin=0, divisible_by=1, mode="Hexagon", img_W=32, img_H=32)
+    r2 = _resolve(scale=0.8, min_margin=2, divisible_by=1, mode="Hexagon", img_W=32, img_H=32)
+    mask1 = at_mod.create_crop_mask(32, 32, r1)
+    mask2 = at_mod.create_crop_mask(32, 32, r2)
     assert mask2.sum().item() < mask1.sum().item()
 
 
+# --- tiling vs mapping consistency ---
+
+
+def test_tiling_vs_mapping_consistency():
+    """Per-pixel rect_tiling and vectorized calculate_mapping produce same results."""
+    W_lat, H_lat = 16, 16
+    r = _resolve(scale=0.6, min_margin=2, divisible_by=1, img_W=W_lat * VAE_FACTOR, img_H=H_lat * VAE_FACTOR)
+    src_x, src_y, new_x, new_y = at_mod.calculate_mapping((W_lat, H_lat), (W_lat, H_lat), r)
+
+    for i in range(len(src_x)):
+        sx, sy = src_x[i].item(), src_y[i].item()
+        nx, ny = new_x[i].item(), new_y[i].item()
+        px, py = rect_tiling(sx, sy, (W_lat, H_lat), r.work_lat_w, r.work_lat_h)
+        assert (px, py) == (nx, ny), f"Mismatch at ({sx},{sy}): rect_tiling={px},{py} vs mapping={nx},{ny}"
+
+
+# --- non-square tests ---
+
+
+def test_non_square_calculate_mapping():
+    """calculate_mapping works for non-square dimensions."""
+    r = _resolve(scale=0.5, min_margin=0, divisible_by=1, img_W=20, img_H=10)
+    src_x, src_y, new_x, new_y = at_mod.calculate_mapping((20, 10), (20, 10), r)
+    assert len(src_x) > 0
+    assert len(src_x) == len(src_y) == len(new_x) == len(new_y)
+
+
+def test_non_square_create_crop_mask():
+    """create_crop_mask works for non-square dimensions."""
+    r = _resolve(scale=0.5, min_margin=0, divisible_by=1, img_W=20, img_H=10)
+    mask = at_mod.create_crop_mask(20, 10, r)
+    assert mask.shape == (1, 10, 20, 1)
+    assert mask.sum().item() < 20 * 10
+    assert mask.sum().item() > 0
+
+
 if __name__ == "__main__":
-    import sys
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     passed = 0
     failed = 0

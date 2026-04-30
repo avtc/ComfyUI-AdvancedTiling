@@ -10,25 +10,9 @@ import functools
 
 import torch
 
-from .modes import Settings
+from .modes import ResolvedSettings
 from .modes.hex import hex_tiling
 from .modes.rect import rect_tiling
-
-
-def _make_patch_settings(settings: Settings, patch_size: int, vae_factor: int) -> tuple[Settings, int]:
-    """Create settings and vae_factor for patch-space tiling functions.
-
-    Tiling functions receive patch-space dimensions (latent/patch_size),
-    so min_margin must be divided by patch_size and vae_factor multiplied
-    by patch_size to maintain correct geometry.
-    """
-    if patch_size == 1:
-        return settings, vae_factor
-    scaled = Settings(
-        settings.mode, settings.rotation, settings.scale,
-        settings.min_margin / patch_size, settings.divisible_by,
-    )
-    return scaled, vae_factor * patch_size
 
 
 def _factorize(n: int) -> tuple[int, int]:
@@ -54,8 +38,7 @@ def _factorize(n: int) -> tuple[int, int]:
 def _compute_hex_boundary_pairs(
     h_patches: int,
     w_patches: int,
-    settings: Settings,
-    vae_factor: int,
+    resolved: ResolvedSettings,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute hex boundary neighbor relationships at patch granularity.
@@ -64,12 +47,11 @@ def _compute_hex_boundary_pairs(
     the hex, record the boundary patch index, the wrapped source index,
     and the direction offset.
 
-    Cached by (h_patches, w_patches, settings, vae_factor).
+    Cached by (h_patches, w_patches, resolved).
 
     :param h_patches: Number of patch rows
     :param w_patches: Number of patch columns
-    :param settings: Tiling settings
-    :param vae_factor: VAE downscale factor
+    :param resolved: Resolved tiling settings with pre-computed values
     :return: (boundary_idx, source_idx, off_h, off_w) as LongTensors
     """
     boundary_idx = []
@@ -82,9 +64,8 @@ def _compute_hex_boundary_pairs(
             src_w, src_h = hex_tiling(
                 w, h,
                 (w_patches, h_patches),
-                (w_patches, h_patches),
-                settings,
-                vae_factor,
+                resolved.hex_size_patch,
+                resolved,
             )
             if src_w != w or src_h != h:
                 continue
@@ -95,9 +76,8 @@ def _compute_hex_boundary_pairs(
                 n_src_w, n_src_h = hex_tiling(
                     nw, nh,
                     (w_patches, h_patches),
-                    (w_patches, h_patches),
-                    settings,
-                    vae_factor,
+                    resolved.hex_size_patch,
+                    resolved,
                 )
 
                 if n_src_w != nw or n_src_h != nh:
@@ -129,14 +109,13 @@ def _compute_hex_boundary_pairs(
 def _compute_rect_boundary_pairs(
     h_patches: int,
     w_patches: int,
-    settings: Settings,
-    vae_factor: int,
+    resolved: ResolvedSettings,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Compute rectangular boundary pairs using float-point rect dims.
+    """Compute rectangular boundary pairs using pre-computed working area.
 
     Uses rect_tiling() for boundary detection, matching hex pattern.
 
-    Cached by (h_patches, w_patches, settings, vae_factor).
+    Cached by (h_patches, w_patches, resolved).
     """
     boundary_idx = []
     source_idx = []
@@ -148,9 +127,8 @@ def _compute_rect_boundary_pairs(
             src_w, src_h = rect_tiling(
                 w, h,
                 (w_patches, h_patches),
-                (w_patches, h_patches),
-                settings,
-                vae_factor,
+                resolved.work_patch_w,
+                resolved.work_patch_h,
             )
             if src_w != w or src_h != h:
                 continue
@@ -161,9 +139,8 @@ def _compute_rect_boundary_pairs(
                 n_src_w, n_src_h = rect_tiling(
                     nw, nh,
                     (w_patches, h_patches),
-                    (w_patches, h_patches),
-                    settings,
-                    vae_factor,
+                    resolved.work_patch_w,
+                    resolved.work_patch_h,
                 )
 
                 if n_src_w != nw or n_src_h != nh:
@@ -193,10 +170,9 @@ def _compute_rect_boundary_pairs(
 class _BaseToroidalAttentionPatch:
     """Shared logic for hex and rectangular toroidal attention patches."""
 
-    def __init__(self, pe_embedder, vae_factor: int, patch_size: int):
+    def __init__(self, pe_embedder, resolved: ResolvedSettings):
         self.pe_embedder = pe_embedder
-        self.vae_factor = vae_factor
-        self.patch_size = patch_size
+        self.resolved = resolved
         self._initialized = False
         self._boundary_idx = None
         self._source_idx = None
@@ -280,29 +256,21 @@ class _BaseToroidalAttentionPatch:
 class HexToroidalAttentionPatch(_BaseToroidalAttentionPatch):
     """attn1_patch for hex tiling: injects wrapped K/V for hex boundary patches."""
 
-    def __init__(self, settings: Settings, pe_embedder, patch_size: int, vae_factor: int):
-        super().__init__(pe_embedder, vae_factor=vae_factor, patch_size=patch_size)
-        self.settings = settings
-        self._patch_settings, self._patch_vae_factor = _make_patch_settings(
-            settings, patch_size, vae_factor,
-        )
+    def __init__(self, resolved: ResolvedSettings, pe_embedder):
+        super().__init__(pe_embedder, resolved)
 
     def _compute_boundary_pairs(self, h_patches, w_patches):
-        return _compute_hex_boundary_pairs(h_patches, w_patches, self._patch_settings, self._patch_vae_factor)
+        return _compute_hex_boundary_pairs(h_patches, w_patches, self.resolved)
 
 
 class RectToroidalAttentionPatch(_BaseToroidalAttentionPatch):
     """attn1_patch for rectangular tiling: injects wrapped K/V from opposite edges."""
 
-    def __init__(self, settings: Settings, pe_embedder, patch_size: int, vae_factor: int):
-        super().__init__(pe_embedder, vae_factor=vae_factor, patch_size=patch_size)
-        self.settings = settings
-        self._patch_settings, self._patch_vae_factor = _make_patch_settings(
-            settings, patch_size, vae_factor,
-        )
+    def __init__(self, resolved: ResolvedSettings, pe_embedder):
+        super().__init__(pe_embedder, resolved)
 
     def _compute_boundary_pairs(self, h_patches, w_patches):
-        return _compute_rect_boundary_pairs(h_patches, w_patches, self._patch_settings, self._patch_vae_factor)
+        return _compute_rect_boundary_pairs(h_patches, w_patches, self.resolved)
 
 
 # ---------------------------------------------------------------------------
@@ -320,13 +288,9 @@ class LuminaWastePatch:
     and maps them to the opposite edge of the working rectangle.
     """
 
-    def __init__(self, patch_size: int, settings: Settings, vae_factor: int):
+    def __init__(self, patch_size: int, resolved: ResolvedSettings):
         self.patch_size = patch_size
-        self.settings = settings
-        self.vae_factor = vae_factor
-        self._patch_settings, self._patch_vae_factor = _make_patch_settings(
-            settings, patch_size, vae_factor,
-        )
+        self.resolved = resolved
         self._initialized = False
         self._waste_idx = None
         self._waste_source_idx = None
@@ -339,15 +303,14 @@ class LuminaWastePatch:
         waste_indices = []
         waste_source_indices = []
 
-        if self.settings.mode == "Hexagon":
+        if self.resolved.mode == "Hexagon":
             for h in range(h_patches):
                 for w in range(w_patches):
                     src_w, src_h = hex_tiling(
                         w, h,
                         (w_patches, h_patches),
-                        (w_patches, h_patches),
-                        self._patch_settings,
-                        self._patch_vae_factor,
+                        self.resolved.hex_size_patch,
+                        self.resolved,
                     )
                     if src_w != w or src_h != h:
                         waste_indices.append(h * w_patches + w)
@@ -358,9 +321,8 @@ class LuminaWastePatch:
                     src_w, src_h = rect_tiling(
                         w, h,
                         (w_patches, h_patches),
-                        (w_patches, h_patches),
-                        self._patch_settings,
-                        self._patch_vae_factor,
+                        self.resolved.work_patch_w,
+                        self.resolved.work_patch_h,
                     )
                     if src_w != w or src_h != h:
                         waste_indices.append(h * w_patches + w)

@@ -148,71 +148,32 @@ def pixel_to_hex(
     return (q, r)
 
 
-def compute_float_hex_size(
-    W: int,
-    H: int,
-    settings: Settings,
-    vae_factor: int,
-) -> float:
-    """Compute hex radius from scale, min_margin, and divisible_by.
-
-    Pipeline: min(W,H)/2 * scale -> subtract min_margin -> round down for divisible_by.
-    W, H should be in the same space as min_margin (latent pixels by default).
-    divisible_by is in image pixels, converted via vae_factor.
-    Returns float hex radius in the same space as W, H.
-
-    Equivalent to compute_float_rect_dims: hex height = 2 * size,
-    so 2*size is divisible by divisible_by means size is divisible by divisible_by/2.
-    """
-    size = min(W, H) / 2 * settings.scale - settings.min_margin
-
-    if settings.divisible_by > 1:
-        # Hex crop height = 2 * size. Ensure 2*size is divisible by divisible_by.
-        # In latent space: unit = divisible_by / (2 * vae_factor)
-        unit = settings.divisible_by / (2 * vae_factor)
-        if unit > 0:
-            size = math.floor(size / unit) * unit
-
-    return max(size, 1.0)
-
-
 @functools.cache
 def hex_tiling(
     x: int,
     y: int,
-    original_size: tuple[int, int],
     padded_size: tuple[int, int],
+    hex_size: float,
     settings: Settings,
-    vae_factor: int,
 ) -> tuple[int, int]:
-    """
-    Hexagonal tiling function
+    """Hexagonal tiling with pre-computed hex radius.
 
-    :param x: X coordinate
-    :param y: Y coordinate
-    :param original_size: Original size of tensor
-    :param padded_size: Padded size of tensor
-    :param settings: Tiling settings
-    :param vae_factor: VAE downscale factor for divisible_by conversion
-    :return (x, y): Coordinates
+    :param x: X coordinate in padded space
+    :param y: Y coordinate in padded space
+    :param padded_size: (width, height) of padded tensor
+    :param hex_size: Hex radius (pre-computed at appropriate resolution)
+    :param settings: Tiling settings (used for rotation matrix only)
+    :return: (new_x, new_y) source coordinates in padded space
     """
-
-    # Hexagon size - applies scale, min_margin, divisible_by via shared function
-    size = compute_float_hex_size(original_size[0], original_size[1], settings, vae_factor)
-    # Shift the origin to the center of the image and convert to fractional hexagon coordinates
     q, r = pixel_to_hex(
         (x - padded_size[0] // 2, y - padded_size[1] // 2),
-        size,
+        hex_size,
         settings,
     )
-    # Round to nearest hexagon
     rounded = axial_round((q, r))
-    # Get fractional part of hexagon coordinates
     q -= rounded[0]
     r -= rounded[1]
-    # Convert back to pixel coordinates
-    new_x, new_y = hex_to_pixel((q, r), size, settings)
-    # Calculated coordinates are relative, so we need to shift them back
+    new_x, new_y = hex_to_pixel((q, r), hex_size, settings)
     new_x = (new_x + padded_size[0] // 2) % padded_size[0]
     new_y = (new_y + padded_size[1] // 2) % padded_size[1]
 

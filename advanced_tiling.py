@@ -10,7 +10,7 @@ from torch import Tensor
 from torch.nn import Conv2d
 from torch.nn import functional as F
 from torch.nn.modules.utils import _pair
-from .modes import MODE_NAMES, Settings
+from .modes import MODE_NAMES, Settings, ResolvedSettings
 from .dit_tiling import patch_dit_model, _has_conv2d, _create_content_wrapper
 
 
@@ -51,26 +51,22 @@ def _hex_remap_batch(centers_x, centers_y, size, wrap_w, wrap_h, settings):
 
 @functools.cache
 def calculate_mapping(
-    original_size: tuple[int, int], padded_size: tuple[int, int], settings: Settings,
-    vae_factor: int,
+    original_size: tuple[int, int], padded_size: tuple[int, int],
+    resolved: ResolvedSettings,
 ):
     """
     Calculate mapping for pixels outside of the mask
 
     :param original_size: Original size of the image
     :param padded_size: Padded size of the image
-    :param settings: Tiling settings
-    :param vae_factor: VAE downscale factor for divisible_by conversion
+    :param resolved: Resolved tiling settings with pre-computed values
     :return: Mapping of pixels
     """
-
-    assert settings.resolved, "Settings must be resolved before use"
     pw, ph = padded_size
     ow, oh = original_size
 
-    if settings.mode == "Rectangular":
-        from .modes.rect import compute_float_rect_dims
-        work_w, work_h = compute_float_rect_dims(ow, oh, settings, vae_factor)
+    if resolved.mode == "Rectangular":
+        work_w, work_h = resolved.work_lat_w, resolved.work_lat_h
         cx, cy = pw / 2.0, ph / 2.0
 
         xs = torch.arange(pw, dtype=torch.float64)
@@ -93,14 +89,13 @@ def calculate_mapping(
         non_id = (src_x != new_x) | (src_y != new_y)
         result = (src_x[non_id], src_y[non_id], new_x[non_id], new_y[non_id])
 
-    elif settings.mode == "Hexagon":
+    elif resolved.mode == "Hexagon":
         import numpy as np
-        from .modes.hex import compute_float_hex_size
-        size = compute_float_hex_size(ow, oh, settings, vae_factor)
+        size = resolved.hex_size_lat
         cx = np.arange(pw, dtype=np.float64) - pw // 2
         cy = np.arange(ph, dtype=np.float64) - ph // 2
         grid_cx, grid_cy = np.meshgrid(cx, cy, indexing='xy')
-        new_x, new_y = _hex_remap_batch(grid_cx, grid_cy, size, pw, ph, settings)
+        new_x, new_y = _hex_remap_batch(grid_cx, grid_cy, size, pw, ph, resolved)
 
         src_x = np.tile(np.arange(pw, dtype=np.int64), ph)
         src_y = np.repeat(np.arange(ph, dtype=np.int64), pw)
@@ -118,104 +113,48 @@ def calculate_mapping(
 
 
 @functools.cache
-def create_crop_mask(width: int, height: int, settings: Settings, vae_factor: int):
+def create_crop_mask(width: int, height: int, resolved: ResolvedSettings):
     """
-    Crop image based on tiling settings
+    Create crop mask based on resolved tiling settings.
 
     :param width: Width of the image
     :param height: Height of the image
-    :param settings: Tiling settings
-    :param vae_factor: VAE downscale factor, obtained via vae.spacial_compression_decode().
-        When >1, computes the working rect in latent space and scales to image
-        space so that min_margin (which is in latent pixels) is applied correctly.
-        Also forwarded to compute_float_rect_dims for divisible_by rounding.
-    :return: Cropped image
+    :param resolved: Resolved tiling settings with pre-computed values
+    :return: Crop mask tensor (1, H, W, 1)
     """
-
-    assert settings.resolved, "Settings must be resolved before use"
-    if settings.mode == "Hexagon":
+    if resolved.mode == "Hexagon":
         import numpy as np
-        from .modes.hex import compute_float_hex_size
 
-        if vae_factor > 1 and width >= vae_factor and height >= vae_factor:
-            # Image-space call: compute identity at latent resolution (where
-            # Conv2d wrapping operates) then upscale to image pixels.
-            W_lat = width // vae_factor
-            H_lat = height // vae_factor
-            size_lat = compute_float_hex_size(W_lat, H_lat, settings, vae_factor=vae_factor)
+        size = resolved.hex_size_img
+        cx = np.arange(width, dtype=np.float64) - width // 2
+        cy = np.arange(height, dtype=np.float64) - height // 2
+        grid_cx, grid_cy = np.meshgrid(cx, cy, indexing='xy')
+        new_x, new_y = _hex_remap_batch(grid_cx, grid_cy, size, width, height, resolved)
 
-            cx_lat = np.arange(W_lat, dtype=np.float64) - W_lat // 2
-            cy_lat = np.arange(H_lat, dtype=np.float64) - H_lat // 2
-            grid_cx, grid_cy = np.meshgrid(cx_lat, cy_lat, indexing='xy')
-            new_x, new_y = _hex_remap_batch(grid_cx, grid_cy, size_lat, W_lat, H_lat, settings)
+        src_x = np.tile(np.arange(width, dtype=np.int64), height)
+        src_y = np.repeat(np.arange(height, dtype=np.int64), width)
+        is_identity = ((new_x == src_x) & (new_y == src_y)).reshape(height, width)
 
-            src_x = np.tile(np.arange(W_lat, dtype=np.int64), H_lat)
-            src_y = np.repeat(np.arange(H_lat, dtype=np.int64), W_lat)
-            is_identity_lat = ((new_x == src_x) & (new_y == src_y)).reshape(H_lat, W_lat)
+        mask = torch.zeros((1, height, width, 1), dtype=torch.float32)
+        mask[0, :, :, 0] = torch.from_numpy(is_identity.astype(np.float32))
 
-            is_identity = np.repeat(np.repeat(is_identity_lat, vae_factor, axis=0), vae_factor, axis=1)
-            mask = torch.zeros((1, height, width, 1), dtype=torch.float32)
-            mask[0, :, :, 0] = torch.from_numpy(is_identity.astype(np.float32))
-        else:
-            # Latent-space call (or small test dimensions): use dimensions directly
-            size = compute_float_hex_size(width, height, settings, vae_factor)
-            cx = np.arange(width, dtype=np.float64) - width // 2
-            cy = np.arange(height, dtype=np.float64) - height // 2
-            grid_cx, grid_cy = np.meshgrid(cx, cy, indexing='xy')
-            new_x, new_y = _hex_remap_batch(grid_cx, grid_cy, size, width, height, settings)
+    elif resolved.mode == "Rectangular":
+        work_w, work_h = resolved.work_img_w, resolved.work_img_h
+        cx, cy = width / 2.0, height / 2.0
+        left = cx - work_w / 2
+        right = cx + work_w / 2
+        top = cy - work_h / 2
+        bottom = cy + work_h / 2
 
-            src_x = np.tile(np.arange(width, dtype=np.int64), height)
-            src_y = np.repeat(np.arange(height, dtype=np.int64), width)
-            is_identity = torch.from_numpy(((new_x == src_x) & (new_y == src_y)).reshape(height, width))
-            mask = torch.zeros((1, height, width, 1), dtype=torch.float32)
-            mask[0, :, :, 0] = is_identity.float()
-    elif settings.mode == "Rectangular":
-        from .modes.rect import compute_float_rect_dims
+        xs = torch.arange(width, dtype=torch.float64)
+        ys = torch.arange(height, dtype=torch.float64)
+        inside_x = (xs >= left) & (xs < right)
+        inside_y = (ys >= top) & (ys < bottom)
+        is_identity = inside_y.unsqueeze(1) & inside_x.unsqueeze(0)
 
-        if vae_factor > 1 and width >= vae_factor and height >= vae_factor:
-            # Image-space call: compute identity at latent resolution (where
-            # Conv2d wrapping operates) then upscale to image pixels.
-            W_lat = width // vae_factor
-            H_lat = height // vae_factor
-            work_w_lat, work_h_lat = compute_float_rect_dims(W_lat, H_lat, settings, vae_factor=vae_factor)
-            cx_lat = W_lat / 2.0
-            cy_lat = H_lat / 2.0
-            left_lat = cx_lat - work_w_lat / 2
-            right_lat = cx_lat + work_w_lat / 2
-            top_lat = cy_lat - work_h_lat / 2
-            bottom_lat = cy_lat + work_h_lat / 2
+        mask = torch.zeros((1, height, width, 1), dtype=torch.float32)
+        mask[0, :, :, 0] = is_identity.float()
 
-            xs = torch.arange(W_lat, dtype=torch.float64)
-            ys = torch.arange(H_lat, dtype=torch.float64)
-            inside_x = (xs >= left_lat) & (xs < right_lat)
-            inside_y = (ys >= top_lat) & (ys < bottom_lat)
-            is_identity_lat = inside_y.unsqueeze(1) & inside_x.unsqueeze(0)
-
-            is_identity = torch.repeat_interleave(
-                torch.repeat_interleave(is_identity_lat, vae_factor, dim=0),
-                vae_factor, dim=1,
-            )
-            mask = torch.zeros((1, height, width, 1), dtype=torch.float32)
-            mask[0, :, :, 0] = is_identity.float()
-        else:
-            # Latent-space call (or small test dimensions): use dimensions directly
-            work_w, work_h = compute_float_rect_dims(width, height, settings, vae_factor)
-            cx, cy = width / 2.0, height / 2.0
-            left_img = cx - work_w / 2
-            right_img = cx + work_w / 2
-            top_img = cy - work_h / 2
-            bottom_img = cy + work_h / 2
-
-            xs = torch.arange(width, dtype=torch.float64)
-            ys = torch.arange(height, dtype=torch.float64)
-            grid_x, grid_y = torch.meshgrid(xs, ys, indexing='xy')
-
-            inside_x = (grid_x >= left_img) & (grid_x < right_img)
-            inside_y = (grid_y >= top_img) & (grid_y < bottom_img)
-            is_identity = inside_x & inside_y
-
-            mask = torch.zeros((1, height, width, 1), dtype=torch.float32)
-            mask[0, :, :, 0] = is_identity.float()
     else:
         mask = torch.ones((1, height, width, 1), dtype=torch.float32)
 
@@ -255,22 +194,17 @@ def _crop_with_mask(
     return torch.cat((image, cropped_mask.to(device=image.device)), dim=3)
 
 
-def patch_model(model, settings: Settings, vae_factor: int):
+def patch_model(model, resolved: ResolvedSettings):
     """
     Patch model to perform tiling - in place!
 
     :param model: Model to patch
-    :param settings: Tiling settings
-    :param vae_factor: VAE downscale factor
+    :param resolved: Resolved tiling settings
     """
-
-    assert settings.resolved, "Settings must be resolved before use"
-    # Patch all Conv2d layers
     for layer in [layer for layer in model.modules() if isinstance(layer, Conv2d)]:
         # pylint: disable=protected-access, no-value-for-parameter
         layer._conv_forward = tiling_conv.__get__(layer, Conv2d)
-        layer.tiling_settings = settings
-        layer.tiling_vae_factor = vae_factor
+        layer.tiling_resolved = resolved
     return
 
 
@@ -294,8 +228,7 @@ def tiling_conv(self, input_tensor: Tensor, weight: Tensor, bias: Optional[Tenso
     mapping = calculate_mapping(
         (input_tensor.shape[-1], input_tensor.shape[-2]),
         (padded.shape[-1], padded.shape[-2]),
-        self.tiling_settings,
-        self.tiling_vae_factor,
+        self.tiling_resolved,
     )
     # Apply tiling
     padded[:, :, mapping[1], mapping[0]] = padded[:, :, mapping[3], mapping[2]]
@@ -364,9 +297,6 @@ class AdvancedTilingSettings:
         Creates tiling settings from node inputs
         """
 
-        # scale=0.0 is the auto sentinel — resolved in AdvancedTiling.run()
-        # once the model type is known.
-
         settings = Settings(mode, rotation, scale, min_margin, divisible_by)
 
         return (settings,)
@@ -389,38 +319,48 @@ class AdvancedTiling:
             "required": {
                 "settings": ("ADVANCED_TILING_SETTINGS",),
                 "model": ("MODEL",),
+                "vae": ("VAE",),
+                "latent": ("LATENT",),
             },
         }
 
     CATEGORY = "conditioning"
-    RETURN_TYPES = ("MODEL", "ADVANCED_TILING_SETTINGS")
+    RETURN_TYPES = ("MODEL", "RESOLVED_TILING_SETTINGS")
     RETURN_NAMES = ("MODEL", "resolved_settings")
     FUNCTION = "run"
 
-    def run(self, settings, model):
+    def run(self, settings, model, vae, latent):
         """
         Does the actual patching of the model
         """
 
         model_copy = model.clone()
 
-        is_conv2d = _has_conv2d(model_copy.model.diffusion_model)
+        diff_model = model_copy.model.diffusion_model
+        is_conv2d = _has_conv2d(diff_model)
+        vae_factor = vae.spacial_compression_decode()
+        patch_size = 1 if is_conv2d else getattr(diff_model, 'patch_size', 1)
 
-        # Resolve auto-sentinel values into a new Settings (no in-place mutation).
-        # This is the single resolution point — all downstream consumers
-        # (VAE decode, crop mask, wrapping) use these resolved values.
-        settings = settings._resolve_auto(is_conv2d)
+        latent_tensor = latent["samples"]
+        _, _, H_lat, W_lat = latent_tensor.shape
+        img_W = W_lat * vae_factor
+        img_H = H_lat * vae_factor
+
+        resolved = settings._resolve_auto(is_conv2d, vae_factor, patch_size, img_W, img_H)
+
+        if resolved.mode == "None":
+            return (model_copy, resolved)
 
         if is_conv2d:
-            patch_model(model_copy.model, settings, vae_factor=8)
+            patch_model(model_copy.model, resolved)
 
-            if settings.mode == "Rectangular" and (settings.scale < 1.0 or settings.min_margin > 0):
-                wrapper = _create_content_wrapper(settings, vae_factor=8)
+            if resolved.mode == "Rectangular" and resolved.margin_lat_w > 0:
+                wrapper = _create_content_wrapper(resolved)
                 model_copy.set_model_unet_function_wrapper(wrapper)
         else:
-            patch_dit_model(model_copy, settings, vae_factor=8)
+            patch_dit_model(model_copy, resolved)
 
-        return (model_copy, settings)
+        return (model_copy, resolved)
 
 
 def hex_square_crop(rmin, rmax, cmin, cmax, img_h, img_w, divisible_by):
@@ -461,7 +401,7 @@ class AdvancedTilingVAEDecode:
 
         return {
             "required": {
-                "settings": ("ADVANCED_TILING_SETTINGS",),
+                "settings": ("RESOLVED_TILING_SETTINGS",),
                 "samples": ("LATENT",),
                 "vae": ("VAE",),
                 "crop": ("BOOLEAN", {"default": True}),
@@ -478,11 +418,17 @@ class AdvancedTilingVAEDecode:
         Optionally crop the image based on tiling settings
 
         For Hexagon mode: applies alpha mask for hex-shaped cropping.
-        For Rectangular mode with scale < 1.0 or margin: decodes full latent
+        For Rectangular mode with margin: decodes full latent
         then crops using mask-based post-decode crop.
 
         Settings must be pre-resolved (from AdvancedTiling node output).
         """
+
+        if settings.mode == "None":
+            image = vae.decode(samples["samples"])
+            if image.ndim == 5:
+                image = image.squeeze(1)
+            return (image,)
 
         # Patch VAE in-place instead of deepcopy (avoids copying ~167MB of weights).
         # Save original state so we can restore after decode.
@@ -491,32 +437,28 @@ class AdvancedTilingVAEDecode:
             if isinstance(layer, Conv2d)
         ]
         saved = [
-            (layer, layer._conv_forward, getattr(layer, 'tiling_settings', None))
+            (layer, layer._conv_forward, getattr(layer, 'tiling_resolved', None))
             for layer in conv_layers
         ]
-        vae_factor = vae.spacial_compression_decode()
 
         # Use settings as-is — they were resolved by AdvancedTiling.run()
         # to match the generation model's working area.
-        patch_model(vae.first_stage_model, settings, vae_factor)
+        patch_model(vae.first_stage_model, settings)
 
         try:
             result = self._decode_and_crop(settings, samples, vae, crop)
         finally:
-            # Restore original state — patch_model added tiling_settings to
+            # Restore original state — patch_model added tiling_resolved to
             # every Conv2d layer, so deleting it is always safe here.
             for layer, orig_forward, _ in saved:
                 layer._conv_forward = orig_forward
-                if hasattr(layer, 'tiling_settings'):
-                    del layer.tiling_settings
-                if hasattr(layer, 'tiling_vae_factor'):
-                    del layer.tiling_vae_factor
+                if hasattr(layer, 'tiling_resolved'):
+                    del layer.tiling_resolved
 
         return result
 
     def _decode_and_crop(self, settings, samples, vae, crop):
         latent = samples["samples"]
-        vae_factor = vae.spacial_compression_decode()
 
         # Decode full latent — crop after decode using mask
         image = vae.decode(latent)
@@ -525,15 +467,15 @@ class AdvancedTilingVAEDecode:
             image = image.squeeze(1)
 
         if crop:
-            if settings.mode == "Rectangular" and (settings.scale < 1.0 or settings.min_margin > 0):
+            if settings.mode == "Rectangular" and settings.margin_img_w > 0:
                 img_h, img_w = image.shape[1], image.shape[2]
-                mask = create_crop_mask(img_w, img_h, settings, vae_factor=vae_factor)
+                mask = create_crop_mask(img_w, img_h, settings)
                 rmin, rmax, cmin, cmax = _mask_bounding_box(mask)
                 image = _crop_with_mask(image, mask, rmin, rmax, cmin, cmax)
 
             elif settings.mode == "Hexagon":
                 img_h, img_w = image.shape[1], image.shape[2]
-                mask = create_crop_mask(img_w, img_h, settings, vae_factor=vae_factor)
+                mask = create_crop_mask(img_w, img_h, settings)
                 rmin, rmax, cmin, cmax = _mask_bounding_box(mask)
                 sq_rmin, sq_rmax, sq_cmin, sq_cmax = hex_square_crop(
                     rmin, rmax, cmin, cmax, img_h, img_w, settings.divisible_by,
