@@ -66,7 +66,11 @@ def calculate_mapping(
     ow, oh = original_size
 
     if resolved.mode == "Rectangular":
-        work_w, work_h = resolved.work_lat_w, resolved.work_lat_h
+        # Scale working area to actual tensor resolution.
+        # At diffusion latent resolution ow=img_w/vae_factor, scale=1.0.
+        # VAE decoder Conv2d layers at 2x/4x/8x get proportionally scaled.
+        work_w = ow * resolved.work_img_w / resolved.img_w
+        work_h = oh * resolved.work_img_h / resolved.img_h
         cx, cy = pw / 2.0, ph / 2.0
 
         xs = torch.arange(pw, dtype=torch.float64)
@@ -91,7 +95,9 @@ def calculate_mapping(
 
     elif resolved.mode == "Hexagon":
         import numpy as np
-        size = resolved.hex_size_lat
+        # Scale hex size to actual tensor resolution.
+        min_dim = min(resolved.img_w, resolved.img_h)
+        size = min(ow, oh) * resolved.hex_size_img / min_dim
         cx = np.arange(pw, dtype=np.float64) - pw // 2
         cy = np.arange(ph, dtype=np.float64) - ph // 2
         grid_cx, grid_cy = np.meshgrid(cx, cy, indexing='xy')
@@ -350,10 +356,10 @@ class AdvancedTiling:
 
         latent_tensor = latent["samples"]
         _, _, H_lat, W_lat = latent_tensor.shape
-        img_W = W_lat * vae_factor
-        img_H = H_lat * vae_factor
+        img_w = W_lat * vae_factor
+        img_h = H_lat * vae_factor
 
-        resolved = settings._resolve_auto(is_conv2d, vae_factor, patch_size, img_W, img_H)
+        resolved = settings._resolve_auto(is_conv2d, vae_factor, patch_size, img_w, img_h)
 
         if resolved.mode == "None":
             return (model_copy, resolved)

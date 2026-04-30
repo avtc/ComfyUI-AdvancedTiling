@@ -55,10 +55,10 @@ IMG_H = 1024
 
 def _resolve(scale, min_margin, divisible_by, mode, is_conv2d=False,
              vae_factor=VAE_FACTOR, patch_size=PATCH_SIZE,
-             img_W=IMG_W, img_H=IMG_H):
+             img_w=IMG_W, img_h=IMG_H):
     """Create Settings and resolve."""
     s = Settings(mode, 0.0, scale=scale, min_margin=min_margin, divisible_by=divisible_by, conv2d_content_wrapping=True)
-    return s._resolve_auto(is_conv2d, vae_factor, patch_size, img_W, img_H)
+    return s._resolve_auto(is_conv2d, vae_factor, patch_size, img_w, img_h)
 
 
 def build_wrapping_identity(W, H, resolved):
@@ -158,10 +158,10 @@ def check_geometry(label, mode, scale, min_margin, div_by, W, H, vae_factor,
                    patch_size=PATCH_SIZE, is_conv2d=False,
                    print_ascii=True, assert_consistency=True):
     """Run full geometry consistency check for one mode/settings combo."""
-    img_W = W * vae_factor
-    img_H = H * vae_factor
+    img_w = W * vae_factor
+    img_h = H * vae_factor
     resolved = _resolve(scale, min_margin, div_by, mode, is_conv2d,
-                        vae_factor, patch_size, img_W, img_H)
+                        vae_factor, patch_size, img_w, img_h)
 
     if mode == "Rectangular":
         dim_info = f"work_img_w={resolved.work_img_w:.2f}, work_img_h={resolved.work_img_h:.2f}"
@@ -290,7 +290,7 @@ def test_auto_resolve_dit_rect():
     """min_margin=-1, scale=0 resolves for DiT Rect."""
     raw = Settings("Rectangular", 0.0, scale=0.0, min_margin=-1, divisible_by=1, conv2d_content_wrapping=True)
     resolved = raw._resolve_auto(is_conv2d=False, vae_factor=VAE_FACTOR,
-                                 patch_size=PATCH_SIZE, img_W=IMG_W, img_H=IMG_H)
+                                 patch_size=PATCH_SIZE, img_w=IMG_W, img_h=IMG_H)
 
     # scale=7/8, min_margin=4
     assert resolved.work_img_w == 896.0
@@ -311,7 +311,7 @@ def test_auto_resolve_conv2d_rect():
     """min_margin=-1, scale=0 resolves for Conv2d Rect."""
     raw = Settings("Rectangular", 0.0, scale=0.0, min_margin=-1, divisible_by=1, conv2d_content_wrapping=True)
     resolved = raw._resolve_auto(is_conv2d=True, vae_factor=VAE_FACTOR,
-                                 patch_size=1, img_W=IMG_W, img_H=IMG_H)
+                                 patch_size=1, img_w=IMG_W, img_h=IMG_H)
 
     # scale=1.0, min_margin=0
     assert resolved.work_img_w == 1024.0
@@ -330,7 +330,7 @@ def test_auto_resolve_dit_hex():
     """min_margin=-1, scale=0 resolves for DiT Hex."""
     raw = Settings("Hexagon", 0.0, scale=0.0, min_margin=-1, divisible_by=1, conv2d_content_wrapping=True)
     resolved = raw._resolve_auto(is_conv2d=False, vae_factor=VAE_FACTOR,
-                                 patch_size=PATCH_SIZE, img_W=IMG_W, img_H=IMG_H)
+                                 patch_size=PATCH_SIZE, img_w=IMG_W, img_h=IMG_H)
 
     # scale=1.0, min_margin=0
     assert resolved.hex_size_img == 512.0
@@ -348,7 +348,7 @@ def test_auto_resolve_conv2d_hex():
     """min_margin=-1, scale=0 resolves for Conv2d Hex."""
     raw = Settings("Hexagon", 0.0, scale=0.0, min_margin=-1, divisible_by=1, conv2d_content_wrapping=True)
     resolved = raw._resolve_auto(is_conv2d=True, vae_factor=VAE_FACTOR,
-                                 patch_size=1, img_W=IMG_W, img_H=IMG_H)
+                                 patch_size=1, img_w=IMG_W, img_h=IMG_H)
 
     assert resolved.hex_size_img == 512.0
 
@@ -365,7 +365,7 @@ def test_auto_resolve_dit_rect_div16():
     """min_margin=-1, scale=0, div_by=16 resolves for DiT Rect."""
     raw = Settings("Rectangular", 0.0, scale=0.0, min_margin=-1, divisible_by=16, conv2d_content_wrapping=True)
     resolved = raw._resolve_auto(is_conv2d=False, vae_factor=VAE_FACTOR,
-                                 patch_size=PATCH_SIZE, img_W=IMG_W, img_H=IMG_H)
+                                 patch_size=PATCH_SIZE, img_w=IMG_W, img_h=IMG_H)
 
     assert resolved.work_img_w == 896.0
 
@@ -382,7 +382,7 @@ def test_auto_resolve_dit_hex_div16():
     """min_margin=-1, scale=0, div_by=16 resolves for DiT Hex."""
     raw = Settings("Hexagon", 0.0, scale=0.0, min_margin=-1, divisible_by=16, conv2d_content_wrapping=True)
     resolved = raw._resolve_auto(is_conv2d=False, vae_factor=VAE_FACTOR,
-                                 patch_size=PATCH_SIZE, img_W=IMG_W, img_H=IMG_H)
+                                 patch_size=PATCH_SIZE, img_w=IMG_W, img_h=IMG_H)
 
     assert resolved.hex_size_img == 512.0
 
@@ -403,7 +403,7 @@ def test_auto_resolve_dit_rect_s09_mneg1():
     """scale=0.9, min_margin=-1, div_by=16 for DiT Rect: margin resolves -1->4."""
     raw = Settings("Rectangular", 0.0, scale=0.9, min_margin=-1, divisible_by=16, conv2d_content_wrapping=True)
     resolved = raw._resolve_auto(is_conv2d=False, vae_factor=VAE_FACTOR,
-                                 patch_size=PATCH_SIZE, img_W=IMG_W, img_H=IMG_H)
+                                 patch_size=PATCH_SIZE, img_w=IMG_W, img_h=IMG_H)
 
     assert resolved.margin_img_w > 0
 
@@ -420,7 +420,7 @@ def test_auto_resolve_conv2d_rect_s09_mneg1():
     """scale=0.9, min_margin=-1, div_by=16 for Conv2d Rect: margin resolves -1->0."""
     raw = Settings("Rectangular", 0.0, scale=0.9, min_margin=-1, divisible_by=16, conv2d_content_wrapping=True)
     resolved = raw._resolve_auto(is_conv2d=True, vae_factor=VAE_FACTOR,
-                                 patch_size=1, img_W=IMG_W, img_H=IMG_H)
+                                 patch_size=1, img_w=IMG_W, img_h=IMG_H)
 
     assert resolved.margin_img_w > 0
 
@@ -437,7 +437,7 @@ def test_auto_resolve_hex_s09_mneg1_dit():
     """HEX scale=0.9, min_margin=-1, div_by=16 for DiT: margin resolves -1->0."""
     raw = Settings("Hexagon", 0.0, scale=0.9, min_margin=-1, divisible_by=16, conv2d_content_wrapping=True)
     resolved = raw._resolve_auto(is_conv2d=False, vae_factor=VAE_FACTOR,
-                                 patch_size=PATCH_SIZE, img_W=IMG_W, img_H=IMG_H)
+                                 patch_size=PATCH_SIZE, img_w=IMG_W, img_h=IMG_H)
 
     assert resolved.hex_size_img > 0
 
@@ -454,7 +454,7 @@ def test_auto_resolve_hex_s09_mneg1_conv2d():
     """HEX scale=0.9, min_margin=-1, div_by=16 for Conv2d: margin resolves -1->0."""
     raw = Settings("Hexagon", 0.0, scale=0.9, min_margin=-1, divisible_by=16, conv2d_content_wrapping=True)
     resolved = raw._resolve_auto(is_conv2d=True, vae_factor=VAE_FACTOR,
-                                 patch_size=1, img_W=IMG_W, img_H=IMG_H)
+                                 patch_size=1, img_w=IMG_W, img_h=IMG_H)
 
     assert resolved.hex_size_img > 0
 
@@ -534,10 +534,10 @@ def ascii_boundary_zoom(bool_2d, zoom_px=10):
 def check_realistic_borders(label, mode, scale, min_margin, div_by,
                              W_lat=128, H_lat=128, vae_factor=VAE_FACTOR):
     """Check geometry at realistic latent resolution with border visualization."""
-    img_W = W_lat * vae_factor
-    img_H = H_lat * vae_factor
+    img_w = W_lat * vae_factor
+    img_h = H_lat * vae_factor
     resolved = _resolve(scale, min_margin, div_by, mode,
-                        vae_factor=vae_factor, img_W=img_W, img_H=img_H)
+                        vae_factor=vae_factor, img_w=img_w, img_h=img_h)
 
     if mode == "Rectangular":
         dim_info = f"work_img_w={resolved.work_img_w:.2f}, work_img_h={resolved.work_img_h:.2f}"
@@ -570,13 +570,13 @@ def check_realistic_borders(label, mode, scale, min_margin, div_by,
         crop_w = int(round(resolved.work_img_w))
         crop_h = int(round(resolved.work_img_h))
 
-    print(f"\n  Image crop: {crop_w}x{crop_h} (from {img_W}x{img_H})")
+    print(f"\n  Image crop: {crop_w}x{crop_h} (from {img_w}x{img_h})")
 
     # Image-resolution boundary visualization (crop mask)
-    mask = at_mod.create_crop_mask(img_W, img_H, resolved)
+    mask = at_mod.create_crop_mask(img_w, img_h, resolved)
     crop_mask_np = mask[0, :, :, 0].bool().numpy()
     if outside_count > 0:
-        print(f"\n  Image crop mask boundary zoom ({img_W}x{img_H}, vae_factor={vae_factor}):")
+        print(f"\n  Image crop mask boundary zoom ({img_w}x{img_h}, vae_factor={vae_factor}):")
         print(ascii_boundary_zoom(crop_mask_np, zoom_px=8))
 
     if mode == "Hexagon":

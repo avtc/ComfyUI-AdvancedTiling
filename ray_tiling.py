@@ -58,9 +58,9 @@ if HAS_RAYLIGHT:
                 resolved_list = []
                 for latent in latent_list:
                     _, _, H_lat, W_lat = latent["samples"].shape
-                    img_W = W_lat * vae_factor
-                    img_H = H_lat * vae_factor
-                    resolved = settings._resolve_auto(False, vae_factor, 2, img_W, img_H)
+                    img_w = W_lat * vae_factor
+                    img_h = H_lat * vae_factor
+                    resolved = settings._resolve_auto(False, vae_factor, 2, img_w, img_h)
                     resolved_list.append(resolved)
                 return (ray_actors, resolved_list)
 
