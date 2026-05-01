@@ -95,20 +95,36 @@ if HAS_RAYLIGHT:
 
                 from ComfyUI_AdvancedTiling.dit_tiling import patch_dit_model
                 from ComfyUI_AdvancedTiling.modes import Settings
+                from ComfyUI_AdvancedTiling.toroidal_attention import (
+                    _BaseToroidalAttentionPatch, LuminaWastePatch,
+                )
                 import gc
                 import torch
+
+                # ModelPatcher.set_model_patch APPENDS to a list — it never
+                # removes old entries.  Remove only our own accumulated
+                # tiling patches so their cached GPU tensors (synthetic PE,
+                # boundary indices) are freed before new patches are added
+                # for potentially different latent dimensions.
+                to = model.model_options.setdefault("transformer_options", {})
+                patches = to.setdefault("patches", {})
+                attn = patches.get("attn1_patch", [])
+                patches["attn1_patch"] = [p for p in attn
+                                          if not isinstance(p, _BaseToroidalAttentionPatch)]
+                dbl = patches.get("double_block", [])
+                patches["double_block"] = [p for p in dbl
+                                           if not isinstance(p, LuminaWastePatch)]
+                wrapper = model.model_options.get("model_function_wrapper")
+                if wrapper is not None and getattr(wrapper, '_is_tiling_wrapper', False):
+                    del model.model_options["model_function_wrapper"]
+                gc.collect()
+                torch.cuda.empty_cache()
 
                 diff_model = model.model.diffusion_model
                 patch_size = getattr(diff_model, 'patch_size', 1)
                 raw = Settings(mode, rotation, scale, min_margin, divisible_by, conv2d_attention_wrapping=True)
                 resolved = raw._resolve_auto(False, vae_factor, patch_size, img_W, img_H)
                 patch_dit_model(model, resolved)
-
-                # Free GPU tensors cached by previous run's patch objects
-                # (synthetic PE, boundary indices) so new patches with
-                # different latent dimensions can allocate without OOM.
-                gc.collect()
-                torch.cuda.empty_cache()
                 return {
                     "mode": resolved.mode,
                     "rotation": resolved.rotation,
