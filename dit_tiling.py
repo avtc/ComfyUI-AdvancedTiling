@@ -56,6 +56,7 @@ def _create_content_wrapper(resolved: ResolvedSettings):
     def wrapper(apply_model, args):
         _apply_latent_wrapping(args["input"], resolved)
         return apply_model(args["input"], args["timestep"], **args["c"])
+    wrapper._is_tiling_wrapper = True
     return wrapper
 
 
@@ -64,7 +65,7 @@ def _create_lumina_wrapper(resolved: ResolvedSettings):
     def wrapper(apply_model, args):
         _apply_latent_wrapping(args["input"], resolved)
         return apply_model(args["input"], args["timestep"], **args["c"])
-
+    wrapper._is_tiling_wrapper = True
     return wrapper
 
 

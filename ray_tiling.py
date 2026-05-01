@@ -48,16 +48,16 @@ if HAS_RAYLIGHT:
         FUNCTION = "run"
         CATEGORY = "conditioning"
 
-        def run(self, settings_list, ray_actors_list, vae_list, latent_list):
-            settings = settings_list[0]
-            ray_actors = ray_actors_list[0]
-            vae = vae_list[0]
+        def run(self, settings, ray_actors, vae, latent):
+            settings = settings[0]
+            ray_actors = ray_actors[0]
+            vae = vae[0]
             vae_factor = vae.spacial_compression_decode()
 
             if settings.mode == "None":
                 resolved_list = []
-                for latent in latent_list:
-                    _, _, H_lat, W_lat = latent["samples"].shape
+                for lat in latent:
+                    _, _, H_lat, W_lat = lat["samples"].shape
                     img_w = W_lat * vae_factor
                     img_h = H_lat * vae_factor
                     resolved = settings._resolve_auto(False, vae_factor, 2, img_w, img_h)
@@ -95,22 +95,59 @@ if HAS_RAYLIGHT:
 
                 from ComfyUI_AdvancedTiling.dit_tiling import patch_dit_model
                 from ComfyUI_AdvancedTiling.modes import Settings
+                from ComfyUI_AdvancedTiling.toroidal_attention import (
+                    _BaseToroidalAttentionPatch, LuminaWastePatch,
+                )
+                import gc
+                import torch
+
+                # ModelPatcher.set_model_patch APPENDS to a list — it never
+                # removes old entries.  Remove only our own accumulated
+                # tiling patches so their cached GPU tensors (synthetic PE,
+                # boundary indices) are freed before new patches are added
+                # for potentially different latent dimensions.
+                to = model.model_options.setdefault("transformer_options", {})
+                patches = to.setdefault("patches", {})
+                attn = patches.get("attn1_patch", [])
+                patches["attn1_patch"] = [p for p in attn
+                                          if not isinstance(p, _BaseToroidalAttentionPatch)]
+                dbl = patches.get("double_block", [])
+                patches["double_block"] = [p for p in dbl
+                                           if not isinstance(p, LuminaWastePatch)]
+                wrapper = model.model_options.get("model_function_wrapper")
+                if wrapper is not None and getattr(wrapper, '_is_tiling_wrapper', False):
+                    del model.model_options["model_function_wrapper"]
+                gc.collect()
+                torch.cuda.empty_cache()
 
                 diff_model = model.model.diffusion_model
                 patch_size = getattr(diff_model, 'patch_size', 1)
                 raw = Settings(mode, rotation, scale, min_margin, divisible_by, conv2d_attention_wrapping=True)
                 resolved = raw._resolve_auto(False, vae_factor, patch_size, img_W, img_H)
                 patch_dit_model(model, resolved)
-                return resolved
+                return {
+                    "mode": resolved.mode,
+                    "rotation": resolved.rotation,
+                    "work_img_w": resolved.work_img_w,
+                    "work_img_h": resolved.work_img_h,
+                    "margin_img_w": resolved.margin_img_w,
+                    "work_patch_w": resolved.work_patch_w,
+                    "work_patch_h": resolved.work_patch_h,
+                    "hex_size_img": resolved.hex_size_img,
+                    "hex_size_patch": resolved.hex_size_patch,
+                    "img_w": resolved.img_w,
+                    "img_h": resolved.img_h,
+                    "conv2d_attention_wrapping": resolved.conv2d_attention_wrapping,
+                }
 
             # Build per-worker args: each worker gets its latent's img dimensions
             worker_args = []
-            for latent in latent_list:
-                _, _, H_lat, W_lat = latent["samples"].shape
+            for lat in latent:
+                _, _, H_lat, W_lat = lat["samples"].shape
                 worker_args.append((W_lat * vae_factor, H_lat * vae_factor))
 
             futures = [
-                actor.model_function_runner.remote(
+                actor.model_function_runner_get_values.remote(
                     _patch, vae_factor, settings.mode, settings.rotation,
                     settings.scale, settings.min_margin, settings.divisible_by,
                     img_W, img_H,
@@ -118,6 +155,8 @@ if HAS_RAYLIGHT:
                 for actor, (img_W, img_H) in zip(gpu_workers, worker_args)
             ]
             results = ray.get(futures)
-            # Use resolved settings from workers (they have correct patch_size)
-            resolved_list = results
+            # Reconstruct ResolvedSettings from plain dicts (workers can't
+            # serialize the class back across Ray due to the hyphenated module)
+            from .modes import ResolvedSettings
+            resolved_list = [ResolvedSettings(**d) for d in results]
             return (ray_actors, resolved_list)
