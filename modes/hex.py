@@ -148,6 +148,24 @@ def pixel_to_hex(
     return (q, r)
 
 
+def _cube_round_offsets(q: float, r: float):
+    """Cube-round (q, r) and return the fractional offsets (dq, dr)."""
+    s = -q - r
+    rq = math.floor(q + 0.5)
+    rr = math.floor(r + 0.5)
+    rs = math.floor(s + 0.5)
+    q_diff = abs(rq - q)
+    r_diff = abs(rr - r)
+    s_diff = abs(rs - s)
+    if q_diff > r_diff and q_diff > s_diff:
+        rq = -rr - rs
+    elif r_diff > s_diff:
+        rr = -rq - rs
+    else:
+        rs = -rq - rr
+    return q - rq, r - rr
+
+
 @functools.cache
 def hex_tiling(
     x: int,
@@ -158,6 +176,9 @@ def hex_tiling(
 ) -> tuple[int, int]:
     """Hexagonal tiling with pre-computed hex radius.
 
+    Uses 4-neighbor search to find the integer source pixel whose hex offset
+    best matches the destination's hex offset, eliminating rounding mismatches.
+
     :param x: X coordinate in padded space
     :param y: Y coordinate in padded space
     :param padded_size: (width, height) of padded tensor
@@ -165,17 +186,38 @@ def hex_tiling(
     :param rotation: Rotation angle in degrees
     :return: (new_x, new_y) source coordinates in padded space
     """
+    inv_mat = get_inverse_matrix(rotation)
+    mat = get_matrix(rotation)
+
     q, r = pixel_to_hex(
         (x - padded_size[0] // 2, y - padded_size[1] // 2),
         hex_size,
         rotation,
     )
-    rounded = axial_round((q, r))
-    q -= rounded[0]
-    r -= rounded[1]
-    new_x, new_y = hex_to_pixel((q, r), hex_size, rotation)
-    new_x = (new_x + padded_size[0] // 2) % padded_size[0]
-    new_y = (new_y + padded_size[1] // 2) % padded_size[1]
+    target_dq, target_dr = _cube_round_offsets(q, r)
+
+    # Continuous pixel position of the target offset
+    pixel = hex_size * (mat @ np.array([[target_dq], [target_dr]])).flatten()
+    base_x = int(math.floor(pixel[0]))
+    base_y = int(math.floor(pixel[1]))
+
+    # 4-neighbor search: pick integer pixel with closest hex offset
+    best_x, best_y = base_x, base_y
+    best_err = float('inf')
+    for dx in (0, 1):
+        for dy in (0, 1):
+            cx, cy = base_x + dx, base_y + dy
+            cq, cr = (
+                inv_mat @ np.array([[cx], [cy]])
+            ).flatten() / hex_size
+            cand_dq, cand_dr = _cube_round_offsets(float(cq), float(cr))
+            err = max(abs(cand_dq - target_dq), abs(cand_dr - target_dr))
+            if err < best_err:
+                best_err = err
+                best_x, best_y = cx, cy
+
+    new_x = (best_x + padded_size[0] // 2) % padded_size[0]
+    new_y = (best_y + padded_size[1] // 2) % padded_size[1]
 
     return (new_x, new_y)
 

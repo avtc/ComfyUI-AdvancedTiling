@@ -16,7 +16,12 @@ from .dit_tiling import patch_dit_model, _has_conv2d
 
 
 def _hex_remap_batch(centers_x, centers_y, size, wrap_w, wrap_h, rotation):
-    """Vectorized hex coordinate remapping for all pixels at once."""
+    """Vectorized hex coordinate remapping for all pixels at once.
+
+    Uses 4-neighbor search to find the integer source pixel whose hex offset
+    best matches the destination's hex offset, eliminating rounding mismatches
+    that occur when the hex-to-pixel round-trip lands on a suboptimal integer.
+    """
     import numpy as np
     from .modes.hex import get_inverse_matrix, get_matrix
 
@@ -41,17 +46,49 @@ def _hex_remap_batch(centers_x, centers_y, size, wrap_w, wrap_h, rotation):
     rq = np.where(mask_q, -rr - rs, rq)
     rr = np.where(mask_r, -rq - rs, rr)
 
-    # Fractional parts -> hex_to_pixel
-    pixel = size * (mat @ np.stack([q - rq, r - rr], axis=0))
-    # Use floor(x+0.5) instead of rint to avoid banker's rounding on exact 0.5:
-    # when hex_size is an integer at a VAE decoder resolution, size*3/2 becomes a
-    # half-integer, causing pixel offsets to land exactly on X.5 boundaries where
-    # np.rint rounds to even — producing discontinuities in the wrapped image.
-    new_x = np.floor(pixel[0] + 0.5).astype(np.int64)
-    new_y = np.floor(pixel[1] + 0.5).astype(np.int64)
+    # Target hex offsets (desired relative position within hex cell)
+    target_dq = q - rq
+    target_dr = r - rr
 
-    new_x = (new_x + wrap_w // 2) % wrap_w
-    new_y = (new_y + wrap_h // 2) % wrap_h
+    # Continuous pixel position of the target offset
+    pixel = size * (mat @ np.stack([target_dq, target_dr], axis=0))
+    base_x = np.floor(pixel[0]).astype(np.int64)
+    base_y = np.floor(pixel[1]).astype(np.int64)
+
+    # 4-neighbor search: pick the integer pixel whose hex offset
+    # is closest to the target offset (Chebyshev distance in hex space).
+    # The simple rounding result is always one of the 4 candidates,
+    # so this can only match or improve, never regress.
+    best_x = np.empty_like(base_x)
+    best_y = np.empty_like(base_y)
+    best_err = np.full(len(q), np.inf)
+
+    for dx in (0, 1):
+        for dy in (0, 1):
+            cx = (base_x + dx).astype(np.float64)
+            cy = (base_y + dy).astype(np.float64)
+            c_pts = np.stack([cx, cy], axis=0)
+            c_qr = (inv_mat @ c_pts) / size
+            cq, cr = c_qr[0], c_qr[1]
+            cs = -cq - cr
+            crq, crr, crs = _half_up(cq), _half_up(cr), _half_up(cs)
+            cq_diff = np.abs(crq - cq)
+            cr_diff = np.abs(crr - cr)
+            cs_diff = np.abs(crs - cs)
+            cmask_q = (cq_diff > cr_diff) & (cq_diff > cs_diff)
+            cmask_r = ~cmask_q & (cr_diff > cs_diff)
+            crq = np.where(cmask_q, -crr - crs, crq)
+            crr = np.where(cmask_r, -crq - crs, crr)
+            cand_dq = cq - crq
+            cand_dr = cr - crr
+            err = np.maximum(np.abs(cand_dq - target_dq), np.abs(cand_dr - target_dr))
+            better = err < best_err
+            best_x = np.where(better, base_x + dx, best_x)
+            best_y = np.where(better, base_y + dy, best_y)
+            best_err = np.where(better, err, best_err)
+
+    new_x = (best_x + wrap_w // 2) % wrap_w
+    new_y = (best_y + wrap_h // 2) % wrap_h
     return new_x, new_y
 
 
@@ -265,16 +302,19 @@ def _patch_attention_wrapping(model, resolved: ResolvedSettings):
     The hook runs after GroupNorm but before proj_in / transformer blocks,
     so the skip connection (``x + x_in``) uses the original unwrapped input.
     """
+    count = 0
     for module in model.modules():
         if module.__class__.__name__ != "SpatialTransformer":
             continue
         norm = getattr(module, "norm", None)
         if norm is None:
             continue
-        _register_tiling_hook(norm, resolved)
+        _register_tiling_hook(norm, resolved, count)
+        count += 1
+    print(f"[AdvancedTiling] Registered attention wrapping hooks on {count} SpatialTransformer norm modules")
 
 
-def _register_tiling_hook(norm_module, resolved: ResolvedSettings):
+def _register_tiling_hook(norm_module, resolved: ResolvedSettings, hook_id: int = 0):
     """Forward hook that applies tiling wrapping to a norm module's output."""
 
     def _hook(_module, _input, output):
@@ -282,8 +322,11 @@ def _register_tiling_hook(norm_module, resolved: ResolvedSettings):
             return output
         W, H = output.shape[-1], output.shape[-2]
         mapping = calculate_mapping((W, H), (W, H), resolved)
-        if len(mapping[0]) > 0:
+        n_mapped = len(mapping[0])
+        if n_mapped > 0:
             output[:, :, mapping[1], mapping[0]] = output[:, :, mapping[3], mapping[2]]
+        if hook_id == 0:
+            print(f"[AdvancedTiling] Attention hook fired: shape={output.shape}, mapped={n_mapped}")
         return output
 
     norm_module.register_forward_hook(_hook)
@@ -291,8 +334,9 @@ def _register_tiling_hook(norm_module, resolved: ResolvedSettings):
 
 # --- DEBUG: per-forward-pass Conv2d stats accumulation ---
 _debug_step_stats = []
-_debug_expected_per_pass = [0]  # tracks expected layer count per forward pass
 _debug_pass_counter = [0]
+_debug_full_w = [0]      # width of first layer (full resolution)
+_debug_seen_small = [False]  # did we pass through smaller resolutions?
 
 
 def _debug_flush():
@@ -301,7 +345,6 @@ def _debug_flush():
     if not _debug_step_stats:
         return
     n = len(_debug_step_stats)
-    _debug_expected_per_pass[0] = n
     pass_num = _debug_pass_counter[0]
     high_neg = [(i, s) for i, s in enumerate(_debug_step_stats) if s['out_neg'] > 60]
     low_std = [(i, s) for i, s in enumerate(_debug_step_stats) if s['out_std'] < 0.001]
@@ -317,6 +360,7 @@ def _debug_flush():
                   f" in_neg={s['in_neg']:.1f}% out_neg={s['out_neg']:.1f}% {s['shape']} k{s['k']}")
     _debug_step_stats.clear()
     _debug_pass_counter[0] += 1
+    _debug_seen_small[0] = False
 
 
 def tiling_conv(self, input_tensor: Tensor, weight: Tensor, bias: Optional[Tensor]):
@@ -350,6 +394,15 @@ def tiling_conv(self, input_tensor: Tensor, weight: Tensor, bias: Optional[Tenso
     )
 
     # --- DEBUG: accumulate stats, auto-flush at pass boundary ---
+    cur_w = input_tensor.shape[-1]
+    if _debug_full_w[0] == 0:
+        _debug_full_w[0] = cur_w
+    if cur_w < _debug_full_w[0]:
+        _debug_seen_small[0] = True
+    # Flush when we return to full width after visiting smaller resolutions
+    if _debug_seen_small[0] and cur_w >= _debug_full_w[0] and len(_debug_step_stats) > 20:
+        _debug_flush()
+        _debug_full_w[0] = cur_w
     _debug_step_stats.append({
         'shape': tuple(input_tensor.shape),
         'in_std': input_tensor.std().item(),
@@ -358,9 +411,6 @@ def tiling_conv(self, input_tensor: Tensor, weight: Tensor, bias: Optional[Tenso
         'out_neg': (result < 0).float().mean().item() * 100,
         'k': weight.shape[-1],
     })
-    expected = _debug_expected_per_pass[0]
-    if expected > 0 and len(_debug_step_stats) >= expected:
-        _debug_flush()
 
     return result
 
