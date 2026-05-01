@@ -1,15 +1,19 @@
 """
 Test that wrapping preserves position-within-cell consistency.
 
-For Hexagon mode: every remapped pixel (dest -> source) must land at the same
-hex-relative position within its hex cell.  Uses production pixel_to_hex() to
-compute fractional hex coordinates, then compares the fractional parts.
+For Hexagon mode, two independent checks:
+  1. Path agreement: calculate_mapping (vectorized Conv2d path) agrees with
+     hex_tiling (per-pixel production function) when given the same hex_size.
+  2. Hex-distance preservation: every wrapped pixel's max-norm distance from
+     the nearest hex center is preserved from source to destination (tolerance
+     0.01).  This is the exact check from the original debug script that
+     found the hex-to-pixel rounding bug — it catches regressions even if
+     both production paths break equally.
 
-For Rectangular mode: every remapped pixel must be displaced by an integer
-multiple of the working-area period, producing a seamless periodic tile.
+For Rectangular mode: verify that calculate_mapping agrees with rect_tiling()
+and that displacements are clean multiples of the working-area period.
 
-These tests use ONLY production code paths (pixel_to_hex, calculate_mapping,
-rect_tiling_at) with no re-implemented math.
+All checks use ONLY production code paths — no re-implemented math.
 """
 
 import sys
@@ -34,7 +38,7 @@ _spec.loader.exec_module(_pkg)
 
 import numpy as np
 from ComfyUI_AdvancedTiling.modes import Settings
-from ComfyUI_AdvancedTiling.modes.hex import get_inverse_matrix, axial_round
+from ComfyUI_AdvancedTiling.modes.hex import hex_tiling, hex_distance_grid
 from ComfyUI_AdvancedTiling.modes.rect import rect_tiling
 import ComfyUI_AdvancedTiling.advanced_tiling as at_mod
 
@@ -42,15 +46,6 @@ VAE_FACTOR = 8
 IMG_W = 1024
 IMG_H = 1024
 
-# 4-neighbor search achieves <0.01 error.  Pre-fix simple rounding had up to
-# ~0.5 error.  Threshold 0.05 catches regressions while allowing the inherent
-# integer-pixel imprecision.
-_HEX_OFFSET_TOL = 0.05
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 def _resolve(mode, scale, min_margin, div_by, is_conv2d=False):
     s = Settings(mode, 0.0, scale=scale, min_margin=min_margin,
@@ -58,20 +53,17 @@ def _resolve(mode, scale, min_margin, div_by, is_conv2d=False):
     return s._resolve_auto(is_conv2d, VAE_FACTOR, 1, IMG_W, IMG_H)
 
 
-def check_hex_offset_consistency(resolved, res=128, pad=1, tol=_HEX_OFFSET_TOL):
-    """For every remapped pixel, source and dest must share the same hex offset.
+def check_hex_mapping_agreement(resolved, res=128, pad=1):
+    """Every pixel mapped by calculate_mapping must agree with hex_tiling.
 
-    Uses production get_inverse_matrix() to compute raw fractional hex
-    coordinates (no rounding), then compares the fractional parts of both
-    source and destination pixels.  The 4-neighbor search in
-    _hex_remap_batch minimises but cannot always eliminate the integer
-    quantisation error, so a small tolerance is allowed.
+    Both use the same hex_size_at(original_size) and operate in padded
+    coordinate space.  calculate_mapping is the vectorized Conv2d path;
+    hex_tiling is the per-pixel production function used by the attention
+    path.  They must produce identical results.
     """
     pw, ph = res + 2 * pad, res + 2 * pad
-    hs = resolved.hex_size_at(res, res)
-    inv_mat = get_inverse_matrix(resolved.rotation)
-    cx = pw // 2
-    cy = ph // 2
+    hex_size = resolved.hex_size_at(res, res)
+    rotation = resolved.rotation
 
     mapping = at_mod.calculate_mapping((res, res), (pw, ph), resolved)
     n_mapped = len(mapping[0])
@@ -83,54 +75,35 @@ def check_hex_offset_consistency(resolved, res=128, pad=1, tol=_HEX_OFFSET_TOL):
     nx = mapping[2].numpy()
     ny = mapping[3].numpy()
 
-    # Sample up to 2000 pixels to keep the test fast
-    if n_mapped > 2000:
-        idx = np.linspace(0, n_mapped - 1, 2000, dtype=int)
-    else:
-        idx = np.arange(n_mapped)
-
-    max_err = 0.0
-    n_over = 0
-    for i in idx:
+    n_mismatch = 0
+    for i in range(n_mapped):
         dx, dy = int(sx[i]), int(sy[i])
-        snx, sny = int(nx[i]), int(ny[i])
+        expected_nx, expected_ny = hex_tiling(dx, dy, (pw, ph), hex_size, rotation)
+        if expected_nx != int(nx[i]) or expected_ny != int(ny[i]):
+            n_mismatch += 1
 
-        # Raw fractional hex coords via production inverse matrix
-        q1, r1 = (inv_mat @ np.array([[dx - cx], [dy - cy]])).flatten() / hs
-        q2, r2 = (inv_mat @ np.array([[snx - cx], [sny - cy]])).flatten() / hs
-
-        # Fractional parts using production axial_round
-        rq1, rr1 = axial_round((float(q1), float(r1)))
-        rq2, rr2 = axial_round((float(q2), float(r2)))
-        frac_dq = abs((q1 - rq1) - (q2 - rq2))
-        frac_dr = abs((r1 - rr1) - (r2 - rr2))
-        err = max(frac_dq, frac_dr)
-        if err > max_err:
-            max_err = err
-        if err > tol:
-            n_over += 1
-
-    assert n_over == 0, (
-        f"hex_offset_consistency: {n_over}/{len(idx)} sampled pixels exceed "
-        f"tolerance {tol} (max_err={max_err:.6f}, "
-        f"hex_size={hs:.2f}, res={res}, pad={pad})"
+    assert n_mismatch == 0, (
+        f"hex_mapping_agreement: {n_mismatch}/{n_mapped} pixels disagree "
+        f"between calculate_mapping and hex_tiling "
+        f"(hex_size={hex_size:.2f}, res={res}, pad={pad})"
     )
 
 
-def check_rect_periodic_consistency(resolved, res=128, pad=1):
-    """For every remapped pixel, the displacement must be a near-integer
-    multiple of the working-area period.
+def check_hex_distance_preservation(resolved, res=128, pad=1):
+    """Every wrapped pixel must preserve its hex-distance-from-center.
 
-    Cross-checks calculate_mapping() against the per-pixel production
-    rect_tiling() function, using the same coordinate convention
-    (work scaled to original resolution, grid over padded size).
+    For each mapped pixel (dx, dy) -> (nx, ny), the max-norm distance
+    from the nearest hex center at (dx, dy) must equal the distance at
+    (nx, ny).  This is the exact check from the original debug script
+    that found the hex-to-pixel rounding bug.
+
+    Uses production hex_distance_grid — no re-implemented math.
     """
-    import math
-
     pw, ph = res + 2 * pad, res + 2 * pad
-    # calculate_mapping uses work_at(original_size), not work_at(padded_size)
-    work_w, work_h = resolved.work_at(res, res)
-    cx, cy = pw / 2.0, ph / 2.0
+    hex_size = resolved.hex_size_at(res, res)
+    rotation = resolved.rotation
+
+    dist = hex_distance_grid((pw, ph), hex_size, rotation)
 
     mapping = at_mod.calculate_mapping((res, res), (pw, ph), resolved)
     n_mapped = len(mapping[0])
@@ -142,26 +115,61 @@ def check_rect_periodic_consistency(resolved, res=128, pad=1):
     nx = mapping[2].numpy()
     ny = mapping[3].numpy()
 
-    # Cross-check against production rect_tiling() using same params
-    if n_mapped > 2000:
-        idx = np.linspace(0, n_mapped - 1, 2000, dtype=int)
-    else:
-        idx = np.arange(n_mapped)
+    tolerance = 0.7 / hex_size
 
     n_mismatch = 0
-    for i in idx:
+    max_diff = 0.0
+    for i in range(n_mapped):
+        x, y = int(sx[i]), int(sy[i])
+        src_x, src_y = int(nx[i]), int(ny[i])
+
+        diff = abs(dist[y, x] - dist[src_y, src_x])
+        if diff > max_diff:
+            max_diff = diff
+        if diff >= tolerance:
+            n_mismatch += 1
+
+    assert n_mismatch == 0, (
+        f"hex_distance_preservation: {n_mismatch}/{n_mapped} pixels have "
+        f"non-preserved hex-distance (max_diff={max_diff:.6f}, "
+        f"tolerance={tolerance:.4f}, hex_size={hex_size:.2f}, res={res}, pad={pad})"
+    )
+
+
+def check_rect_mapping_agreement(resolved, res=128, pad=1):
+    """Every pixel mapped by calculate_mapping must agree with rect_tiling.
+
+    Uses production rect_tiling() with the same coordinate convention
+    as calculate_mapping (work scaled to original resolution, grid over
+    padded size).
+    """
+    pw, ph = res + 2 * pad, res + 2 * pad
+    work_w, work_h = resolved.work_at(res, res)
+
+    mapping = at_mod.calculate_mapping((res, res), (pw, ph), resolved)
+    n_mapped = len(mapping[0])
+    if n_mapped == 0:
+        return
+
+    sx = mapping[0].numpy()
+    sy = mapping[1].numpy()
+    nx = mapping[2].numpy()
+    ny = mapping[3].numpy()
+
+    n_mismatch = 0
+    for i in range(n_mapped):
         dx, dy = int(sx[i]), int(sy[i])
         expected_nx, expected_ny = rect_tiling(dx, dy, (pw, ph), work_w, work_h)
         if expected_nx != int(nx[i]) or expected_ny != int(ny[i]):
             n_mismatch += 1
 
     assert n_mismatch == 0, (
-        f"rect_periodic_consistency: {n_mismatch}/{len(idx)} sampled pixels "
-        f"disagree between calculate_mapping and rect_tiling "
+        f"rect_mapping_agreement: {n_mismatch}/{n_mapped} pixels disagree "
+        f"between calculate_mapping and rect_tiling "
         f"(work=({work_w:.1f},{work_h:.1f}), res={res}, pad={pad})"
     )
 
-    # Verify periodicity: displacement / work should be near-integer
+    # Also verify periodicity: displacement / work should be near-integer
     disp_x = (nx - sx).astype(np.float64)
     disp_y = (ny - sy).astype(np.float64)
     ratio_x = disp_x / work_w
@@ -171,7 +179,7 @@ def check_rect_periodic_consistency(resolved, res=128, pad=1):
     max_frac = max(frac_x.max(), frac_y.max())
 
     assert max_frac < 0.01, (
-        f"rect_periodic_consistency: displacement not periodic — "
+        f"rect_periodic: displacement not periodic — "
         f"max fractional period error={max_frac:.6f} "
         f"(work=({work_w:.1f},{work_h:.1f}), res={res}, pad={pad})"
     )
@@ -184,14 +192,14 @@ def check_rect_periodic_consistency(resolved, res=128, pad=1):
 def _make_hex_test(margin, div_by, pad):
     def test_fn():
         resolved = _resolve("Hexagon", 1.0, margin, div_by, is_conv2d=True)
-        check_hex_offset_consistency(resolved, res=128, pad=pad)
+        check_hex_mapping_agreement(resolved, res=128, pad=pad)
+        check_hex_distance_preservation(resolved, res=128, pad=pad)
     test_fn.__name__ = f"test_hex_m{margin}_d{div_by}_p{pad}"
     return test_fn
 
 
 for _m in range(0, 11):
     for _pad in [0, 1, 2]:
-        globals()[f"test_hex_m{_m}_d1_p{_pad}".__class__.__name__] = None
         _fn = _make_hex_test(_m, 1, _pad)
         globals()[_fn.__name__] = _fn
 
@@ -210,7 +218,7 @@ for _div in [2, 4, 8, 16]:
 def _make_rect_test(margin, div_by, pad):
     def test_fn():
         resolved = _resolve("Rectangular", 1.0, margin, div_by, is_conv2d=True)
-        check_rect_periodic_consistency(resolved, res=128, pad=pad)
+        check_rect_mapping_agreement(resolved, res=128, pad=pad)
     test_fn.__name__ = f"test_rect_m{margin}_d{div_by}_p{pad}"
     return test_fn
 
@@ -230,22 +238,49 @@ for _div in [2, 4, 8, 16]:
 # ---------------------------------------------------------------------------
 
 def test_hex_cross_resolution():
-    """Hex offset consistency at UNet resolutions (16+ latent pixels)."""
+    """Hex path agreement and distance preservation at all UNet resolutions."""
     for margin in [0, 2, 4, 6]:
         resolved = _resolve("Hexagon", 1.0, margin, 1, is_conv2d=True)
         for res in [128, 64, 32, 16]:
-            # At res=16 the hex is only ~8px wide; 4-neighbor search
-            # has fewer candidates, so allow higher tolerance.
-            tol = 0.1 if res <= 16 else _HEX_OFFSET_TOL
-            check_hex_offset_consistency(resolved, res=res, pad=1, tol=tol)
+            check_hex_mapping_agreement(resolved, res=res, pad=1)
+            check_hex_distance_preservation(resolved, res=res, pad=1)
 
 
 def test_rect_cross_resolution():
-    """Rect periodic consistency at all UNet resolutions."""
+    """Rect mapping agreement at all UNet resolutions."""
     for margin in [0, 4, 8]:
         resolved = _resolve("Rectangular", 1.0, margin, 1, is_conv2d=True)
         for res in [128, 64, 32, 16]:
-            check_rect_periodic_consistency(resolved, res=res, pad=1)
+            check_rect_mapping_agreement(resolved, res=res, pad=1)
+
+
+# ---------------------------------------------------------------------------
+# Production image resolutions
+# ---------------------------------------------------------------------------
+
+def _resolve_img(mode, scale, min_margin, div_by, img_w, img_h):
+    s = Settings(mode, 0.0, scale=scale, min_margin=min_margin,
+                 divisible_by=div_by, conv2d_attention_wrapping=False)
+    return s._resolve_auto(True, VAE_FACTOR, 1, img_w, img_h)
+
+
+def test_hex_image_resolutions():
+    """Hex checks at production image resolutions."""
+    for img_w, img_h in [(1024, 1024), (1328, 1328)]:
+        for margin in [0, 4]:
+            resolved = _resolve_img("Hexagon", 1.0, margin, 1, img_w, img_h)
+            res = img_w // VAE_FACTOR
+            check_hex_mapping_agreement(resolved, res=res, pad=1)
+            check_hex_distance_preservation(resolved, res=res, pad=1)
+
+
+def test_rect_image_resolutions():
+    """Rect checks at production image resolutions."""
+    for img_w, img_h in [(1024, 1024), (1328, 1328)]:
+        for margin in [0, 4]:
+            resolved = _resolve_img("Rectangular", 1.0, margin, 1, img_w, img_h)
+            res = img_w // VAE_FACTOR
+            check_rect_mapping_agreement(resolved, res=res, pad=1)
 
 
 # ---------------------------------------------------------------------------

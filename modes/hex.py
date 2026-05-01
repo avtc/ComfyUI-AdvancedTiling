@@ -148,7 +148,7 @@ def pixel_to_hex(
     return (q, r)
 
 
-def _cube_round_offsets(q: float, r: float):
+def cube_round_offsets(q: float, r: float):
     """Cube-round (q, r) and return the fractional offsets (dq, dr)."""
     s = -q - r
     rq = math.floor(q + 0.5)
@@ -194,7 +194,7 @@ def hex_tiling(
         hex_size,
         rotation,
     )
-    target_dq, target_dr = _cube_round_offsets(q, r)
+    target_dq, target_dr = cube_round_offsets(q, r)
 
     # Continuous pixel position of the target offset
     pixel = hex_size * (mat @ np.array([[target_dq], [target_dr]])).flatten()
@@ -210,7 +210,7 @@ def hex_tiling(
             cq, cr = (
                 inv_mat @ np.array([[cx], [cy]])
             ).flatten() / hex_size
-            cand_dq, cand_dr = _cube_round_offsets(float(cq), float(cr))
+            cand_dq, cand_dr = cube_round_offsets(float(cq), float(cr))
             err = max(abs(cand_dq - target_dq), abs(cand_dr - target_dr))
             if err < best_err:
                 best_err = err
@@ -230,3 +230,41 @@ def hex_tiling_at(x, y, padded_size, resolved):
     """
     size = resolved.hex_size_at(padded_size[0], padded_size[1])
     return hex_tiling(x, y, padded_size, size, resolved.rotation)
+
+
+def hex_distance_grid(padded_size, hex_size, rotation):
+    """Compute max-norm distance from nearest hex center for every pixel.
+
+    Uses the same numpy vectorized cube_round as _hex_remap_batch
+    (np.floor-based), ensuring bit-identical results with the Conv2d
+    wrapping path.
+
+    :param padded_size: (width, height) of the tensor
+    :param hex_size: Hex radius at this resolution
+    :param rotation: Rotation angle in degrees
+    :return: 2D numpy array (height, width) of distances
+    """
+    pw, ph = padded_size
+    inv_mat = get_inverse_matrix(rotation)
+
+    cx = np.arange(pw, dtype=np.float64) - pw // 2
+    cy = np.arange(ph, dtype=np.float64) - ph // 2
+    grid_cx, grid_cy = np.meshgrid(cx, cy, indexing='xy')
+
+    pts = np.stack([grid_cx.ravel(), grid_cy.ravel()], axis=0)
+    qr = (inv_mat @ pts) / hex_size
+    hq, hr = qr[0], qr[1]
+    hs = -hq - hr
+
+    _half_up = np.floor
+    rq, rr, rs = _half_up(hq + 0.5), _half_up(hr + 0.5), _half_up(hs + 0.5)
+    q_diff = np.abs(rq - hq)
+    r_diff = np.abs(rr - hr)
+    s_diff = np.abs(rs - hs)
+    mask_q = (q_diff > r_diff) & (q_diff > s_diff)
+    mask_r = ~mask_q & (r_diff > s_diff)
+    rq = np.where(mask_q, -rr - rs, rq)
+    rr = np.where(mask_r, -rq - rs, rr)
+
+    dist = np.maximum(np.maximum(np.abs(hq - rq), np.abs(hr - rr)), np.abs(hs - rs))
+    return dist.reshape(ph, pw)
