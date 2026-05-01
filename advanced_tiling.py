@@ -4,26 +4,53 @@ Main advanced tiling implementation
 
 from typing import Optional
 import functools
+import math
 
 import torch
 from torch import Tensor
 from torch.nn import Conv2d
 from torch.nn import functional as F
 from torch.nn.modules.utils import _pair
-from .modes import modes, Settings
-from .dit_tiling import patch_dit_model, _has_conv2d, _create_content_wrapper
+from .modes import MODE_NAMES, Settings, ResolvedSettings
+from .dit_tiling import patch_dit_model, _has_conv2d
+
+# Track patches applied to the shared model so they can be removed between runs.
+# ComfyUI's model.clone() shares the same underlying nn.Module, so hooks and
+# _conv_forward replacements persist across workflow executions.
+_attention_hook_handles: list = []
+_patched_conv2d_layers: dict[int, tuple] = {}
 
 
-def _hex_remap_batch(centers_x, centers_y, size, wrap_w, wrap_h, settings):
-    """Vectorized hex coordinate remapping for all pixels at once."""
+def _cleanup_previous_patches():
+    """Remove all hooks and restore Conv2d layers from previous patch_model calls."""
+    global _attention_hook_handles, _patched_conv2d_layers
+
+    for handle in _attention_hook_handles:
+        handle.remove()
+    _attention_hook_handles.clear()
+
+    for mid, (layer, orig_forward, had_attr) in _patched_conv2d_layers.items():
+        layer._conv_forward = orig_forward
+        if had_attr:
+            del layer.tiling_resolved
+    _patched_conv2d_layers.clear()
+
+
+def _hex_remap_batch(centers_x, centers_y, size, wrap_w, wrap_h, rotation):
+    """Vectorized hex coordinate remapping for all pixels at once.
+
+    Uses 4-neighbor search to find the integer source pixel whose hex offset
+    best matches the destination's hex offset, eliminating rounding mismatches
+    that occur when the hex-to-pixel round-trip lands on a suboptimal integer.
+    """
     import numpy as np
     from .modes.hex import get_inverse_matrix, get_matrix
 
     flat_x = np.asarray(centers_x).ravel().astype(np.float64)
     flat_y = np.asarray(centers_y).ravel().astype(np.float64)
 
-    inv_mat = get_inverse_matrix(settings)
-    mat = get_matrix(settings)
+    inv_mat = get_inverse_matrix(rotation)
+    mat = get_matrix(rotation)
 
     # pixel_to_hex (batch): inverse matrix multiply + divide by size
     pts = np.stack([flat_x, flat_y], axis=0)
@@ -31,62 +58,112 @@ def _hex_remap_batch(centers_x, centers_y, size, wrap_w, wrap_h, settings):
     q, r = qr[0], qr[1]
     s = -q - r
 
-    # cube_round (vectorized)
-    rq, rr, rs = np.rint(q), np.rint(r), np.rint(s)
+    # cube_round (vectorized) — floor(x+0.5) for consistent half-up rounding
+    _half_up = lambda v: np.floor(v + 0.5)
+    rq, rr, rs = _half_up(q), _half_up(r), _half_up(s)
     q_diff, r_diff, s_diff = np.abs(rq - q), np.abs(rr - r), np.abs(rs - s)
     mask_q = (q_diff > r_diff) & (q_diff > s_diff)
     mask_r = ~mask_q & (r_diff > s_diff)
     rq = np.where(mask_q, -rr - rs, rq)
     rr = np.where(mask_r, -rq - rs, rr)
 
-    # Fractional parts -> hex_to_pixel
-    pixel = size * (mat @ np.stack([q - rq, r - rr], axis=0))
-    new_x = np.rint(pixel[0]).astype(np.int64)
-    new_y = np.rint(pixel[1]).astype(np.int64)
+    # Target hex offsets (desired relative position within hex cell)
+    target_dq = q - rq
+    target_dr = r - rr
 
-    new_x = (new_x + wrap_w // 2) % wrap_w
-    new_y = (new_y + wrap_h // 2) % wrap_h
+    # Continuous pixel position of the target offset
+    pixel = size * (mat @ np.stack([target_dq, target_dr], axis=0))
+    base_x = np.floor(pixel[0]).astype(np.int64)
+    base_y = np.floor(pixel[1]).astype(np.int64)
+
+    # 4-neighbor search: pick the integer pixel whose hex offset
+    # is closest to the target offset (Chebyshev distance in hex space).
+    # The simple rounding result is always one of the 4 candidates,
+    # so this can only match or improve, never regress.
+    best_x = np.empty_like(base_x)
+    best_y = np.empty_like(base_y)
+    best_err = np.full(len(q), np.inf)
+
+    for dx in (0, 1):
+        for dy in (0, 1):
+            cx = (base_x + dx).astype(np.float64)
+            cy = (base_y + dy).astype(np.float64)
+            c_pts = np.stack([cx, cy], axis=0)
+            c_qr = (inv_mat @ c_pts) / size
+            cq, cr = c_qr[0], c_qr[1]
+            cs = -cq - cr
+            crq, crr, crs = _half_up(cq), _half_up(cr), _half_up(cs)
+            cq_diff = np.abs(crq - cq)
+            cr_diff = np.abs(crr - cr)
+            cs_diff = np.abs(crs - cs)
+            cmask_q = (cq_diff > cr_diff) & (cq_diff > cs_diff)
+            cmask_r = ~cmask_q & (cr_diff > cs_diff)
+            crq = np.where(cmask_q, -crr - crs, crq)
+            crr = np.where(cmask_r, -crq - crs, crr)
+            cand_dq = cq - crq
+            cand_dr = cr - crr
+            err = np.maximum(np.abs(cand_dq - target_dq), np.abs(cand_dr - target_dr))
+            better = err < best_err
+            best_x = np.where(better, base_x + dx, best_x)
+            best_y = np.where(better, base_y + dy, best_y)
+            best_err = np.where(better, err, best_err)
+
+    new_x = (best_x + wrap_w // 2) % wrap_w
+    new_y = (best_y + wrap_h // 2) % wrap_h
     return new_x, new_y
 
 
 @functools.cache
 def calculate_mapping(
-    original_size: tuple[int, int], padded_size: tuple[int, int], settings: Settings
+    original_size: tuple[int, int], padded_size: tuple[int, int],
+    resolved: ResolvedSettings,
 ):
     """
     Calculate mapping for pixels outside of the mask
 
     :param original_size: Original size of the image
     :param padded_size: Padded size of the image
-    :param settings: Tiling settings
+    :param resolved: Resolved tiling settings with pre-computed values
     :return: Mapping of pixels
     """
-
     pw, ph = padded_size
     ow, oh = original_size
 
-    if settings.mode == "Rectangular":
-        pad_x = (pw - ow) // 2
-        pad_y = (ph - oh) // 2
-        xs = torch.arange(pw)
-        ys = torch.arange(ph)
+    if resolved.mode == "Rectangular":
+        # Scale working area to actual tensor resolution.
+        # At diffusion latent resolution ow=img_w/vae_factor, scale=1.0.
+        # VAE decoder Conv2d layers at 2x/4x/8x get proportionally scaled.
+        work_w, work_h = resolved.work_at(ow, oh)
+        cx, cy = pw / 2.0, ph / 2.0
+
+        xs = torch.arange(pw, dtype=torch.float64)
+        ys = torch.arange(ph, dtype=torch.float64)
         grid_x, grid_y = torch.meshgrid(xs, ys, indexing='xy')
-        src_x = grid_x.flatten()
-        src_y = grid_y.flatten()
-        new_x = (src_x - pad_x) % ow + pad_x
-        new_y = (src_y - pad_y) % oh + pad_y
-        # Only keep pixels that actually change position
+
+        rel_x = grid_x - cx
+        rel_y = grid_y - cy
+
+        new_x = cx + torch.fmod(torch.fmod(rel_x + work_w / 2, work_w) + work_w, work_w) - work_w / 2
+        new_y = cy + torch.fmod(torch.fmod(rel_y + work_h / 2, work_h) + work_h, work_h) - work_h / 2
+
+        new_x = torch.floor(new_x + 0.5).to(torch.long)
+        new_y = torch.floor(new_y + 0.5).to(torch.long)
+        src_x = grid_x.flatten().to(torch.long)
+        src_y = grid_y.flatten().to(torch.long)
+        new_x = new_x.flatten()
+        new_y = new_y.flatten()
+
         non_id = (src_x != new_x) | (src_y != new_y)
         result = (src_x[non_id], src_y[non_id], new_x[non_id], new_y[non_id])
 
-    elif settings.mode == "Hexagon":
+    elif resolved.mode == "Hexagon":
         import numpy as np
-        min_margin = getattr(settings, 'min_margin', 0)
-        size = max(1, round(min(ow, oh) // 2 * settings.scale) - min_margin)
+        # Scale hex size to actual tensor resolution.
+        size = resolved.hex_size_at(ow, oh)
         cx = np.arange(pw, dtype=np.float64) - pw // 2
         cy = np.arange(ph, dtype=np.float64) - ph // 2
         grid_cx, grid_cy = np.meshgrid(cx, cy, indexing='xy')
-        new_x, new_y = _hex_remap_batch(grid_cx, grid_cy, size, pw, ph, settings)
+        new_x, new_y = _hex_remap_batch(grid_cx, grid_cy, size, pw, ph, resolved.rotation)
 
         src_x = np.tile(np.arange(pw, dtype=np.int64), ph)
         src_y = np.repeat(np.arange(ph, dtype=np.int64), pw)
@@ -104,50 +181,186 @@ def calculate_mapping(
 
 
 @functools.cache
-def create_crop_mask(width: int, height: int, settings: Settings):
+def create_crop_mask(width: int, height: int, resolved: ResolvedSettings):
     """
-    Crop image based on tiling settings
+    Create crop mask based on resolved tiling settings.
 
-    :param image: Image to crop
-    :param settings: Tiling settings
-    :return: Cropped image
+    :param width: Width of the image
+    :param height: Height of the image
+    :param resolved: Resolved tiling settings with pre-computed values
+    :return: Crop mask tensor (1, H, W, 1)
     """
-
-    if settings.mode == "Hexagon":
+    if resolved.mode == "Hexagon":
         import numpy as np
-        min_margin = getattr(settings, 'min_margin', 0)
-        size = max(1, round(min(width, height) // 2 * settings.scale) - min_margin)
+
+        size = resolved.hex_size_img
         cx = np.arange(width, dtype=np.float64) - width // 2
         cy = np.arange(height, dtype=np.float64) - height // 2
         grid_cx, grid_cy = np.meshgrid(cx, cy, indexing='xy')
-        new_x, new_y = _hex_remap_batch(grid_cx, grid_cy, size, width, height, settings)
+        new_x, new_y = _hex_remap_batch(grid_cx, grid_cy, size, width, height, resolved.rotation)
 
         src_x = np.tile(np.arange(width, dtype=np.int64), height)
         src_y = np.repeat(np.arange(height, dtype=np.int64), width)
-        is_identity = torch.from_numpy(((new_x == src_x) & (new_y == src_y)).reshape(height, width))
+        is_identity = ((new_x == src_x) & (new_y == src_y)).reshape(height, width)
+
+        mask = torch.zeros((1, height, width, 1), dtype=torch.float32)
+        mask[0, :, :, 0] = torch.from_numpy(is_identity.astype(np.float32))
+
+    elif resolved.mode == "Rectangular":
+        work_w, work_h = resolved.work_img_w, resolved.work_img_h
+        cx, cy = width / 2.0, height / 2.0
+        left = cx - work_w / 2
+        right = cx + work_w / 2
+        top = cy - work_h / 2
+        bottom = cy + work_h / 2
+
+        xs = torch.arange(width, dtype=torch.float64)
+        ys = torch.arange(height, dtype=torch.float64)
+        inside_x = (xs >= left) & (xs < right)
+        inside_y = (ys >= top) & (ys < bottom)
+        is_identity = inside_y.unsqueeze(1) & inside_x.unsqueeze(0)
+
         mask = torch.zeros((1, height, width, 1), dtype=torch.float32)
         mask[0, :, :, 0] = is_identity.float()
+
     else:
-        # Rectangular/None: all pixels are in the mask
         mask = torch.ones((1, height, width, 1), dtype=torch.float32)
 
     return mask
 
 
-def patch_model(model, settings: Settings):
+def compute_crop_bounds(img_w: int, img_h: int, resolved: ResolvedSettings):
+    """Compute crop bounding box (rmin, rmax, cmin, cmax) inclusive.
+
+    :param img_w: Image width
+    :param img_h: Image height
+    :param resolved: Resolved tiling settings
+    :return: (rmin, rmax, cmin, cmax) inclusive pixel indices
+    """
+    if resolved.mode == "Rectangular" and resolved.margin_img_w > 0:
+        crop_w = int(math.floor(resolved.work_img_w + 0.5))
+        crop_h = int(math.floor(resolved.work_img_h + 0.5))
+        center_c = img_w // 2
+        center_r = img_h // 2
+        cmin = center_c - crop_w // 2
+        cmax = cmin + crop_w - 1
+        rmin = center_r - crop_h // 2
+        rmax = rmin + crop_h - 1
+    elif resolved.mode == "Hexagon":
+        hex_side = int(math.floor(2 * resolved.hex_size_img + 0.5))
+        center_r = img_h // 2
+        center_c = img_w // 2
+        half = hex_side // 2
+        rmin = max(0, center_r - half)
+        cmin = max(0, center_c - half)
+        rmax = min(img_h, rmin + hex_side) - 1
+        cmax = min(img_w, cmin + hex_side) - 1
+        rmin = max(0, rmax + 1 - hex_side)
+        cmin = max(0, cmax + 1 - hex_side)
+    else:
+        rmin, rmax, cmin, cmax = 0, img_h - 1, 0, img_w - 1
+    return rmin, rmax, cmin, cmax
+
+
+def _mask_bounding_box(mask: torch.Tensor) -> tuple[int, int, int, int]:
+    """Find the bounding box of non-zero region in a crop mask.
+
+    :param mask: Shape (1, H, W, 1)
+    :return: (rmin, rmax, cmin, cmax) inclusive indices
+    """
+    mask_2d = mask[0, :, :, 0]
+    rows = torch.any(mask_2d, dim=1)
+    cols = torch.any(mask_2d, dim=0)
+    row_indices = torch.where(rows)[0]
+    col_indices = torch.where(cols)[0]
+    return (
+        row_indices[0].item(), row_indices[-1].item(),
+        col_indices[0].item(), col_indices[-1].item(),
+    )
+
+
+def _crop_with_mask(
+    image: torch.Tensor,
+    mask: torch.Tensor,
+    rmin: int, rmax: int, cmin: int, cmax: int,
+) -> torch.Tensor:
+    """Slice image and mask to bounding box, concatenate mask as alpha channel.
+
+    :param image: Shape (B, H, W, C)
+    :param mask: Shape (1, H, W, 1)
+    :return: Image with mask appended as last channel
+    """
+    image = image[:, rmin:rmax + 1, cmin:cmax + 1, :]
+    cropped_mask = mask[:, rmin:rmax + 1, cmin:cmax + 1, :]
+    return torch.cat((image, cropped_mask.to(device=image.device)), dim=3)
+
+
+def patch_model(model, resolved: ResolvedSettings):
     """
     Patch model to perform tiling - in place!
 
-    :param model: Model to patch
-    :param settings: Tiling settings
-    """
+    Patches Conv2d layers with spatial wrapping and optionally patches
+    SpatialTransformer norm outputs with the same wrapping, so attention
+    layers also see the tiled tensor.
 
-    # Patch all Conv2d layers
-    for layer in [layer for layer in model.modules() if isinstance(layer, Conv2d)]:
+    Does NOT clean up previous patches — caller must call
+    _cleanup_previous_patches() first if needed.
+
+    :param model: Model to patch
+    :param resolved: Resolved tiling settings
+    """
+    global _patched_conv2d_layers
+
+    conv2d_layers = [layer for layer in model.modules() if isinstance(layer, Conv2d)]
+    for layer in conv2d_layers:
+        mid = id(layer)
+        if mid not in _patched_conv2d_layers:
+            _patched_conv2d_layers[mid] = (
+                layer, layer._conv_forward, hasattr(layer, 'tiling_resolved'),
+            )
         # pylint: disable=protected-access, no-value-for-parameter
         layer._conv_forward = tiling_conv.__get__(layer, Conv2d)
-        layer.tiling_settings = settings
+        layer.tiling_resolved = resolved
+
+    if resolved.conv2d_attention_wrapping:
+        _patch_attention_wrapping(model, resolved)
     return
+
+
+def _patch_attention_wrapping(model, resolved: ResolvedSettings):
+    """Register forward hooks on SpatialTransformer norm modules so attention
+    sees the tiled tensor.
+
+    The hook runs after GroupNorm but before proj_in / transformer blocks,
+    so the skip connection (``x + x_in``) uses the original unwrapped input.
+    """
+    count = 0
+    for module in model.modules():
+        if module.__class__.__name__ != "SpatialTransformer":
+            continue
+        norm = getattr(module, "norm", None)
+        if norm is None:
+            continue
+        _register_tiling_hook(norm, resolved)
+        count += 1
+
+
+def _register_tiling_hook(norm_module, resolved: ResolvedSettings):
+    """Forward hook that applies tiling wrapping to a norm module's output."""
+
+    def _hook(_module, _input, output):
+        if output.ndim < 3:
+            return output
+        W, H = output.shape[-1], output.shape[-2]
+        mapping = calculate_mapping((W, H), (W, H), resolved)
+        n_mapped = len(mapping[0])
+        if n_mapped > 0:
+            output[:, :, mapping[1], mapping[0]] = output[:, :, mapping[3], mapping[2]]
+        return output
+
+    global _attention_hook_handles
+    handle = norm_module.register_forward_hook(_hook)
+    _attention_hook_handles.append(handle)
 
 
 def tiling_conv(self, input_tensor: Tensor, weight: Tensor, bias: Optional[Tensor]):
@@ -170,7 +383,7 @@ def tiling_conv(self, input_tensor: Tensor, weight: Tensor, bias: Optional[Tenso
     mapping = calculate_mapping(
         (input_tensor.shape[-1], input_tensor.shape[-2]),
         (padded.shape[-1], padded.shape[-2]),
-        self.tiling_settings,
+        self.tiling_resolved,
     )
     # Apply tiling
     padded[:, :, mapping[1], mapping[0]] = padded[:, :, mapping[3], mapping[2]]
@@ -196,7 +409,7 @@ class AdvancedTilingSettings:
 
         return {
             "required": {
-                "mode": (list(modes.keys()), {
+                "mode": (MODE_NAMES, {
                     "tooltip": "Tiling mode. 'None' disables tiling, 'Hexagon' wraps edges in a hexagonal pattern, 'Rectangular' wraps right→left and bottom→top.",
                 }),
                 "rotation": (
@@ -223,8 +436,15 @@ class AdvancedTilingSettings:
                 "divisible_by": (
                     "INT",
                     {
-                        "default": 16, "min": 1, "max": 256, "step": 1,
-                        "tooltip": "Round working area dimensions to multiples of this value in pixels. Only applies when margin exists (scale < 1.0 or min_margin > 0). Affects final output size when crop is enabled. 1 = no rounding, 16 = ensures symmetric margins.",
+                        "default": 1, "min": 0, "max": 256, "step": 1,
+                        "tooltip": "Round working area down to multiples of this value. Affects wrapping and crop. 1 = floor to integer. 0 = disabled.",
+                    },
+                ),
+                "conv2d_attention_wrapping": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "Apply tiling wrapping to SpatialTransformer norm output so attention sees the tiled tensor (Conv2d/UNet models only). Disable to only wrap Conv2d layers.",
                     },
                 ),
             },
@@ -234,17 +454,14 @@ class AdvancedTilingSettings:
     RETURN_NAMES = ("SETTINGS",)
     FUNCTION = "run"
 
-    def run(self, mode, rotation, scale, min_margin, divisible_by):
+    def run(self, mode, rotation, scale, min_margin, divisible_by,
+            conv2d_attention_wrapping):
         """
         Creates tiling settings from node inputs
         """
 
-        import math
-
-        # scale=0.0 is the auto sentinel — resolved in AdvancedTiling.run()
-        # once the model type is known.
-
-        settings = Settings(mode, rotation, scale, min_margin, divisible_by)
+        settings = Settings(mode, rotation, scale, min_margin, divisible_by,
+                            conv2d_attention_wrapping)
 
         return (settings,)
 
@@ -266,48 +483,47 @@ class AdvancedTiling:
             "required": {
                 "settings": ("ADVANCED_TILING_SETTINGS",),
                 "model": ("MODEL",),
+                "vae": ("VAE",),
+                "latent": ("LATENT",),
             },
         }
 
     CATEGORY = "conditioning"
-    RETURN_TYPES = ("MODEL",)
+    RETURN_TYPES = ("MODEL", "RESOLVED_TILING_SETTINGS")
+    RETURN_NAMES = ("MODEL", "resolved_settings")
     FUNCTION = "run"
 
-    def run(self, settings, model):
+    def run(self, settings, model, vae, latent):
         """
         Does the actual patching of the model
         """
 
-        import math
-
         model_copy = model.clone()
 
-        # Resolve auto-scale (0.0): Conv2d=1.0, DiT Rectangular=0.875, DiT Hexagon=1.0
-        if settings.scale == 0.0:
-            is_conv2d = _has_conv2d(model_copy.model.diffusion_model)
-            if is_conv2d or settings.mode == "Hexagon":
-                settings.scale = 1.0
-            else:
-                settings.scale = round(math.sqrt(3) / 2, 3)  # 0.875
+        diff_model = model_copy.model.diffusion_model
+        is_conv2d = _has_conv2d(diff_model)
+        vae_factor = vae.spacial_compression_decode()
+        patch_size = 1 if is_conv2d else getattr(diff_model, 'patch_size', 1)
 
-        # Resolve auto min_margin (-1): 4 for DiT Rectangular, 0 otherwise
-        if settings.min_margin == -1:
-            is_conv2d = _has_conv2d(model_copy.model.diffusion_model)
-            if not is_conv2d and settings.mode == "Rectangular":
-                settings.min_margin = 4
-            else:
-                settings.min_margin = 0
+        latent_tensor = latent["samples"]
+        _, _, H_lat, W_lat = latent_tensor.shape
+        img_w = W_lat * vae_factor
+        img_h = H_lat * vae_factor
 
-        if _has_conv2d(model_copy.model.diffusion_model):
-            patch_model(model_copy.model, settings)
+        resolved = settings._resolve_auto(is_conv2d, vae_factor, patch_size, img_w, img_h)
 
-            if settings.mode == "Rectangular" and (settings.scale < 1.0 or settings.min_margin > 0):
-                wrapper = _create_content_wrapper(settings)
-                model_copy.set_model_unet_function_wrapper(wrapper)
+        if resolved.mode == "None":
+            _cleanup_previous_patches()
+            return (model_copy, resolved)
+
+        if is_conv2d:
+            _cleanup_previous_patches()
+            patch_model(model_copy.model, resolved)
         else:
-            patch_dit_model(model_copy, settings)
+            patch_dit_model(model_copy, resolved)
 
-        return (model_copy,)
+        return (model_copy, resolved)
+
 
 
 class AdvancedTilingVAEDecode:
@@ -325,7 +541,7 @@ class AdvancedTilingVAEDecode:
 
         return {
             "required": {
-                "settings": ("ADVANCED_TILING_SETTINGS",),
+                "resolved_settings": ("RESOLVED_TILING_SETTINGS",),
                 "samples": ("LATENT",),
                 "vae": ("VAE",),
                 "crop": ("BOOLEAN", {"default": True}),
@@ -336,16 +552,23 @@ class AdvancedTilingVAEDecode:
     FUNCTION = "run"
     CATEGORY = "latent"
 
-    def run(self, settings, samples, vae, crop):
+    def run(self, resolved_settings, samples, vae, crop):
         """
         Decode latents to image with tiling
         Optionally crop the image based on tiling settings
 
         For Hexagon mode: applies alpha mask for hex-shaped cropping.
-        For Rectangular mode with scale < 1.0: crops the latent to the centered
-        working rectangle before VAE decoding, so the VAE's Conv2d wrapping
-        operates at the working rectangle boundary.
+        For Rectangular mode with margin: decodes full latent
+        then crops using mask-based post-decode crop.
+
+        Settings must be pre-resolved (from AdvancedTiling node output).
         """
+
+        if resolved_settings.mode == "None":
+            image = vae.decode(samples["samples"])
+            if image.ndim == 5:
+                image = image.squeeze(1)
+            return (image,)
 
         # Patch VAE in-place instead of deepcopy (avoids copying ~167MB of weights).
         # Save original state so we can restore after decode.
@@ -354,77 +577,41 @@ class AdvancedTilingVAEDecode:
             if isinstance(layer, Conv2d)
         ]
         saved = [
-            (layer, layer._conv_forward, getattr(layer, 'tiling_settings', None))
+            (layer, layer._conv_forward, getattr(layer, 'tiling_resolved', None))
             for layer in conv_layers
         ]
-        patch_model(vae.first_stage_model, settings)
+
+        # Use settings as-is — they were resolved by AdvancedTiling.run()
+        # to match the generation model's working area.
+        patch_model(vae.first_stage_model, resolved_settings)
 
         try:
-            result = self._decode_and_crop(settings, samples, vae, crop)
+            result = self._decode_and_crop(resolved_settings, samples, vae, crop)
         finally:
+            # Restore original state — patch_model added tiling_resolved to
+            # every Conv2d layer, so deleting it is always safe here.
             for layer, orig_forward, _ in saved:
                 layer._conv_forward = orig_forward
-                if hasattr(layer, 'tiling_settings'):
-                    del layer.tiling_settings
+                if hasattr(layer, 'tiling_resolved'):
+                    del layer.tiling_resolved
 
         return result
 
-    def _decode_and_crop(self, settings, samples, vae, crop):
+    def _decode_and_crop(self, resolved_settings, samples, vae, crop):
         latent = samples["samples"]
-        is_5d = latent.ndim == 5
 
-        if is_5d:
-            _, _, _, H_lat, W_lat = latent.shape
-        else:
-            _, _, H_lat, W_lat = latent.shape
-
-        # For rectangular mode with margin, crop latent to working rectangle
-        # before VAE decoding so Conv2d wrapping operates at working rect boundary.
-        # Use patch-aligned dimensions for consistency with the model wrapper.
-        if crop and settings.mode == "Rectangular" and (settings.scale < 1.0 or settings.min_margin > 0):
-            from .dit_tiling import _compute_working_size
-            patch_size = getattr(settings, '_patch_size', 1)
-            work_W, work_H, margin_W, margin_H = _compute_working_size(
-                W_lat, H_lat, settings, patch_size=patch_size,
-            )
-            if is_5d:
-                latent = latent[:, :, :, margin_H:margin_H + work_H, margin_W:margin_W + work_W]
-            else:
-                latent = latent[:, :, margin_H:margin_H + work_H, margin_W:margin_W + work_W]
-
-        # Decode latents to image
+        # Decode full latent — crop after decode using mask
         image = vae.decode(latent)
 
-        # WanVAE returns 5D (B, T, H, W, C), standard VAE returns 4D (B, H, W, C)
         if image.ndim == 5:
             image = image.squeeze(1)
 
         if crop:
-            if settings.mode == "Hexagon":
-                img_h, img_w = image.shape[1], image.shape[2]
-                mask = create_crop_mask(img_w, img_h, settings)
-                mask_2d = mask[0, :, :, 0]
-                rows = torch.any(mask_2d, dim=1)
-                cols = torch.any(mask_2d, dim=0)
-                row_indices = torch.where(rows)[0]
-                col_indices = torch.where(cols)[0]
-                rmin, rmax = row_indices[0].item(), row_indices[-1].item()
-                cmin, cmax = col_indices[0].item(), col_indices[-1].item()
+            img_h, img_w = image.shape[1], image.shape[2]
+            mask = create_crop_mask(img_w, img_h, resolved_settings)
 
-                # Crop to square based on hex height, centered on hex center
-                hex_h = rmax - rmin + 1
-                center_r = (rmin + rmax) // 2
-                center_c = (cmin + cmax) // 2
-                half = hex_h // 2
-                sq_rmin = max(0, center_r - half)
-                sq_cmin = max(0, center_c - half)
-                sq_rmax = min(img_h, sq_rmin + hex_h) - 1
-                sq_cmax = min(img_w, sq_cmin + hex_h) - 1
-                sq_rmin = sq_rmax + 1 - hex_h
-                sq_cmin = sq_cmax + 1 - hex_h
-
-                image = image[:, sq_rmin:sq_rmax + 1, sq_cmin:sq_cmax + 1, :]
-                cropped_mask = mask[:, sq_rmin:sq_rmax + 1, sq_cmin:sq_cmax + 1, :]
-                image = torch.cat((image, cropped_mask.to(device=image.device)), dim=3)
+            if resolved_settings.mode != "None":
+                rmin, rmax, cmin, cmax = compute_crop_bounds(img_w, img_h, resolved_settings)
+                image = _crop_with_mask(image, mask, rmin, rmax, cmin, cmax)
 
         return (image,)
