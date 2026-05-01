@@ -101,7 +101,20 @@ if HAS_RAYLIGHT:
                 raw = Settings(mode, rotation, scale, min_margin, divisible_by, conv2d_attention_wrapping=True)
                 resolved = raw._resolve_auto(False, vae_factor, patch_size, img_W, img_H)
                 patch_dit_model(model, resolved)
-                return resolved
+                return {
+                    "mode": resolved.mode,
+                    "rotation": resolved.rotation,
+                    "work_img_w": resolved.work_img_w,
+                    "work_img_h": resolved.work_img_h,
+                    "margin_img_w": resolved.margin_img_w,
+                    "work_patch_w": resolved.work_patch_w,
+                    "work_patch_h": resolved.work_patch_h,
+                    "hex_size_img": resolved.hex_size_img,
+                    "hex_size_patch": resolved.hex_size_patch,
+                    "img_w": resolved.img_w,
+                    "img_h": resolved.img_h,
+                    "conv2d_attention_wrapping": resolved.conv2d_attention_wrapping,
+                }
 
             # Build per-worker args: each worker gets its latent's img dimensions
             worker_args = []
@@ -118,6 +131,8 @@ if HAS_RAYLIGHT:
                 for actor, (img_W, img_H) in zip(gpu_workers, worker_args)
             ]
             results = ray.get(futures)
-            # Use resolved settings from workers (they have correct patch_size)
-            resolved_list = results
+            # Reconstruct ResolvedSettings from plain dicts (workers can't
+            # serialize the class back across Ray due to the hyphenated module)
+            from .modes import ResolvedSettings
+            resolved_list = [ResolvedSettings(**d) for d in results]
             return (ray_actors, resolved_list)
