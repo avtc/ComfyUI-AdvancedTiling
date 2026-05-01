@@ -241,6 +241,10 @@ def patch_model(model, resolved: ResolvedSettings):
     """
     Patch model to perform tiling - in place!
 
+    Patches Conv2d layers with spatial wrapping and optionally patches
+    SpatialTransformer norm outputs with the same wrapping, so attention
+    layers also see the tiled tensor.
+
     :param model: Model to patch
     :param resolved: Resolved tiling settings
     """
@@ -248,7 +252,41 @@ def patch_model(model, resolved: ResolvedSettings):
         # pylint: disable=protected-access, no-value-for-parameter
         layer._conv_forward = tiling_conv.__get__(layer, Conv2d)
         layer.tiling_resolved = resolved
+
+    if resolved.conv2d_attention_wrapping:
+        _patch_attention_wrapping(model, resolved)
     return
+
+
+def _patch_attention_wrapping(model, resolved: ResolvedSettings):
+    """Register forward hooks on SpatialTransformer norm modules so attention
+    sees the tiled tensor.
+
+    The hook runs after GroupNorm but before proj_in / transformer blocks,
+    so the skip connection (``x + x_in``) uses the original unwrapped input.
+    """
+    for module in model.modules():
+        if module.__class__.__name__ != "SpatialTransformer":
+            continue
+        norm = getattr(module, "norm", None)
+        if norm is None:
+            continue
+        _register_tiling_hook(norm, resolved)
+
+
+def _register_tiling_hook(norm_module, resolved: ResolvedSettings):
+    """Forward hook that applies tiling wrapping to a norm module's output."""
+
+    def _hook(_module, _input, output):
+        if output.ndim < 3:
+            return output
+        W, H = output.shape[-1], output.shape[-2]
+        mapping = calculate_mapping((W, H), (W, H), resolved)
+        if len(mapping[0]) > 0:
+            output[:, :, mapping[1], mapping[0]] = output[:, :, mapping[3], mapping[2]]
+        return output
+
+    norm_module.register_forward_hook(_hook)
 
 
 def tiling_conv(self, input_tensor: Tensor, weight: Tensor, bias: Optional[Tensor]):
@@ -328,6 +366,13 @@ class AdvancedTilingSettings:
                         "tooltip": "Round working area down to multiples of this value. Affects wrapping and crop. 1 = no rounding.",
                     },
                 ),
+                "conv2d_attention_wrapping": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "Apply tiling wrapping to SpatialTransformer norm output so attention sees the tiled tensor (Conv2d/UNet models only). Disable to only wrap Conv2d layers.",
+                    },
+                ),
             },
         }
 
@@ -335,12 +380,14 @@ class AdvancedTilingSettings:
     RETURN_NAMES = ("SETTINGS",)
     FUNCTION = "run"
 
-    def run(self, mode, rotation, scale, min_margin, divisible_by):
+    def run(self, mode, rotation, scale, min_margin, divisible_by,
+            conv2d_attention_wrapping):
         """
         Creates tiling settings from node inputs
         """
 
-        settings = Settings(mode, rotation, scale, min_margin, divisible_by)
+        settings = Settings(mode, rotation, scale, min_margin, divisible_by,
+                            conv2d_attention_wrapping)
 
         return (settings,)
 

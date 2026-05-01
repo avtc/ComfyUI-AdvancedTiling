@@ -22,14 +22,17 @@ class Settings:
     and resolution-dependent properties pre-computed.
     """
 
-    __slots__ = ("mode", "rotation", "scale", "min_margin", "divisible_by")
+    __slots__ = ("mode", "rotation", "scale", "min_margin", "divisible_by",
+                 "conv2d_attention_wrapping")
 
-    def __init__(self, mode, rotation, scale, min_margin, divisible_by):
+    def __init__(self, mode, rotation, scale, min_margin, divisible_by,
+                 conv2d_attention_wrapping):
         self.mode = mode
         self.rotation = rotation
         self.scale = scale
         self.min_margin = min_margin
         self.divisible_by = divisible_by
+        self.conv2d_attention_wrapping = conv2d_attention_wrapping
 
     def _resolve_auto(self, is_conv2d: bool, vae_factor: int, patch_size: int,
                       img_w: int, img_h: int) -> "ResolvedSettings":
@@ -102,19 +105,21 @@ class Settings:
             work_patch_w, work_patch_h,
             hex_size_img, hex_size_patch,
             img_w, img_h,
+            self.conv2d_attention_wrapping,
         )
 
     def __eq__(self, other):
         if not isinstance(other, Settings):
             return NotImplemented
         return (self.mode, self.rotation, self.scale, self.min_margin,
-                self.divisible_by) == (
+                self.divisible_by, self.conv2d_attention_wrapping) == (
                     other.mode, other.rotation, other.scale,
-                    other.min_margin, other.divisible_by)
+                    other.min_margin, other.divisible_by,
+                    other.conv2d_attention_wrapping)
 
     def __hash__(self):
         return hash((self.mode, self.rotation, self.scale, self.min_margin,
-                     self.divisible_by))
+                     self.divisible_by, self.conv2d_attention_wrapping))
 
 
 class ResolvedSettings:
@@ -137,13 +142,15 @@ class ResolvedSettings:
         "work_patch_w", "work_patch_h",
         "hex_size_img", "hex_size_patch",
         "img_w", "img_h",
+        "conv2d_attention_wrapping",
     )
 
     def __init__(self, mode, rotation,
                  work_img_w, work_img_h, margin_img_w,
                  work_patch_w, work_patch_h,
                  hex_size_img, hex_size_patch,
-                 img_w, img_h):
+                 img_w, img_h,
+                 conv2d_attention_wrapping):
         self.mode = mode
         self.rotation = rotation
         self.work_img_w = work_img_w
@@ -155,6 +162,7 @@ class ResolvedSettings:
         self.hex_size_patch = hex_size_patch
         self.img_w = img_w
         self.img_h = img_h
+        self.conv2d_attention_wrapping = conv2d_attention_wrapping
 
     def __eq__(self, other):
         if not isinstance(other, ResolvedSettings):
@@ -163,19 +171,22 @@ class ResolvedSettings:
                 self.work_img_w, self.work_img_h, self.margin_img_w,
                 self.work_patch_w, self.work_patch_h,
                 self.hex_size_img, self.hex_size_patch,
-                self.img_w, self.img_h) == (
+                self.img_w, self.img_h,
+                self.conv2d_attention_wrapping) == (
                     other.mode, other.rotation,
                     other.work_img_w, other.work_img_h, other.margin_img_w,
                     other.work_patch_w, other.work_patch_h,
                     other.hex_size_img, other.hex_size_patch,
-                    other.img_w, other.img_h)
+                    other.img_w, other.img_h,
+                    other.conv2d_attention_wrapping)
 
     def __hash__(self):
         return hash((self.mode, self.rotation,
                      self.work_img_w, self.work_img_h, self.margin_img_w,
                      self.work_patch_w, self.work_patch_h,
                      self.hex_size_img, self.hex_size_patch,
-                     self.img_w, self.img_h))
+                     self.img_w, self.img_h,
+                     self.conv2d_attention_wrapping))
 
     def work_at(self, tensor_w, tensor_h):
         """Scale working area dimensions to tensor resolution."""

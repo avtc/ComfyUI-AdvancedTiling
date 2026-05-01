@@ -98,7 +98,7 @@ if HAS_RAYLIGHT:
 
                 diff_model = model.model.diffusion_model
                 patch_size = getattr(diff_model, 'patch_size', 1)
-                raw = Settings(mode, rotation, scale, min_margin, divisible_by)
+                raw = Settings(mode, rotation, scale, min_margin, divisible_by, conv2d_attention_wrapping=True)
                 resolved = raw._resolve_auto(False, vae_factor, patch_size, img_W, img_H)
                 patch_dit_model(model, resolved)
                 return resolved
