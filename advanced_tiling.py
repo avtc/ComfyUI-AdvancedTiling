@@ -436,8 +436,8 @@ class AdvancedTilingSettings:
                 "divisible_by": (
                     "INT",
                     {
-                        "default": 1, "min": 1, "max": 256, "step": 1,
-                        "tooltip": "Round working area down to multiples of this value. Affects wrapping and crop. 1 = no rounding.",
+                        "default": 1, "min": 0, "max": 256, "step": 1,
+                        "tooltip": "Round working area down to multiples of this value. Affects wrapping and crop. 1 = floor to integer. 0 = disabled.",
                     },
                 ),
                 "conv2d_attention_wrapping": (

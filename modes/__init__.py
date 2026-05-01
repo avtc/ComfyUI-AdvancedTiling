@@ -66,7 +66,7 @@ class Settings:
             margin_h = max(base_margin_h, min_margin_img)
             work_w = img_w - 2 * margin_w
             work_h = img_h - 2 * margin_h
-            if self.divisible_by > 1:
+            if self.divisible_by >= 1:
                 work_w = work_w // self.divisible_by * self.divisible_by
                 work_h = work_h // self.divisible_by * self.divisible_by
             margin_w = (img_w - work_w) / 2
@@ -82,7 +82,7 @@ class Settings:
             min_margin_img = min_margin * vae_factor
             margin = max(base_margin, min_margin_img)
             hex_size = min_dim / 2 - margin
-            if self.divisible_by > 1:
+            if self.divisible_by >= 1:
                 hex_height = 2 * hex_size
                 hex_height = hex_height // self.divisible_by * self.divisible_by
                 hex_size = hex_height / 2

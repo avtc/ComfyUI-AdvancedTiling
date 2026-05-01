@@ -63,6 +63,37 @@ def test_resolve_divisible_by():
     assert r.margin_img_w == 35.0
 
 
+def test_resolve_divisible_by_zero_rect():
+    """divisible_by=0 disables rounding — work area stays as-is (float)."""
+    r = _resolve(scale=0.98, min_margin=4, divisible_by=0)
+    # margin=32, work=960 — no rounding applied
+    assert r.work_img_w == 960.0
+    assert r.work_img_h == 960.0
+    assert r.margin_img_w == 32.0
+
+
+def test_resolve_divisible_by_zero_hex():
+    """divisible_by=0 disables rounding for hex — hex_size stays as-is (float)."""
+    r = _resolve(scale=0.8, min_margin=0, divisible_by=0, mode="Hexagon")
+    # base_margin = 512 * 0.2 = 102.4, hex_size = 409.6 — no rounding
+    assert r.hex_size_img == 409.6
+
+
+def test_resolve_divisible_by_one_floors_rect():
+    """divisible_by=1 floors work area to integer."""
+    r = _resolve(scale=0.98, min_margin=3, divisible_by=1)
+    # base_margin = 1024*0.02/2 = 10.24, min_margin_img = 24
+    # margin = 24, work = 1024 - 48 = 976 — already integer, stays 976
+    assert r.work_img_w == 976.0
+
+
+def test_resolve_divisible_by_one_floors_hex():
+    """divisible_by=1 floors hex height to integer."""
+    r = _resolve(scale=0.8, min_margin=0, divisible_by=1, mode="Hexagon")
+    # hex_size = 409.6, hex_height = 819.2 -> 819, hex_size = 409.5
+    assert r.hex_size_img == 409.5
+
+
 def test_resolve_patch_downscale():
     """Patch values are image values / (vae_factor * patch_size)."""
     r = _resolve(scale=0.98, min_margin=4, divisible_by=1)
@@ -79,10 +110,10 @@ def test_resolve_rectangular_image():
 
 
 def test_resolve_hex_mode():
-    """Hex mode computes hex_size from min(W,H)."""
-    r = _resolve(scale=0.8, min_margin=0, divisible_by=1, mode="Hexagon")
+    """Hex mode computes hex_size from min(W,H) with divisible_by=0 (no rounding)."""
+    r = _resolve(scale=0.8, min_margin=0, divisible_by=0, mode="Hexagon")
     # base_margin = 512 * 0.2 = 102.4, min_margin_img = 0
-    # margin = 102.4, hex_size = 512 - 102.4 = 409.6
+    # margin = 102.4, hex_size = 512 - 102.4 = 409.6 — no rounding
     assert r.hex_size_img == 409.6
     assert r.hex_size_patch == r.hex_size_img / (VAE_FACTOR * PATCH_SIZE)
 
