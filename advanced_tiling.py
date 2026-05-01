@@ -14,6 +14,27 @@ from torch.nn.modules.utils import _pair
 from .modes import MODE_NAMES, Settings, ResolvedSettings
 from .dit_tiling import patch_dit_model, _has_conv2d
 
+# Track patches applied to the shared model so they can be removed between runs.
+# ComfyUI's model.clone() shares the same underlying nn.Module, so hooks and
+# _conv_forward replacements persist across workflow executions.
+_attention_hook_handles: list = []
+_patched_conv2d_layers: dict[int, tuple] = {}
+
+
+def _cleanup_previous_patches():
+    """Remove all hooks and restore Conv2d layers from previous patch_model calls."""
+    global _attention_hook_handles, _patched_conv2d_layers
+
+    for handle in _attention_hook_handles:
+        handle.remove()
+    _attention_hook_handles.clear()
+
+    for mid, (layer, orig_forward, had_attr) in _patched_conv2d_layers.items():
+        layer._conv_forward = orig_forward
+        if had_attr:
+            del layer.tiling_resolved
+    _patched_conv2d_layers.clear()
+
 
 def _hex_remap_batch(centers_x, centers_y, size, wrap_w, wrap_h, rotation):
     """Vectorized hex coordinate remapping for all pixels at once.
@@ -285,7 +306,15 @@ def patch_model(model, resolved: ResolvedSettings):
     :param model: Model to patch
     :param resolved: Resolved tiling settings
     """
+    global _patched_conv2d_layers
+    _cleanup_previous_patches()
+
     for layer in [layer for layer in model.modules() if isinstance(layer, Conv2d)]:
+        mid = id(layer)
+        if mid not in _patched_conv2d_layers:
+            _patched_conv2d_layers[mid] = (
+                layer, layer._conv_forward, hasattr(layer, 'tiling_resolved'),
+            )
         # pylint: disable=protected-access, no-value-for-parameter
         layer._conv_forward = tiling_conv.__get__(layer, Conv2d)
         layer.tiling_resolved = resolved
@@ -329,7 +358,9 @@ def _register_tiling_hook(norm_module, resolved: ResolvedSettings, hook_id: int 
             print(f"[AdvancedTiling] Attention hook fired: shape={output.shape}, mapped={n_mapped}")
         return output
 
-    norm_module.register_forward_hook(_hook)
+    global _attention_hook_handles
+    handle = norm_module.register_forward_hook(_hook)
+    _attention_hook_handles.append(handle)
 
 
 def tiling_conv(self, input_tensor: Tensor, weight: Tensor, bias: Optional[Tensor]):
@@ -482,6 +513,7 @@ class AdvancedTiling:
         resolved = settings._resolve_auto(is_conv2d, vae_factor, patch_size, img_w, img_h)
 
         if resolved.mode == "None":
+            _cleanup_previous_patches()
             return (model_copy, resolved)
 
         if is_conv2d:
