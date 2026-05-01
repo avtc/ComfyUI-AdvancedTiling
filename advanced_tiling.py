@@ -25,8 +25,6 @@ def _cleanup_previous_patches():
     """Remove all hooks and restore Conv2d layers from previous patch_model calls."""
     global _attention_hook_handles, _patched_conv2d_layers
 
-    n_hooks = len(_attention_hook_handles)
-    n_conv2d = len(_patched_conv2d_layers)
     for handle in _attention_hook_handles:
         handle.remove()
     _attention_hook_handles.clear()
@@ -36,8 +34,6 @@ def _cleanup_previous_patches():
         if had_attr:
             del layer.tiling_resolved
     _patched_conv2d_layers.clear()
-    if n_hooks > 0 or n_conv2d > 0:
-        print(f"[AdvancedTiling] Cleanup: removed {n_hooks} hooks, restored {n_conv2d} Conv2d layers")
 
 
 def _hex_remap_batch(centers_x, centers_y, size, wrap_w, wrap_h, rotation):
@@ -316,7 +312,6 @@ def patch_model(model, resolved: ResolvedSettings):
     global _patched_conv2d_layers
 
     conv2d_layers = [layer for layer in model.modules() if isinstance(layer, Conv2d)]
-    n_already = sum(1 for l in conv2d_layers if id(l) in _patched_conv2d_layers)
     for layer in conv2d_layers:
         mid = id(layer)
         if mid not in _patched_conv2d_layers:
@@ -326,9 +321,6 @@ def patch_model(model, resolved: ResolvedSettings):
         # pylint: disable=protected-access, no-value-for-parameter
         layer._conv_forward = tiling_conv.__get__(layer, Conv2d)
         layer.tiling_resolved = resolved
-
-    print(f"[AdvancedTiling] patch_model: {len(conv2d_layers)} Conv2d layers ({n_already} already tracked), "
-          f"attention_wrapping={resolved.conv2d_attention_wrapping}")
 
     if resolved.conv2d_attention_wrapping:
         _patch_attention_wrapping(model, resolved)
@@ -349,12 +341,11 @@ def _patch_attention_wrapping(model, resolved: ResolvedSettings):
         norm = getattr(module, "norm", None)
         if norm is None:
             continue
-        _register_tiling_hook(norm, resolved, count)
+        _register_tiling_hook(norm, resolved)
         count += 1
-    print(f"[AdvancedTiling] Registered attention wrapping hooks on {count} SpatialTransformer norm modules")
 
 
-def _register_tiling_hook(norm_module, resolved: ResolvedSettings, hook_id: int = 0):
+def _register_tiling_hook(norm_module, resolved: ResolvedSettings):
     """Forward hook that applies tiling wrapping to a norm module's output."""
 
     def _hook(_module, _input, output):
@@ -365,8 +356,6 @@ def _register_tiling_hook(norm_module, resolved: ResolvedSettings, hook_id: int 
         n_mapped = len(mapping[0])
         if n_mapped > 0:
             output[:, :, mapping[1], mapping[0]] = output[:, :, mapping[3], mapping[2]]
-        if hook_id == 0:
-            print(f"[AdvancedTiling] Attention hook fired: shape={output.shape}, mapped={n_mapped}")
         return output
 
     global _attention_hook_handles
@@ -509,8 +498,6 @@ class AdvancedTiling:
         Does the actual patching of the model
         """
 
-        print(f"[AdvancedTiling] run() called: mode={settings.mode}, conv2d_attn_wrap={settings.conv2d_attention_wrapping}")
-
         model_copy = model.clone()
 
         diff_model = model_copy.model.diffusion_model
@@ -596,7 +583,6 @@ class AdvancedTilingVAEDecode:
 
         # Use settings as-is — they were resolved by AdvancedTiling.run()
         # to match the generation model's working area.
-        print(f"[AdvancedTiling] VAE decode: patching {len(conv_layers)} VAE Conv2d layers")
         patch_model(vae.first_stage_model, resolved_settings)
 
         try:
