@@ -48,16 +48,16 @@ if HAS_RAYLIGHT:
         FUNCTION = "run"
         CATEGORY = "conditioning"
 
-        def run(self, settings_list, ray_actors_list, vae_list, latent_list):
-            settings = settings_list[0]
-            ray_actors = ray_actors_list[0]
-            vae = vae_list[0]
+        def run(self, settings, ray_actors, vae, latent):
+            settings = settings[0]
+            ray_actors = ray_actors[0]
+            vae = vae[0]
             vae_factor = vae.spacial_compression_decode()
 
             if settings.mode == "None":
                 resolved_list = []
-                for latent in latent_list:
-                    _, _, H_lat, W_lat = latent["samples"].shape
+                for lat in latent:
+                    _, _, H_lat, W_lat = lat["samples"].shape
                     img_w = W_lat * vae_factor
                     img_h = H_lat * vae_factor
                     resolved = settings._resolve_auto(False, vae_factor, 2, img_w, img_h)
@@ -105,7 +105,7 @@ if HAS_RAYLIGHT:
 
             # Build per-worker args: each worker gets its latent's img dimensions
             worker_args = []
-            for latent in latent_list:
+            for lat in latent:
                 _, _, H_lat, W_lat = latent["samples"].shape
                 worker_args.append((W_lat * vae_factor, H_lat * vae_factor))
 
