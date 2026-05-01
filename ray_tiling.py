@@ -95,6 +95,15 @@ if HAS_RAYLIGHT:
 
                 from ComfyUI_AdvancedTiling.dit_tiling import patch_dit_model
                 from ComfyUI_AdvancedTiling.modes import Settings
+                import torch
+
+                # Clear previous tiling patches so their cached GPU tensors
+                # (synthetic PE, boundary indices) are freed before we allocate
+                # new ones for potentially different latent dimensions.
+                model.set_model_attn1_patch(None)
+                model.set_model_unet_function_wrapper(None)
+                model.set_model_double_block_patch(None)
+                torch.cuda.empty_cache()
 
                 diff_model = model.model.diffusion_model
                 patch_size = getattr(diff_model, 'patch_size', 1)
