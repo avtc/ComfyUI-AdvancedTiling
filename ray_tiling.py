@@ -110,7 +110,7 @@ if HAS_RAYLIGHT:
                 worker_args.append((W_lat * vae_factor, H_lat * vae_factor))
 
             futures = [
-                actor.model_function_runner.remote(
+                actor.model_function_runner_get_values.remote(
                     _patch, vae_factor, settings.mode, settings.rotation,
                     settings.scale, settings.min_margin, settings.divisible_by,
                     img_W, img_H,
