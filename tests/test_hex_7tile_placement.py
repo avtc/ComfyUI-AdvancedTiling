@@ -39,7 +39,7 @@ _spec.loader.exec_module(_pkg)
 
 import numpy as np
 from ComfyUI_AdvancedTiling.modes import Settings
-from ComfyUI_AdvancedTiling.modes.hex import get_inverse_matrix, get_matrix
+from ComfyUI_AdvancedTiling.modes.hex import get_inverse_matrix, get_matrix, _cube_round_vectorized
 import ComfyUI_AdvancedTiling.advanced_tiling as at_mod
 
 VAE_FACTOR = 8
@@ -51,22 +51,6 @@ def _resolve(scale, div_by):
     s = Settings("Hexagon", 0.0, scale=scale, min_margin=0,
                  divisible_by=div_by, conv2d_attention_wrapping=False)
     return s._resolve_auto(True, VAE_FACTOR, 1, IMG_W, IMG_H)
-
-
-def _cube_round_grid(q, r):
-    """Vectorized cube_round on (q, r) grids. Returns (rq, rr) int grids."""
-    s = -q - r
-    rq = np.floor(q + 0.5)
-    rr = np.floor(r + 0.5)
-    rs = np.floor(s + 0.5)
-    q_diff = np.abs(rq - q)
-    r_diff = np.abs(rr - r)
-    s_diff = np.abs(rs - s)
-    mask_q = (q_diff > r_diff) & (q_diff > s_diff)
-    mask_r = ~mask_q & (r_diff > s_diff)
-    rq = np.where(mask_q, -rr - rs, rq)
-    rr = np.where(mask_r, -rq - rs, rr)
-    return rq, rr
 
 
 def _hex_coords_grid(hex_size, rotation):
@@ -90,7 +74,7 @@ def run_checks(scale, div_by):
     t_resolve = time.perf_counter()
 
     q, r = _hex_coords_grid(hex_size, resolved.rotation)
-    rq, rr = _cube_round_grid(q, r)
+    rq, rr = _cube_round_vectorized(q, r)
     central = (rq == 0) & (rr == 0)
     t_grid = time.perf_counter()
 
@@ -111,7 +95,7 @@ def run_checks(scale, div_by):
     r_flat = r.ravel()
     shifted_q = q_flat[np.newaxis, :] - HEX_NEIGHBORS[:, 0, np.newaxis]  # (6, N)
     shifted_r = r_flat[np.newaxis, :] - HEX_NEIGHBORS[:, 1, np.newaxis]  # (6, N)
-    srq, srr = _cube_round_grid(shifted_q, shifted_r)  # (6, N) each
+    srq, srr = _cube_round_vectorized(shifted_q, shifted_r)  # (6, N) each
     for i in range(6):
         neighbor = (srq[i].reshape(IMG_H, IMG_W) == 0) & (srr[i].reshape(IMG_H, IMG_W) == 0)
         overlap = int((central & neighbor).sum())
@@ -154,7 +138,7 @@ def run_checks(scale, div_by):
     all_qr = (inv_mat @ all_pts) / hex_size       # (2, 4*N)
     aq = all_qr[0].reshape(4, IMG_H, IMG_W)
     ar = all_qr[1].reshape(4, IMG_H, IMG_W)
-    a_rq, a_rr = _cube_round_grid(aq, ar)
+    a_rq, a_rr = _cube_round_vectorized(aq, ar)
     a_dq = aq - a_rq
     a_dr = ar - a_rr
     # Reshape to (4, H, W) for comparison with dq/dr (H, W)
