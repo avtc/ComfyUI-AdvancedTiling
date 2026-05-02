@@ -72,6 +72,34 @@ def _normalize_latent(latent: torch.Tensor) -> tuple[torch.Tensor, tuple[int, ..
     return x, original_shape
 
 
+def _paste_with_offset(dst, src, mask, direction, hex_radius, is_latent=True):
+    """
+    Paste src into dst at mask positions with hex-neighbor coordinate offset.
+
+    Maps output (y,x) to src coordinates by subtracting the inter-hex offset
+    for the given direction. This ensures correct spatial alignment between
+    the center tile and neighbor tiles.
+
+    :param dst: Destination tensor (modified in-place)
+    :param src: Source tensor (same batch/chan layout as dst)
+    :param mask: Boolean mask (H, W) of pixels to paste
+    :param direction: Neighbor direction ("E", "NE", etc.)
+    :param hex_radius: Hex circumradius in pixels
+    :param is_latent: True for (B,C,H,W), False for (B,H,W,C)
+    """
+    H, W = mask.shape
+    ox, oy = _neighbor_offset_px(direction, hex_radius)
+    ox_i, oy_i = round(ox), round(oy)
+    ys = torch.arange(H, dtype=torch.long)
+    xs = torch.arange(W, dtype=torch.long)
+    src_ys = (ys - oy_i).clamp(0, H - 1)
+    src_xs = (xs - ox_i).clamp(0, W - 1)
+    if is_latent:
+        dst[:, :, mask] = src[:, :, src_ys[mask], src_xs[mask]]
+    else:
+        dst[0][mask] = src[0, src_ys[mask], src_xs[mask]]
+
+
 @functools.cache
 def _build_neighbor_map(
     width: int, height: int, rotation: float
@@ -117,6 +145,8 @@ def composite_latents(
     Composite center and neighbor latents into a single latent.
 
     Places neighbor content in the waste region around the center hex.
+    Uses coordinate offsets to map output positions to neighbor latent
+    positions (each neighbor hex is centered at a different position).
 
     :param center_latent: Center tile latent
     :param neighbor_latents: Dict mapping direction name ("E", "NE", etc.)
@@ -140,6 +170,7 @@ def composite_latents(
 
     n = len(NEIGHBOR_DIRECTIONS)
     direction_to_idx = {name: idx for idx, name in enumerate(NEIGHBOR_DIRECTIONS)}
+    hex_radius = min(W, H) // 2
 
     total_pasted = 0
     for direction_name, neighbor_latent in neighbor_latents.items():
@@ -153,7 +184,7 @@ def composite_latents(
             continue
 
         neighbor_4d, _ = _normalize_latent(neighbor_latent)
-        result[:, :, mask] = neighbor_4d[:, :, mask]
+        _paste_with_offset(result, neighbor_4d, mask, direction_name, hex_radius, is_latent=True)
         total_pasted += count
         logger.info(f"  {direction_name}: pasted {count} pixels")
 
@@ -474,30 +505,41 @@ class AdvancedTilingHexInpaint:
         waste_mask_img = create_waste_mask(W_img, H_img, settings)  # (1, H_img, W_img)
 
         # 5b. Priority-ordered neighbor paste at shared edges.
-        # Paste neighbor latent where the neighbor's hex mask overlaps with
-        # the center hex. Higher-priority neighbors paste last (overwrite).
+        # Paste higher-priority neighbor latent (lower priority number) where
+        # the neighbor's hex mask overlaps with the center hex. Only neighbors
+        # in masked_directions (higher priority than center) are pasted.
+        # Lower-priority neighbors are NOT pasted — center content at their
+        # overlap is preserved since those directions are not masked.
+        # Coordinate offset maps output positions to neighbor latent positions
+        # (same approach as CornerEdges _composite_priority_ordered).
         if neighbor_latents and masked_directions:
             center_hex = hex_masks_lat[0]
-            # Sort neighbors by priority: lowest priority (highest number) first
+            # Sort neighbors by priority: lowest priority (highest number) first,
+            # highest priority (lowest number) last so it overwrites at overlaps.
             paste_list = []
             for direction_name, neighbor_latent in neighbor_latents.items():
                 dir_idx = NEIGHBOR_DIRECTIONS.index(direction_name)
                 target_idx = (dir_idx - rotation_steps) % n
+                # Only paste neighbors that have higher priority than center
+                if target_idx not in masked_directions:
+                    continue
                 n_pri = tile_priorities_list[target_idx + 1]
                 paste_list.append((
                     n_pri if n_pri is not None else float('inf'),
-                    target_idx, neighbor_latent,
+                    target_idx, direction_name, neighbor_latent,
                 ))
             paste_list.sort(key=lambda x: -x[0])
 
             total_pasted = 0
-            for _, target_idx, neighbor_latent in paste_list:
+            for _, target_idx, direction_name, neighbor_latent in paste_list:
                 neighbor_hex = hex_masks_lat[target_idx + 1]
                 overlap = center_hex & neighbor_hex
-                if overlap.any():
-                    neighbor_4d, _ = _normalize_latent(neighbor_latent)
-                    composited_4d[:, :, overlap] = neighbor_4d[:, :, overlap]
-                    total_pasted += overlap.sum().item()
+                if not overlap.any():
+                    continue
+                neighbor_4d, _ = _normalize_latent(neighbor_latent)
+                _paste_with_offset(composited_4d, neighbor_4d, overlap,
+                                   direction_name, hex_radius_lat, is_latent=True)
+                total_pasted += overlap.sum().item()
             if total_pasted:
                 logger.info(f"[HexInpaint] Priority paste: {total_pasted} edge pixels")
 
@@ -565,14 +607,14 @@ class AdvancedTilingHexInpaint:
         for direction_name, neighbor_img in neighbor_images.items():
             dir_idx = dir_idx_map[direction_name]
             target_idx = (dir_idx - rotation_steps) % n
-            # Waste area (outside hex)
             waste_region = (neighbor_map_img == target_idx)
             if waste_region.any():
-                overlap_image[0][waste_region] = neighbor_img[0][waste_region]
-            # Border mask area (inside hex, near edge)
-            border_region = full_neighbor_masks[target_idx] > 0  # (H, W) bool
+                _paste_with_offset(overlap_image, neighbor_img, waste_region,
+                                   direction_name, hex_radius_img, is_latent=False)
+            border_region = full_neighbor_masks[target_idx] > 0
             if border_region.any():
-                overlap_image[0][border_region] = neighbor_img[0][border_region]
+                _paste_with_offset(overlap_image, neighbor_img, border_region,
+                                   direction_name, hex_radius_img, is_latent=False)
 
         # output 9: composited preview (tiles arrangement as passed to latent)
         if enable_preview:
@@ -582,7 +624,8 @@ class AdvancedTilingHexInpaint:
                 target_idx = (dir_idx - rotation_steps) % n
                 waste_region = (neighbor_map_img == target_idx)
                 if waste_region.any():
-                    preview_image[0][waste_region] = neighbor_img[0][waste_region]
+                    _paste_with_offset(preview_image, neighbor_img, waste_region,
+                                       direction_name, hex_radius_img, is_latent=False)
             outputs.append(preview_image)
         else:
             outputs.append(torch.zeros(1, 1, 1, 3, dtype=torch.float32))
@@ -618,7 +661,8 @@ class AdvancedTilingHexInpaint:
             target_idx = (dir_idx - rotation_steps) % n
             waste_region = (neighbor_map_img == target_idx)
             if waste_region.any():
-                paintbrush_img[0][waste_region] = neighbor_img[0][waste_region]
+                _paste_with_offset(paintbrush_img, neighbor_img, waste_region,
+                                   direction_name, hex_radius_img, is_latent=False)
 
         t_pb = time.time()
         paintbrush_latent = vae.encode(paintbrush_img)

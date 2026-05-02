@@ -418,7 +418,11 @@ def create_central_tile_masks(
         ox, oy = _neighbor_offset_px(d, hex_radius)
         hex_masks.append(_build_hex_mask_at(width, height, cx + ox, cy + oy, hex_radius))
 
-    # Build tile_map: priority-ordered, highest priority (lowest number) first
+    # Build tile_map: non-overlapping pixel ownership.
+    # Priority: lower number = higher priority (e.g., 0=highest, 10=lowest).
+    # Highest-priority tile processed first so it claims all overlap pixels.
+    # Lower-priority tiles only get unclaimed pixels.
+    # Result: overlap at shared edges is owned by the higher-priority tile.
     tile_map = torch.full((height, width), -1, dtype=torch.long)
     tile_order = list(range(7))
     if tile_priorities:
