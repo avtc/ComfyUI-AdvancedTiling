@@ -60,7 +60,7 @@ def get_corner_offsets(corner: str, hex_radius: float):
     """
     unit_offsets = _CORNER_OFFSETS[corner]
     return tuple(
-        (round(ux * hex_radius), round(uy * hex_radius))
+        (int(math.floor(ux * hex_radius + 0.5)), int(math.floor(uy * hex_radius + 0.5)))
         for ux, uy in unit_offsets
     )
 
@@ -92,7 +92,7 @@ def _build_offset_hex_mask(
     angles = torch.atan2(dy, dx) % (2 * math.pi)
 
     # Nearest edge-midpoint direction (0, 60, 120, 180, 240, 300 degrees)
-    sector_angles = (torch.round(angles / (math.pi / 3)) * (math.pi / 3)) % (2 * math.pi)
+    sector_angles = (torch.floor(angles / (math.pi / 3) + 0.5) * (math.pi / 3)) % (2 * math.pi)
     local_angles = (angles - sector_angles + math.pi) % (2 * math.pi) - math.pi
 
     cos_local = torch.clamp(torch.cos(local_angles), min=1e-6)
@@ -148,6 +148,108 @@ def build_corner_tile_map(
     return tile_map
 
 
+def compute_corner_edge_buffer(
+    width: int,
+    height: int,
+    corner: str,
+    hex_radius: int,
+    border_width: float,
+    tile_priorities: list,
+) -> tuple[list[tuple[torch.Tensor, int]], list[torch.Tensor]]:
+    """
+    Compute edge buffer masks for corner composition.
+
+    For each edge where tiles have different priorities, finds the outermost
+    border ring pixels of the lower-priority tile. Returns entries suitable
+    for paste_edge_buffer: (buffer_mask, higher_priority_tile_idx) pairs.
+
+    Also returns hex_masks for same-coord paste.
+
+    :return: (entries, hex_masks) where entries = [(buf_mask, tile_idx), ...]
+    """
+    import torch.nn.functional as F
+    from .modes.hex_mask import (
+        _build_hex_mask_at, _erode_mask, _compute_sector_map_at,
+        _manhattan_distance_to_region,
+    )
+
+    unit_offsets = _CORNER_OFFSETS[corner]
+    float_offsets = [(ux * hex_radius, uy * hex_radius) for ux, uy in unit_offsets]
+    erosion = max(1, int(border_width * hex_radius))
+    pad = erosion + 1
+
+    hex_masks = []
+    eroded_masks = []
+    sector_maps = []
+
+    for ox, oy in float_offsets:
+        cx = width / 2.0 + ox
+        cy = height / 2.0 + oy
+        hm = _build_hex_mask_at(width, height, cx, cy, hex_radius)
+        hex_masks.append(hm)
+
+        padded = F.pad(hm.float().unsqueeze(0).unsqueeze(0), [pad] * 4, mode='constant', value=1.0)
+        eroded = _erode_mask(padded.squeeze().bool(), erosion)
+        eroded_masks.append(eroded[pad:-pad, pad:-pad] if pad > 0 else eroded)
+
+        sector_maps.append(_compute_sector_map_at(width, height, cx, cy))
+
+    edges = _CORNER_EDGE_SECTORS[corner]
+    entries = []
+
+    for tile_a, sec_a, tile_b, sec_b in edges:
+        pri_a = tile_priorities[tile_a] if tile_priorities else None
+        pri_b = tile_priorities[tile_b] if tile_priorities else None
+
+        if pri_a is None or pri_b is None or pri_a == pri_b:
+            continue
+
+        if pri_a > pri_b:
+            lower_tile, lower_sec, higher_tile = tile_a, sec_a, tile_b
+        else:
+            lower_tile, lower_sec, higher_tile = tile_b, sec_b, tile_a
+
+        border = hex_masks[lower_tile] & ~eroded_masks[lower_tile]
+        dist = torch.from_numpy(_manhattan_distance_to_region(~hex_masks[lower_tile]))
+        buf = border & (sector_maps[lower_tile] == lower_sec) & (dist <= 1)
+        if buf.any():
+            entries.append((buf, higher_tile))
+
+    return entries, hex_masks
+
+
+def paste_corner_same_coord(
+    tiles_4d: list[torch.Tensor],
+    hex_masks: list[torch.Tensor],
+    tile_priorities: list,
+) -> torch.Tensor:
+    """
+    Composite tiles using same-coord paste in priority order.
+
+    Lowest priority (highest number) pasted first; highest priority
+    (lowest number) pasted last, overwriting at overlapping edges.
+    Same-coord paste reads from the same (y,x) position in each tile's
+    image, which always reads from inside the hex boundary.
+
+    :param tiles_4d: List of 3 tensors (B,C,H,W)
+    :param hex_masks: List of 3 boolean masks (H,W) per tile
+    :param tile_priorities: List of 3 priorities (lower = higher priority)
+    :return: Composited tensor
+    """
+    result = tiles_4d[0].clone()
+
+    order = list(range(3))
+    if tile_priorities and all(p is not None for p in tile_priorities):
+        order.sort(key=lambda i: -tile_priorities[i])
+
+    for tile_idx in order:
+        mask = hex_masks[tile_idx]
+        if mask.any():
+            result[:, :, mask] = tiles_4d[tile_idx][:, :, mask]
+
+    return result
+
+
 def _composite_priority_ordered(
     tiles, corner, hex_radius_px, tile_priorities=None, is_latent=True,
 ):
@@ -168,7 +270,6 @@ def _composite_priority_ordered(
     """
     unit_offsets = _CORNER_OFFSETS[corner]
     float_offsets = [(ux * hex_radius_px, uy * hex_radius_px) for ux, uy in unit_offsets]
-    int_offsets = get_corner_offsets(corner, hex_radius_px)
 
     if is_latent:
         B, C, H, W = tiles[0].shape
@@ -195,13 +296,13 @@ def _composite_priority_ordered(
     result = torch.zeros_like(tiles[0])
 
     for tile_idx in order:
-        ox, oy = int_offsets[tile_idx]
+        ox, oy = float_offsets[tile_idx]
         src = tiles[tile_idx]
         mask = hex_masks[tile_idx]
         if not mask.any():
             continue
-        src_ys = (ys - oy).clamp(0, H - 1)
-        src_xs = (xs - ox).clamp(0, W - 1)
+        src_ys = torch.floor(ys.float() - oy + 0.5).long().clamp(0, H - 1)
+        src_xs = torch.floor(xs.float() - ox + 0.5).long().clamp(0, W - 1)
         if is_latent:
             result[:, :, mask] = src[:, :, src_ys[mask], src_xs[mask]]
         else:
@@ -215,47 +316,15 @@ def _composite_priority_ordered(
             tile_unc = uncovered & (tile_map_fb == tile_idx)
             if not tile_unc.any():
                 continue
-            ox, oy = int_offsets[tile_idx]
+            ox, oy = float_offsets[tile_idx]
             src = tiles[tile_idx]
-            src_ys = (ys - oy).clamp(0, H - 1)
-            src_xs = (xs - ox).clamp(0, W - 1)
+            src_ys = torch.floor(ys.float() - oy + 0.5).long().clamp(0, H - 1)
+            src_xs = torch.floor(xs.float() - ox + 0.5).long().clamp(0, W - 1)
             if is_latent:
                 result[:, :, tile_unc] = src[:, :, src_ys[tile_unc], src_xs[tile_unc]]
             else:
                 result[0, tile_unc] = src[0, src_ys[tile_unc], src_xs[tile_unc]]
 
-    return result
-
-
-def composite_corner_latents(
-    center_latent: torch.Tensor,
-    neighbor1_latent: torch.Tensor,
-    neighbor2_latent: torch.Tensor,
-    corner: str,
-    hex_radius_px: float,
-    tile_priorities: list | None = None,
-) -> torch.Tensor:
-    """
-    Composite 3 tile latents into a corner view with shared vertex at center.
-
-    Pastes in priority order so higher-priority tiles overwrite at overlapping
-    edges, eliminating the need for a separate edge buffer.
-
-    :param tile_priorities: List of 3 priorities (lower = higher priority), or None
-    """
-    from .hex_inpaint import _normalize_latent
-
-    center_4d, center_orig = _normalize_latent(center_latent)
-    n1_4d, _ = _normalize_latent(neighbor1_latent)
-    n2_4d, _ = _normalize_latent(neighbor2_latent)
-
-    result = _composite_priority_ordered(
-        [center_4d, n1_4d, n2_4d], corner, hex_radius_px,
-        tile_priorities=tile_priorities, is_latent=True,
-    )
-
-    if len(center_orig) > 4:
-        result = result.reshape(center_orig)
     return result
 
 

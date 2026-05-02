@@ -130,7 +130,7 @@ def visualize():
     # Build noise_mask using tile_map
     # For each masked direction: mask pixels in border ring that tile_map assigns to center
     # (because neighbor has higher priority, center pixels at the border need regeneration)
-    feather = max(0, round(0.3 * erosion))
+    feather = max(0, int(math.floor(0.3 * erosion + 0.5)))
     noise_mask = torch.zeros(H, W, dtype=torch.float32)
 
     if feather > 0:

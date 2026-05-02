@@ -136,7 +136,7 @@ def _erode_mask(mask: torch.Tensor, pixels: int) -> torch.Tensor:
     if pixels <= 0:
         return mask.clone()
 
-    e_sq = max(1, round(pixels / math.sqrt(2)))
+    e_sq = max(1, int(math.floor(pixels / math.sqrt(2) + 0.5)))
     return _square_erode(mask, e_sq) & _diamond_erode(mask, pixels)
 
 
@@ -541,7 +541,7 @@ def _build_hex_mask_at(
     dist = torch.sqrt(dx * dx + dy * dy)
     angles = torch.atan2(dy, dx) % (2 * math.pi)
 
-    sector_angles = (torch.round(angles / (math.pi / 3)) * (math.pi / 3)) % (2 * math.pi)
+    sector_angles = (torch.floor(angles / (math.pi / 3) + 0.5) * (math.pi / 3)) % (2 * math.pi)
     local_angles = (angles - sector_angles + math.pi) % (2 * math.pi) - math.pi
 
     cos_local = torch.clamp(torch.cos(local_angles), min=1e-6)
@@ -617,7 +617,7 @@ def create_corner_masks(
     erosion_pixels = max(1, int(border_width * hex_radius))
 
     if mask_extent == "half_edge":
-        extent_pixels = round(hex_radius / 2)
+        extent_pixels = int(math.floor(hex_radius / 2 + 0.5))
     else:
         extent_pixels = hex_radius
 

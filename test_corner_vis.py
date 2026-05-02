@@ -26,7 +26,7 @@ sys.modules["ComfyUI_AdvancedTiling"] = _pkg
 
 from corner_composite import (
     CORNER_NAMES, _CORNER_OFFSETS, _build_offset_hex_mask,
-    build_corner_tile_map, get_corner_offsets,
+    build_corner_tile_map,
 )
 from modes.hex_mask import create_corner_masks
 
@@ -56,7 +56,6 @@ def visualize_corner():
     # Build hex masks
     unit_offsets = _CORNER_OFFSETS[corner]
     float_offsets = [(ux * hex_radius, uy * hex_radius) for ux, uy in unit_offsets]
-    int_offsets = get_corner_offsets(corner, hex_radius)
 
     hex_masks = []
     for ox, oy in float_offsets:
@@ -78,7 +77,7 @@ def visualize_corner():
         tile_map[uncovered] = fb_map[uncovered]
 
     # Generate corner mask (noise_mask: 1=regenerate, 0=preserve)
-    feather = max(0, round(0.3 * max(1, int(border_width * hex_radius))))
+    feather = max(0, int(math.floor(0.3 * max(1, int(border_width * hex_radius)) + 0.5)))
     noise_mask = create_corner_masks(
         W, H, corner, border_width, feather, mask_extent="half_edge",
         tile_priorities=tile_priorities,

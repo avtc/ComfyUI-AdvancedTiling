@@ -140,7 +140,7 @@ class AdvancedTilingHexGridPreview:
 
     def run(self, center_image, hex_scale, rotation, gap, **kwargs):
         B, tile_h, tile_w, C = center_image.shape
-        hex_size = max(1, round(min(tile_w, tile_h) // 2 * hex_scale))
+        hex_size = max(1, int(math.floor(min(tile_w, tile_h) // 2 * hex_scale + 0.5)))
         dim = 2 * hex_size
 
         # Build inside mask using hex_tiling_vectorized (same as hex_remap_batch)

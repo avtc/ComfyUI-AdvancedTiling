@@ -27,7 +27,7 @@ sys.modules["ComfyUI_AdvancedTiling"] = _pkg
 
 from corner_composite import (
     composite_corner_preview,
-    _build_offset_hex_mask, get_corner_offsets,
+    _build_offset_hex_mask, _CORNER_OFFSETS,
     _composite_priority_ordered,
 )
 from modes.hex_mask import (
@@ -66,9 +66,8 @@ def test_corner_latent_offset_NE():
     )
 
     # Build hex masks to find overlap regions
-    offsets = get_corner_offsets(corner, R)
-    float_offsets = [(ux * R, uy * R) for ux, uy in
-                     [(-0.866025404, 0.5), (0.866025404, 0.5), (0.0, -1.0)]]
+    unit_offsets = _CORNER_OFFSETS[corner]
+    float_offsets = [(ux * R, uy * R) for ux, uy in unit_offsets]
     hex_masks = [_build_offset_hex_mask(W, H, ox, oy, R) for ox, oy in float_offsets]
 
     # E neighbor hex (tile 1) should have its LEFT edge at the center of output
@@ -81,8 +80,9 @@ def test_corner_latent_offset_NE():
         sy, sx = ys[mid].item(), xs[mid].item()
         actual = result[0, 0, sy, sx].item()
         # With correct offset: output (sy,sx) maps to E neighbor latent at (sy - oy, sx - ox)
-        ox_i, oy_i = offsets[1]  # E neighbor offset
-        expected_src_x = max(0, min(W - 1, sx - ox_i))
+        ox, oy = float_offsets[1]  # E neighbor float offset
+        expected_src_x = int(math.floor(sx - ox + 0.5))
+        expected_src_x = max(0, min(W - 1, expected_src_x))
         # The E neighbor's gradient value at expected_src_x should be expected_src_x
         ok = abs(actual - expected_src_x) < 2.0
         assert ok, (
@@ -106,11 +106,8 @@ def test_corner_latent_offset_all_corners():
             [center_lat, n1_lat, n2_lat], corner, R, is_latent=True,
         )
 
-        offsets = get_corner_offsets(corner, R)
-        float_offsets = [(ux * R, uy * R) for ux, uy in
-                         [(offsets[0][0] / R, offsets[0][1] / R),
-                          (offsets[1][0] / R, offsets[1][1] / R),
-                          (offsets[2][0] / R, offsets[2][1] / R)]]
+        unit_offsets = _CORNER_OFFSETS[corner]
+        float_offsets = [(ux * R, uy * R) for ux, uy in unit_offsets]
         hex_masks = [_build_offset_hex_mask(W, H, ox, oy, R)
                      for ox, oy in float_offsets]
 
@@ -122,8 +119,9 @@ def test_corner_latent_offset_all_corners():
             mid = len(ys) // 2
             sy, sx = ys[mid].item(), xs_idx[mid].item()
             actual = result[0, 0, sy, sx].item()
-            ox_i, oy_i = offsets[tile_idx]
-            expected_src_x = max(0, min(W - 1, sx - ox_i))
+            ox, oy = float_offsets[tile_idx]
+            expected_src_x = int(math.floor(sx - ox + 0.5))
+            expected_src_x = max(0, min(W - 1, expected_src_x))
             ok = abs(actual - expected_src_x) < 2.0
             assert ok, (
                 f"{corner} tile{tile_idx}: pixel ({sy},{sx}) "
@@ -144,9 +142,8 @@ def test_corner_image_offset():
 
     result = composite_corner_preview(center_img, n1_img, n2_img, corner)
 
-    offsets = get_corner_offsets(corner, R)
-    float_offsets = [(ux * R, uy * R) for ux, uy in
-                     [(-0.866025404, 0.5), (0.866025404, 0.5), (0.0, -1.0)]]
+    unit_offsets = _CORNER_OFFSETS[corner]
+    float_offsets = [(ux * R, uy * R) for ux, uy in unit_offsets]
     hex_masks = [_build_offset_hex_mask(W, H, ox, oy, R) for ox, oy in float_offsets]
 
     for tile_idx in [1, 2]:
@@ -157,8 +154,9 @@ def test_corner_image_offset():
         mid = len(ys) // 2
         sy, sx = ys[mid].item(), xs_idx[mid].item()
         actual = result[0, sy, sx, 0].item()  # first channel = x gradient
-        ox_i, oy_i = offsets[tile_idx]
-        expected_src_x = max(0, min(W - 1, sx - ox_i))
+        ox, oy = float_offsets[tile_idx]
+        expected_src_x = int(math.floor(sx - ox + 0.5))
+        expected_src_x = max(0, min(W - 1, expected_src_x))
         ok = abs(actual - expected_src_x) < 2.0
         assert ok, (
             f"NE corner image tile{tile_idx}: pixel ({sy},{sx}) "
@@ -200,7 +198,7 @@ def test_central_latent_overlap_offset():
         e_ys, e_xs = torch.where(e_overlap)
         mid = len(e_ys) // 2
         sy, sx = e_ys[mid].item(), e_xs[mid].item()
-        ox_i, oy_i = round(ox_e), round(oy_e)
+        ox_i, oy_i = int(math.floor(ox_e + 0.5)), int(math.floor(oy_e + 0.5))
         src_y = max(0, min(H - 1, sy - oy_i))
         src_x = max(0, min(W - 1, sx - ox_i))
         expected = e_lat[0, 0, src_y, src_x].item()

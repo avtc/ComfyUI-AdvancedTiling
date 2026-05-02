@@ -9,6 +9,7 @@ Uses hex geometry directly (not through settings tiling mode) so that:
 
 import time
 import logging
+import math
 import functools
 
 import torch
@@ -25,10 +26,11 @@ from .modes.hex_mask import (
 from .corner_composite import (
     CORNER_NAMES,
     CORNER_NEIGHBORS,
+    _CORNER_OFFSETS,
     build_corner_tile_map,
-    composite_corner_latents,
     composite_corner_preview,
-    get_corner_offsets,
+    compute_corner_edge_buffer,
+    paste_corner_same_coord,
 )
 from .tile_priority import match_terrain_priority
 
@@ -72,6 +74,43 @@ def _normalize_latent(latent: torch.Tensor) -> tuple[torch.Tensor, tuple[int, ..
     return x, original_shape
 
 
+def paste_edge_buffer(
+    composited: torch.Tensor,
+    border_mask: torch.Tensor,
+    entries: list[tuple[torch.Tensor, torch.Tensor]],
+) -> torch.Tensor:
+    """
+    Paste neighbor content at edge buffer pixels (same-coord) and exclude from mask.
+
+    For each (buffer_mask, neighbor_4d) pair, hard-pastes neighbor latent at the
+    buffer pixels using same-coord (no offset), then zeros those pixels in the
+    border mask so they are preserved during inpainting.
+
+    Shared by CentralTile and CornerEdge modes.
+
+    :param composited: 4D latent tensor (B,C,H,W), modified in-place
+    :param border_mask: Float mask tensor (1,H,W) for inpainting
+    :param entries: List of (buffer_mask (H,W) bool, neighbor_4d (B,C,H,W))
+    :return: Updated border_mask with buffer pixels zeroed
+    """
+    all_buffer = torch.zeros(composited.shape[2], composited.shape[3], dtype=torch.bool)
+    total = 0
+    for buf_mask, neighbor_4d in entries:
+        if buf_mask.any():
+            composited[:, :, buf_mask] = neighbor_4d[:, :, buf_mask]
+            all_buffer |= buf_mask
+            total += buf_mask.sum().item()
+    if all_buffer.any():
+        border_mask = torch.where(
+            all_buffer.unsqueeze(0),
+            torch.zeros_like(border_mask),
+            border_mask,
+        )
+    if total:
+        logger.info(f"[HexInpaint] Edge buffer: {total} pixels")
+    return border_mask
+
+
 def _paste_with_offset(dst, src, mask, direction, hex_radius, is_latent=True):
     """
     Paste src into dst at mask positions with hex-neighbor coordinate offset.
@@ -89,10 +128,9 @@ def _paste_with_offset(dst, src, mask, direction, hex_radius, is_latent=True):
     """
     H, W = mask.shape
     ox, oy = _neighbor_offset_px(direction, hex_radius)
-    ox_i, oy_i = round(ox), round(oy)
     ys, xs = torch.where(mask)
-    src_ys = (ys - oy_i).clamp(0, H - 1)
-    src_xs = (xs - ox_i).clamp(0, W - 1)
+    src_ys = torch.floor(ys.float() - oy + 0.5).long().clamp(0, H - 1)
+    src_xs = torch.floor(xs.float() - ox + 0.5).long().clamp(0, W - 1)
     if is_latent:
         dst[:, :, ys, xs] = src[:, :, src_ys, src_xs]
     else:
@@ -476,7 +514,7 @@ class AdvancedTilingHexInpaint:
 
         hex_radius_lat = min(W_lat, H_lat) // 2
         erosion_lat = max(1, int(border_width * hex_radius_lat))
-        feather_lat = max(0, round(feather_radius * erosion_lat))
+        feather_lat = max(0, int(math.floor(feather_radius * erosion_lat + 0.5)))
 
         _, border_mask_lat, neighbor_masks_lat = create_feathered_masks(
             W_lat, H_lat, settings, border_width, feather_lat, feather_sides,
@@ -498,7 +536,7 @@ class AdvancedTilingHexInpaint:
                 masked_directions,
             )
             direction_to_idx = {name: idx for idx, name in enumerate(NEIGHBOR_DIRECTIONS)}
-            total_buffer = 0
+            entries = []
             for direction_name, neighbor_latent in neighbor_latents.items():
                 dir_idx = direction_to_idx[direction_name]
                 target_idx = (dir_idx - rotation_steps) % n
@@ -507,17 +545,11 @@ class AdvancedTilingHexInpaint:
                 buf_mask = buffer_dir_masks[target_idx]
                 if buf_mask.any():
                     neighbor_4d, _ = _normalize_latent(neighbor_latent)
-                    composited_4d[:, :, buf_mask] = neighbor_4d[:, :, buf_mask]
-                    total_buffer += buf_mask.sum().item()
-            # Exclude edge buffer from inpaint mask
-            buffer_combined = buffer_dir_masks.any(dim=0)
-            border_mask_lat = torch.where(
-                buffer_combined.unsqueeze(0),
-                torch.zeros_like(border_mask_lat),
-                border_mask_lat,
-            )
-            if total_buffer:
-                logger.info(f"[HexInpaint] Edge buffer: pixels={total_buffer}")
+                    entries.append((buf_mask, neighbor_4d))
+            if entries:
+                border_mask_lat = paste_edge_buffer(
+                    composited_4d, border_mask_lat, entries,
+                )
 
         t4 = time.time()
         logger.info(f"[HexInpaint] Latent masks ({W_lat}x{H_lat}): {t4-t3:.3f}s, "
@@ -544,7 +576,7 @@ class AdvancedTilingHexInpaint:
         t5 = time.time()
         hex_radius_img = min(W_img, H_img) // 2
         erosion_img = max(1, int(border_width * hex_radius_img))
-        feather_img = max(0, round(feather_radius * erosion_img))
+        feather_img = max(0, int(math.floor(feather_radius * erosion_img + 0.5)))
 
         _, full_border_mask, full_neighbor_masks = create_feathered_masks(
             W_img, H_img, settings, border_width, feather_img, feather_sides, active_directions
@@ -708,25 +740,46 @@ class AdvancedTilingHexInpaint:
             logger.info(f"[CornerEdges] Priorities: center={tile_priorities[0]}, "
                          f"{n1_dir}={tile_priorities[1]}, {n2_dir}={tile_priorities[2]}")
 
-        # 2. Composite corner latents in priority order.
-        # Lowest priority pasted first, highest priority pasted last —
-        # higher-priority tile overwrites at overlapping hex edges.
-        # This eliminates the need for a separate edge buffer.
+        # 2. Composite corner latents using same-coord paste + edge buffer.
+        # Same-coord paste reads from the same (y,x) in each tile's image,
+        # which always reads from inside the hex boundary (unlike offset paste
+        # which can read from the waste area at shared edges).
+        # Edge buffer excludes outermost border ring pixels from the inpaint
+        # mask so they are preserved with correct neighbor content.
         composited_4d, _ = _normalize_latent(center_latent)
+        n1_4d, _ = _normalize_latent(n1_latent)
+        n2_4d, _ = _normalize_latent(n2_latent)
         _, _, H_lat, W_lat = composited_4d.shape
         hex_radius_lat = min(W_lat, H_lat) // 2
 
-        composited = composite_corner_latents(
-            center_latent, n1_latent, n2_latent, corner_select, hex_radius_lat,
-            tile_priorities=tile_priorities,
+        # Compute hex masks and edge buffer for corner
+        buf_entries, hex_masks_lat = compute_corner_edge_buffer(
+            W_lat, H_lat, corner_select, hex_radius_lat, border_width,
+            tile_priorities,
+        )
+
+        # Same-coord paste: fill output with tile content at same coordinates
+        composited_4d = paste_corner_same_coord(
+            [composited_4d, n1_4d, n2_4d], hex_masks_lat, tile_priorities,
         )
 
         # 3. Generate corner mask at latent resolution
-        feather_lat = max(0, round(feather_radius * max(1, int(border_width * hex_radius_lat))))
+        feather_lat = max(0, int(math.floor(feather_radius * max(1, int(border_width * hex_radius_lat)) + 0.5)))
         border_mask_lat = create_corner_masks(
             W_lat, H_lat, corner_select, border_width, feather_lat, mask_extent,
             tile_priorities,
         )
+
+        # 3b. Edge buffer: exclude outermost border ring from mask
+        if buf_entries:
+            tiles_4d = [composited_4d, n1_4d, n2_4d]
+            paste_entries = [
+                (buf_mask, tiles_4d[tile_idx])
+                for buf_mask, tile_idx in buf_entries
+            ]
+            border_mask_lat = paste_edge_buffer(
+                composited_4d, border_mask_lat, paste_entries,
+            )
 
         # Remap mask strength
         if mask_strength_min > 0.0 or mask_strength_max < 1.0:
@@ -739,12 +792,12 @@ class AdvancedTilingHexInpaint:
 
         # 4. Build latent dict
         noise_mask = border_mask_lat.unsqueeze(0)
-        latent_dict = {"samples": composited, "noise_mask": noise_mask}
+        latent_dict = {"samples": composited_4d, "noise_mask": noise_mask}
 
         # 5. Generate mask at image resolution (for debug output)
         H_img, W_img = center_image.shape[1], center_image.shape[2]
         hex_radius_img = min(W_img, H_img) // 2
-        feather_img = max(0, round(feather_radius * max(1, int(border_width * hex_radius_img))))
+        feather_img = max(0, int(math.floor(feather_radius * max(1, int(border_width * hex_radius_img)) + 0.5)))
         border_mask_img = create_corner_masks(
             W_img, H_img, corner_select, border_width, feather_img, mask_extent,
             tile_priorities,
@@ -767,8 +820,9 @@ class AdvancedTilingHexInpaint:
         if border_any.dim() == 3:
             border_any = border_any[0]
         if border_any.any():
-            offsets = get_corner_offsets(corner_select, hex_radius_img)
-            _, n1_off, n2_off = offsets
+            unit_offs = _CORNER_OFFSETS[corner_select]
+            float_offs = [(ux * hex_radius_img, uy * hex_radius_img) for ux, uy in unit_offs]
+            _, n1_off, n2_off = float_offs
 
             ys, xs = torch.meshgrid(
                 torch.arange(H_img, dtype=torch.long),
@@ -785,14 +839,14 @@ class AdvancedTilingHexInpaint:
 
             if use_n1.any():
                 ox, oy = n1_off
-                src_ys = (ys[use_n1] - oy).clamp(0, H_img - 1)
-                src_xs = (xs[use_n1] - ox).clamp(0, W_img - 1)
+                src_ys = torch.floor(ys[use_n1].float() - oy + 0.5).long().clamp(0, H_img - 1)
+                src_xs = torch.floor(xs[use_n1].float() - ox + 0.5).long().clamp(0, W_img - 1)
                 corner_overlap[0][use_n1] = n1_image[0, src_ys, src_xs]
 
             if use_n2.any():
                 ox, oy = n2_off
-                src_ys = (ys[use_n2] - oy).clamp(0, H_img - 1)
-                src_xs = (xs[use_n2] - ox).clamp(0, W_img - 1)
+                src_ys = torch.floor(ys[use_n2].float() - oy + 0.5).long().clamp(0, H_img - 1)
+                src_xs = torch.floor(xs[use_n2].float() - ox + 0.5).long().clamp(0, W_img - 1)
                 corner_overlap[0][use_n2] = n2_image[0, src_ys, src_xs]
 
         # 7. Assemble outputs (same count as CentralTile for compatibility)

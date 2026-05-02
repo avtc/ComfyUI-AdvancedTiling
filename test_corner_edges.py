@@ -21,7 +21,7 @@ sys.modules["ComfyUI_AdvancedTiling"] = _pkg
 from corner_composite import (
     CORNER_NAMES,
     CORNER_NEIGHBORS,
-    get_corner_offsets,
+    _CORNER_OFFSETS,
     build_corner_tile_map,
     composite_corner_preview,
     _build_offset_hex_mask,
@@ -93,11 +93,11 @@ def test_corner_offsets_symmetry():
     """All corners should have symmetric offsets (same magnitude, rotated)."""
     R = 256
     for corner in CORNER_NAMES:
-        offsets = get_corner_offsets(corner, R)
-        for ox, oy in offsets:
-            dist = math.sqrt(ox * ox + oy * oy)
+        unit_offsets = _CORNER_OFFSETS[corner]
+        for ux, uy in unit_offsets:
+            dist = math.sqrt((ux * R) ** 2 + (uy * R) ** 2)
             assert abs(dist - R) < 2.0, (
-                f"{corner}: offset ({ox},{oy}) distance {dist:.1f} != R={R}"
+                f"{corner}: offset ({ux},{uy}) distance {dist:.1f} != R={R}"
             )
     print("PASS: test_corner_offsets_symmetry")
 
