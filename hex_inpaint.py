@@ -596,7 +596,7 @@ class AdvancedTilingHexInpaint:
             outputs.append(full_neighbor_masks[i])
 
         # Build neighbor map (shared by preview and overlap)
-        neighbor_map_img = _build_neighbor_map(W_img, H_img, settings)
+        neighbor_map_img = _build_neighbor_map(W_img, H_img, settings.rotation)
         dir_idx_map = {name: idx for idx, name in enumerate(NEIGHBOR_DIRECTIONS)}
 
         # Overlap image: center + neighbor content in waste area AND border mask.
