@@ -16,7 +16,7 @@ import torch
 from .modes import Settings
 from .modes.hex_mask import (
     NEIGHBOR_DIRECTIONS,
-    create_central_tile_masks,
+    compute_edge_buffer_mask,
     create_corner_masks,
     create_feathered_masks,
     create_waste_mask,
@@ -468,11 +468,7 @@ class AdvancedTilingHexInpaint:
             if not masked_directions:
                 logger.info("[HexInpaint] No directions to mask (center has highest priority)")
 
-        # 5. Generate masks at latent resolution using hex-mask approach.
-        # Same as CornerEdges: build hex masks for center + neighbors at offset
-        # positions, create tile_map for non-overlapping ownership, mask only
-        # lower-priority tile's border pixels. Overlap pixels at shared edges
-        # are assigned to the higher-priority tile and excluded from the mask.
+        # 5. Generate masks at latent resolution.
         t3 = time.time()
         composited_4d, _ = _normalize_latent(composited)
         _, _, H_lat, W_lat = composited_4d.shape
@@ -482,65 +478,46 @@ class AdvancedTilingHexInpaint:
         erosion_lat = max(1, int(border_width * hex_radius_lat))
         feather_lat = max(0, round(feather_radius * erosion_lat))
 
-        # Build tile priorities list: [center_pri, E_pri, NE_pri, NW_pri, W_pri, SW_pri, SE_pri]
-        tile_priorities_list = [center_pri]
-        for direction in NEIGHBOR_DIRECTIONS:
-            if direction in neighbor_images and priorities is not None:
-                tile_priorities_list.append(
-                    match_terrain_priority(neighbor_images[direction], priorities)
-                )
-            else:
-                tile_priorities_list.append(None)
-
-        border_mask_lat, neighbor_masks_lat, hex_masks_lat, tile_map_lat = (
-            create_central_tile_masks(
-                W_lat, H_lat, hex_radius_lat, border_width, feather_lat,
-                active_directions, masked_directions, tile_priorities_list,
-            )
+        _, border_mask_lat, neighbor_masks_lat = create_feathered_masks(
+            W_lat, H_lat, settings, border_width, feather_lat, feather_sides,
+            masked_directions,
         )
 
         # Waste-area mask at latent resolution for InpaintVAEDecode
         waste_mask_lat = create_waste_mask(W_lat, H_lat, settings)  # (1, H_lat, W_lat)
         waste_mask_img = create_waste_mask(W_img, H_img, settings)  # (1, H_img, W_img)
 
-        # 5b. Priority-ordered neighbor paste at shared edges.
-        # Paste higher-priority neighbor latent (lower priority number) where
-        # the neighbor's hex mask overlaps with the center hex. Only neighbors
-        # in masked_directions (higher priority than center) are pasted.
-        # Lower-priority neighbors are NOT pasted — center content at their
-        # overlap is preserved since those directions are not masked.
-        # Coordinate offset maps output positions to neighbor latent positions
-        # (same approach as CornerEdges _composite_priority_ordered).
+        # 5b. Edge buffer: paste neighbor latent into the outermost pixels of
+        # the border ring per direction, then exclude those pixels from the
+        # inpaint mask. This seeds the diffusion boundary with correct adjacent
+        # content so VAE decode doesn't bleed inpainted changes into edges.
+        # Uses edge_buffer_depth=0 (boundary only) matching the proven approach.
         if neighbor_latents and masked_directions:
-            center_hex = hex_masks_lat[0]
-            # Sort neighbors by priority: lowest priority (highest number) first,
-            # highest priority (lowest number) last so it overwrites at overlaps.
-            paste_list = []
+            buffer_dir_masks = compute_edge_buffer_mask(
+                W_lat, H_lat, settings.rotation, border_width, 0,
+                masked_directions,
+            )
+            direction_to_idx = {name: idx for idx, name in enumerate(NEIGHBOR_DIRECTIONS)}
+            total_buffer = 0
             for direction_name, neighbor_latent in neighbor_latents.items():
-                dir_idx = NEIGHBOR_DIRECTIONS.index(direction_name)
+                dir_idx = direction_to_idx[direction_name]
                 target_idx = (dir_idx - rotation_steps) % n
-                # Only paste neighbors that have higher priority than center
                 if target_idx not in masked_directions:
                     continue
-                n_pri = tile_priorities_list[target_idx + 1]
-                paste_list.append((
-                    n_pri if n_pri is not None else float('inf'),
-                    target_idx, direction_name, neighbor_latent,
-                ))
-            paste_list.sort(key=lambda x: -x[0])
-
-            total_pasted = 0
-            for _, target_idx, direction_name, neighbor_latent in paste_list:
-                neighbor_hex = hex_masks_lat[target_idx + 1]
-                overlap = center_hex & neighbor_hex
-                if not overlap.any():
-                    continue
-                neighbor_4d, _ = _normalize_latent(neighbor_latent)
-                _paste_with_offset(composited_4d, neighbor_4d, overlap,
-                                   direction_name, hex_radius_lat, is_latent=True)
-                total_pasted += overlap.sum().item()
-            if total_pasted:
-                logger.info(f"[HexInpaint] Priority paste: {total_pasted} edge pixels")
+                buf_mask = buffer_dir_masks[target_idx]
+                if buf_mask.any():
+                    neighbor_4d, _ = _normalize_latent(neighbor_latent)
+                    composited_4d[:, :, buf_mask] = neighbor_4d[:, :, buf_mask]
+                    total_buffer += buf_mask.sum().item()
+            # Exclude edge buffer from inpaint mask
+            buffer_combined = buffer_dir_masks.any(dim=0)
+            border_mask_lat = torch.where(
+                buffer_combined.unsqueeze(0),
+                torch.zeros_like(border_mask_lat),
+                border_mask_lat,
+            )
+            if total_buffer:
+                logger.info(f"[HexInpaint] Edge buffer: pixels={total_buffer}")
 
         t4 = time.time()
         logger.info(f"[HexInpaint] Latent masks ({W_lat}x{H_lat}): {t4-t3:.3f}s, "

@@ -378,6 +378,43 @@ def _neighbor_offset_px(direction: str, hex_radius: float) -> tuple[float, float
             hex_radius * (3.0 / 2 * r))
 
 
+def compute_edge_buffer_mask(
+    width: int,
+    height: int,
+    rotation: float,
+    border_width: float,
+    edge_buffer_depth: int,
+    active_directions: set[int],
+) -> torch.Tensor:
+    """
+    Compute per-direction boolean masks for the latent edge buffer zone.
+
+    Identifies the outermost N pixels of the border ring per active direction.
+    These pixels are hard-pasted with neighbor latent content and excluded from
+    the inpaint mask, seeding the diffusion boundary with correct adjacent content.
+
+    :param edge_buffer_depth: 0 = boundary only, N = N pixels deeper
+    :param active_directions: Direction indices (0-5) that have a neighbour
+    :return: Boolean tensor (6, H, W) per direction. True = buffer pixel.
+    """
+    inside = _build_inside_mask(width, height, rotation)
+    hex_radius = min(width, height) // 2
+    erosion = max(1, int(border_width * hex_radius))
+    eroded = _erode_mask(inside, erosion)
+    border = inside & ~eroded
+
+    sectors = _compute_sector_map(width, height)
+    dist_to_boundary = _manhattan_distance_to_region(~inside)
+    threshold = edge_buffer_depth + 1
+
+    buffer_masks = torch.zeros((6, height, width), dtype=torch.bool)
+    for d in active_directions:
+        sector_border = border & (sectors == d)
+        buffer_masks[d] = sector_border & (torch.from_numpy(dist_to_boundary) <= threshold)
+
+    return buffer_masks
+
+
 def create_central_tile_masks(
     width: int,
     height: int,
