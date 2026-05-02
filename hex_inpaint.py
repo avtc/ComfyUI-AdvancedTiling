@@ -90,14 +90,13 @@ def _paste_with_offset(dst, src, mask, direction, hex_radius, is_latent=True):
     H, W = mask.shape
     ox, oy = _neighbor_offset_px(direction, hex_radius)
     ox_i, oy_i = round(ox), round(oy)
-    ys = torch.arange(H, dtype=torch.long)
-    xs = torch.arange(W, dtype=torch.long)
+    ys, xs = torch.where(mask)
     src_ys = (ys - oy_i).clamp(0, H - 1)
     src_xs = (xs - ox_i).clamp(0, W - 1)
     if is_latent:
-        dst[:, :, mask] = src[:, :, src_ys[mask], src_xs[mask]]
+        dst[:, :, ys, xs] = src[:, :, src_ys, src_xs]
     else:
-        dst[0][mask] = src[0, src_ys[mask], src_xs[mask]]
+        dst[0, ys, xs] = src[0, src_ys, src_xs]
 
 
 @functools.cache
