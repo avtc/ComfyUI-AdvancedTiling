@@ -76,8 +76,8 @@ def _compute_hex_grid(
     py = hex_size * (mc * frac_q + md * frac_r)
 
     # Map to tile image coordinates (center hex mask at tile center)
-    tile_x = np.rint(px).astype(np.int64) + tile_w // 2
-    tile_y = np.rint(py).astype(np.int64) + tile_h // 2
+    tile_x = np.floor(px + 0.5).astype(np.int64) + tile_w // 2
+    tile_y = np.floor(py + 0.5).astype(np.int64) + tile_h // 2
 
     return cell_q, cell_r, tile_x, tile_y
 
