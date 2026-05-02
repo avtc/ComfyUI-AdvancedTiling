@@ -74,7 +74,7 @@ def _normalize_latent(latent: torch.Tensor) -> tuple[torch.Tensor, tuple[int, ..
 
 @functools.cache
 def _build_neighbor_map(
-    width: int, height: int, settings: Settings
+    width: int, height: int, rotation: float
 ) -> torch.Tensor:
     """
     Build a map from pixel position to neighbor direction index.
@@ -90,7 +90,8 @@ def _build_neighbor_map(
     from .modes.hex import hex_tiling_vectorized
     from .modes.hex_mask import _compute_sector_map
 
-    mapped_x, mapped_y = hex_tiling_vectorized(width, height, settings)
+    hex_size = min(width, height) // 2
+    mapped_x, mapped_y = hex_tiling_vectorized(width, height, rotation, hex_size)
 
     mapped_x_t = torch.from_numpy(mapped_x)
     mapped_y_t = torch.from_numpy(mapped_y)
@@ -129,7 +130,7 @@ def composite_latents(
     B, C, H, W = result.shape
 
     t1 = time.time()
-    neighbor_map = _build_neighbor_map(W, H, settings)
+    neighbor_map = _build_neighbor_map(W, H, settings.rotation)
     t2 = time.time()
 
     total_waste = (neighbor_map >= 0).sum().item()

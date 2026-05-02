@@ -18,7 +18,7 @@ NEIGHBOR_DIRECTIONS = ["E", "NE", "NW", "W", "SW", "SE"]
 
 
 @functools.cache
-def _build_inside_mask(width: int, height: int, settings: Settings) -> torch.Tensor:
+def _build_inside_mask(width: int, height: int, rotation: float) -> torch.Tensor:
     """
     Build binary mask of pixels inside the hex.
 
@@ -29,7 +29,8 @@ def _build_inside_mask(width: int, height: int, settings: Settings) -> torch.Ten
     """
     from .hex import hex_tiling_vectorized
 
-    mapped_x, mapped_y = hex_tiling_vectorized(width, height, settings)
+    hex_size = min(width, height) // 2
+    mapped_x, mapped_y = hex_tiling_vectorized(width, height, rotation, hex_size)
 
     xs = np.arange(width, dtype=np.int64)[np.newaxis, :]
     ys = np.arange(height, dtype=np.int64)[:, np.newaxis]
@@ -50,7 +51,7 @@ def create_waste_mask(width: int, height: int, settings: Settings) -> torch.Tens
     :param settings: Tiling settings providing hex geometry.
     :return: Float tensor of shape (1, H, W) with values 0.0 (inside) or 1.0 (waste).
     """
-    inside = _build_inside_mask(width, height, settings)  # (H, W) bool
+    inside = _build_inside_mask(width, height, settings.rotation)  # (H, W) bool
     waste = (~inside).float().unsqueeze(0)  # (1, H, W)
     return waste
 
@@ -188,7 +189,7 @@ def create_border_mask(
     :param inside_mask: Pre-computed inside mask (H, W) bool, computed if not provided
     :return: Float tensor of shape (1, height, width) with values 0-1
     """
-    inside = inside_mask if inside_mask is not None else _build_inside_mask(width, height, settings)
+    inside = inside_mask if inside_mask is not None else _build_inside_mask(width, height, settings.rotation)
     hex_radius = min(width, height) // 2
     erosion_pixels = max(1, int(border_width * hex_radius))
 
@@ -215,7 +216,7 @@ def create_neighbor_masks(
     :param inside_mask: Pre-computed inside mask (H, W) bool, computed if not provided
     :return: Float tensor of shape (6, height, width)
     """
-    inside = inside_mask if inside_mask is not None else _build_inside_mask(width, height, settings)
+    inside = inside_mask if inside_mask is not None else _build_inside_mask(width, height, settings.rotation)
     hex_radius = min(width, height) // 2
     erosion_pixels = max(1, int(border_width * hex_radius))
 
@@ -241,7 +242,7 @@ def create_masks(
 
     :return: (inside_mask (H,W) bool, border_mask (1,H,W) float, neighbor_masks (6,H,W) float)
     """
-    inside = _build_inside_mask(width, height, settings)
+    inside = _build_inside_mask(width, height, settings.rotation)
     hex_radius = min(width, height) // 2
     erosion_pixels = max(1, int(border_width * hex_radius))
 
@@ -287,7 +288,7 @@ def create_feathered_masks(
     :return: (inside_mask (H,W) bool, border_mask (1,H,W) float,
               neighbor_masks (6,H,W) float)
     """
-    inside = _build_inside_mask(width, height, settings)
+    inside = _build_inside_mask(width, height, settings.rotation)
     hex_radius = min(width, height) // 2
     erosion_pixels = max(1, int(border_width * hex_radius))
     eroded = _erode_mask(inside, erosion_pixels)

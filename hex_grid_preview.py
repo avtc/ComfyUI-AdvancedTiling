@@ -10,7 +10,6 @@ import logging
 import torch
 import numpy as np
 
-from .modes import Settings
 from .modes.hex_mask import NEIGHBOR_DIRECTIONS
 
 logger = logging.getLogger("ComfyUI-AdvancedTiling")
@@ -28,7 +27,7 @@ NEIGHBOR_OFFSETS = {
 
 def _compute_hex_grid(
     canvas_w: int, canvas_h: int, hex_size: int,
-    tile_w: int, tile_h: int, settings: Settings,
+    tile_w: int, tile_h: int, rotation: float,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Compute hex cell membership for each canvas pixel.
@@ -42,8 +41,8 @@ def _compute_hex_grid(
     """
     from .modes.hex import get_matrix, get_inverse_matrix
 
-    matrix = get_matrix(settings)
-    inv_matrix = get_inverse_matrix(settings)
+    matrix = get_matrix(rotation)
+    inv_matrix = get_inverse_matrix(rotation)
 
     ma, mb = float(matrix[0, 0]), float(matrix[0, 1])
     mc, md = float(matrix[1, 0]), float(matrix[1, 1])
@@ -154,15 +153,13 @@ class AdvancedTilingHexGridPreview:
     CATEGORY = "image"
 
     def run(self, center_image, hex_scale, rotation, gap, **kwargs):
-        settings = Settings("Hexagon", rotation, hex_scale)
-
         B, tile_h, tile_w, C = center_image.shape
         hex_size = max(1, round(min(tile_w, tile_h) // 2 * hex_scale))
         dim = 2 * hex_size
 
         # Build inside mask using hex_tiling_vectorized (same as hex_inpaint)
         from .modes.hex import hex_tiling_vectorized
-        mapped_x, mapped_y = hex_tiling_vectorized(dim, dim, settings)
+        mapped_x, mapped_y = hex_tiling_vectorized(dim, dim, rotation, float(hex_size))
         mxs = np.arange(dim, dtype=np.int64)[np.newaxis, :]
         mys = np.arange(dim, dtype=np.int64)[:, np.newaxis]
         inside_mask = (mapped_x == mxs) & (mapped_y == mys)  # (dim, dim) bool
@@ -179,7 +176,7 @@ class AdvancedTilingHexGridPreview:
 
         # Compute hex cell membership for each canvas pixel
         cell_q, cell_r, tile_x, tile_y = _compute_hex_grid(
-            canvas_w, canvas_h, hex_size, tile_w, tile_h, settings,
+            canvas_w, canvas_h, hex_size, tile_w, tile_h, rotation,
         )
 
         # Determine inside status for each canvas pixel using the same mask

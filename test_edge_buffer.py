@@ -24,7 +24,7 @@ from modes import Settings
 
 
 def _make_settings(tile_size=512):
-    return Settings("Hexagon", 0, 1.0)
+    return Settings("Hexagon", 0, 1.0, -1, 1, False)
 
 
 def test_buffer_depth_0_is_subset_of_border():

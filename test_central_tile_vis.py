@@ -25,7 +25,6 @@ from modes.hex_mask import (
     NEIGHBOR_DIRECTIONS, _build_hex_mask_at, _compute_sector_map_at,
     _erode_mask, _manhattan_distance_to_region, _compute_sector_map,
 )
-from modes import Settings
 import torch.nn.functional as F
 import numpy as np
 
@@ -54,7 +53,6 @@ def _neighbor_pixel_offset(q, r, hex_radius):
 def visualize():
     W, H = 166, 166
     border_width = 0.15
-    settings = Settings(mode="Hexagon", rotation=0, scale=1.0)
     hex_radius = min(W, H) // 2  # 83
     cx, cy = W / 2.0, H / 2.0
 
