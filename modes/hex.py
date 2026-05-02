@@ -166,6 +166,25 @@ def cube_round_offsets(q: float, r: float):
     return q - rq, r - rr
 
 
+def _cube_round_vectorized(q, r):
+    """Vectorized cube-round using floor(x+0.5) half-up rounding.
+
+    Returns (rq, rr) — the rounded integer coordinates.
+    """
+    s = -q - r
+    rq = np.floor(q + 0.5)
+    rr = np.floor(r + 0.5)
+    rs = np.floor(s + 0.5)
+    q_diff = np.abs(rq - q)
+    r_diff = np.abs(rr - r)
+    s_diff = np.abs(rs - s)
+    mask_q = (q_diff > r_diff) & (q_diff > s_diff)
+    mask_r = ~mask_q & (r_diff > s_diff)
+    rq = np.where(mask_q, -rr - rs, rq)
+    rr = np.where(mask_r, -rq - rs, rr)
+    return rq, rr
+
+
 @functools.cache
 def hex_tiling(
     x: int,
@@ -238,11 +257,10 @@ def hex_tiling_vectorized(
     rotation: float,
     hex_size: float,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Vectorized hexagonal tiling for all pixels at once.
+    """Vectorized hexagonal tiling for all pixels at once.
 
-    Uses explicit element-wise operations (not matmul) to match the scalar
-    floating point path exactly, avoiding rounding differences at hex boundaries.
+    Convenience wrapper around hex_remap_batch for full-grid usage.
+    Produces results identical to the scalar hex_tiling() per-pixel function.
 
     :param width: Grid width
     :param height: Grid height
@@ -250,58 +268,86 @@ def hex_tiling_vectorized(
     :param hex_size: Hex radius at this resolution
     :return: (mapped_x, mapped_y) as int64 arrays of shape (height, width)
     """
-    inv_matrix = get_inverse_matrix(rotation)
-    matrix = get_matrix(rotation)
-
-    ia, ib = float(inv_matrix[0, 0]), float(inv_matrix[0, 1])
-    ic, id_ = float(inv_matrix[1, 0]), float(inv_matrix[1, 1])
-    ma, mb = float(matrix[0, 0]), float(matrix[0, 1])
-    mc, md = float(matrix[1, 0]), float(matrix[1, 1])
-
-    ys, xs = np.meshgrid(
-        np.arange(height, dtype=np.float64),
-        np.arange(width, dtype=np.float64),
-        indexing='ij',
-    )
-    xs -= width // 2
-    ys -= height // 2
-
-    q = (ia * xs + ib * ys) / hex_size
-    r = (ic * xs + id_ * ys) / hex_size
-
-    s = -q - r
-    rq = np.rint(q)
-    rr = np.rint(r)
-    rs = np.rint(s)
-
-    q_diff = np.abs(rq - q)
-    r_diff = np.abs(rr - r)
-    s_diff = np.abs(rs - s)
-
-    cond_q = (q_diff > r_diff) & (q_diff > s_diff)
-    cond_r = ~cond_q & (r_diff > s_diff)
-
-    rq = np.where(cond_q, -rr - rs, rq)
-    rr = np.where(cond_r, -rq - rs, rr)
-
-    frac_q = q - rq
-    frac_r = r - rr
-
-    px = hex_size * (ma * frac_q + mb * frac_r)
-    py = hex_size * (mc * frac_q + md * frac_r)
-
-    new_x = (np.rint(px).astype(np.int64) + width // 2) % width
-    new_y = (np.rint(py).astype(np.int64) + height // 2) % height
-
+    cx = np.arange(width, dtype=np.float64) - width // 2
+    cy = np.arange(height, dtype=np.float64) - height // 2
+    grid_x, grid_y = np.meshgrid(cx, cy, indexing='xy')
+    new_x, new_y = hex_remap_batch(grid_x, grid_y, hex_size, width, height, rotation)
     return new_x, new_y
+
+
+def hex_remap_batch(
+    centers_x, centers_y, size, wrap_w, wrap_h, rotation,
+):
+    """Vectorized hex coordinate remapping with 4-neighbor search.
+
+    Uses 4-neighbor search to find the integer source pixel whose hex offset
+    best matches the destination's hex offset, eliminating rounding mismatches
+    that occur when the hex-to-pixel round-trip lands on a suboptimal integer.
+
+    :param centers_x: X coordinates centered at grid origin (any shape, raveled)
+    :param centers_y: Y coordinates centered at grid origin (any shape, raveled)
+    :param size: Hex radius at this resolution
+    :param wrap_w: Width for modulo wrapping
+    :param wrap_h: Height for modulo wrapping
+    :param rotation: Rotation angle in degrees
+    :return: (new_x, new_y) as int64 arrays, same shape as input
+    """
+    orig_shape = np.asarray(centers_x).shape
+    flat_x = np.asarray(centers_x).ravel().astype(np.float64)
+    flat_y = np.asarray(centers_y).ravel().astype(np.float64)
+
+    inv_mat = get_inverse_matrix(rotation)
+    mat = get_matrix(rotation)
+
+    # pixel_to_hex (batch): inverse matrix multiply + divide by size
+    pts = np.stack([flat_x, flat_y], axis=0)
+    qr = (inv_mat @ pts) / size
+    q, r = qr[0], qr[1]
+
+    # cube_round — floor(x+0.5) for consistent half-up rounding
+    rq, rr = _cube_round_vectorized(q, r)
+
+    # Target hex offsets (desired relative position within hex cell)
+    target_dq = q - rq
+    target_dr = r - rr
+
+    # Continuous pixel position of the target offset
+    pixel = size * (mat @ np.stack([target_dq, target_dr], axis=0))
+    base_x = np.floor(pixel[0]).astype(np.int64)
+    base_y = np.floor(pixel[1]).astype(np.int64)
+
+    # 4-neighbor search: pick the integer pixel whose hex offset
+    # is closest to the target offset (Chebyshev distance in hex space).
+    best_x = np.empty_like(base_x)
+    best_y = np.empty_like(base_y)
+    best_err = np.full(len(q), np.inf)
+
+    for dx in (0, 1):
+        for dy in (0, 1):
+            cx = (base_x + dx).astype(np.float64)
+            cy = (base_y + dy).astype(np.float64)
+            c_pts = np.stack([cx, cy], axis=0)
+            c_qr = (inv_mat @ c_pts) / size
+            cq, cr = c_qr[0], c_qr[1]
+            crq, crr = _cube_round_vectorized(cq, cr)
+            cand_dq = cq - crq
+            cand_dr = cr - crr
+            err = np.maximum(np.abs(cand_dq - target_dq), np.abs(cand_dr - target_dr))
+            better = err < best_err
+            best_x = np.where(better, base_x + dx, best_x)
+            best_y = np.where(better, base_y + dy, best_y)
+            best_err = np.where(better, err, best_err)
+
+    new_x = (best_x + wrap_w // 2) % wrap_w
+    new_y = (best_y + wrap_h // 2) % wrap_h
+    return new_x.reshape(orig_shape), new_y.reshape(orig_shape)
 
 
 def hex_distance_grid(padded_size, hex_size, rotation):
     """Compute max-norm distance from nearest hex center for every pixel.
 
-    Uses the same numpy vectorized cube_round as _hex_remap_batch
-    (np.floor-based), ensuring bit-identical results with the Conv2d
-    wrapping path.
+    Uses the same cube_round as hex_remap_batch (np.floor-based),
+    ensuring bit-identical results with the Conv2d wrapping path.
 
     :param padded_size: (width, height) of the tensor
     :param hex_size: Hex radius at this resolution
@@ -320,15 +366,8 @@ def hex_distance_grid(padded_size, hex_size, rotation):
     hq, hr = qr[0], qr[1]
     hs = -hq - hr
 
-    _half_up = np.floor
-    rq, rr, rs = _half_up(hq + 0.5), _half_up(hr + 0.5), _half_up(hs + 0.5)
-    q_diff = np.abs(rq - hq)
-    r_diff = np.abs(rr - hr)
-    s_diff = np.abs(rs - hs)
-    mask_q = (q_diff > r_diff) & (q_diff > s_diff)
-    mask_r = ~mask_q & (r_diff > s_diff)
-    rq = np.where(mask_q, -rr - rs, rq)
-    rr = np.where(mask_r, -rq - rs, rr)
+    rq, rr = _cube_round_vectorized(hq, hr)
+    rs = -rq - rr
 
     dist = np.maximum(np.maximum(np.abs(hq - rq), np.abs(hr - rr)), np.abs(hs - rs))
     return dist.reshape(ph, pw)

@@ -12,6 +12,7 @@ from torch.nn import Conv2d
 from torch.nn import functional as F
 from torch.nn.modules.utils import _pair
 from .modes import MODE_NAMES, Settings, ResolvedSettings
+from .modes.hex import hex_remap_batch
 from .dit_tiling import patch_dit_model, _has_conv2d
 
 # Track patches applied to the shared model so they can be removed between runs.
@@ -34,83 +35,6 @@ def _cleanup_previous_patches():
         if had_attr:
             del layer.tiling_resolved
     _patched_conv2d_layers.clear()
-
-
-def _hex_remap_batch(centers_x, centers_y, size, wrap_w, wrap_h, rotation):
-    """Vectorized hex coordinate remapping for all pixels at once.
-
-    Uses 4-neighbor search to find the integer source pixel whose hex offset
-    best matches the destination's hex offset, eliminating rounding mismatches
-    that occur when the hex-to-pixel round-trip lands on a suboptimal integer.
-    """
-    import numpy as np
-    from .modes.hex import get_inverse_matrix, get_matrix
-
-    flat_x = np.asarray(centers_x).ravel().astype(np.float64)
-    flat_y = np.asarray(centers_y).ravel().astype(np.float64)
-
-    inv_mat = get_inverse_matrix(rotation)
-    mat = get_matrix(rotation)
-
-    # pixel_to_hex (batch): inverse matrix multiply + divide by size
-    pts = np.stack([flat_x, flat_y], axis=0)
-    qr = (inv_mat @ pts) / size
-    q, r = qr[0], qr[1]
-    s = -q - r
-
-    # cube_round (vectorized) — floor(x+0.5) for consistent half-up rounding
-    _half_up = lambda v: np.floor(v + 0.5)
-    rq, rr, rs = _half_up(q), _half_up(r), _half_up(s)
-    q_diff, r_diff, s_diff = np.abs(rq - q), np.abs(rr - r), np.abs(rs - s)
-    mask_q = (q_diff > r_diff) & (q_diff > s_diff)
-    mask_r = ~mask_q & (r_diff > s_diff)
-    rq = np.where(mask_q, -rr - rs, rq)
-    rr = np.where(mask_r, -rq - rs, rr)
-
-    # Target hex offsets (desired relative position within hex cell)
-    target_dq = q - rq
-    target_dr = r - rr
-
-    # Continuous pixel position of the target offset
-    pixel = size * (mat @ np.stack([target_dq, target_dr], axis=0))
-    base_x = np.floor(pixel[0]).astype(np.int64)
-    base_y = np.floor(pixel[1]).astype(np.int64)
-
-    # 4-neighbor search: pick the integer pixel whose hex offset
-    # is closest to the target offset (Chebyshev distance in hex space).
-    # The simple rounding result is always one of the 4 candidates,
-    # so this can only match or improve, never regress.
-    best_x = np.empty_like(base_x)
-    best_y = np.empty_like(base_y)
-    best_err = np.full(len(q), np.inf)
-
-    for dx in (0, 1):
-        for dy in (0, 1):
-            cx = (base_x + dx).astype(np.float64)
-            cy = (base_y + dy).astype(np.float64)
-            c_pts = np.stack([cx, cy], axis=0)
-            c_qr = (inv_mat @ c_pts) / size
-            cq, cr = c_qr[0], c_qr[1]
-            cs = -cq - cr
-            crq, crr, crs = _half_up(cq), _half_up(cr), _half_up(cs)
-            cq_diff = np.abs(crq - cq)
-            cr_diff = np.abs(crr - cr)
-            cs_diff = np.abs(crs - cs)
-            cmask_q = (cq_diff > cr_diff) & (cq_diff > cs_diff)
-            cmask_r = ~cmask_q & (cr_diff > cs_diff)
-            crq = np.where(cmask_q, -crr - crs, crq)
-            crr = np.where(cmask_r, -crq - crs, crr)
-            cand_dq = cq - crq
-            cand_dr = cr - crr
-            err = np.maximum(np.abs(cand_dq - target_dq), np.abs(cand_dr - target_dr))
-            better = err < best_err
-            best_x = np.where(better, base_x + dx, best_x)
-            best_y = np.where(better, base_y + dy, best_y)
-            best_err = np.where(better, err, best_err)
-
-    new_x = (best_x + wrap_w // 2) % wrap_w
-    new_y = (best_y + wrap_h // 2) % wrap_h
-    return new_x, new_y
 
 
 @functools.cache
@@ -163,7 +87,7 @@ def calculate_mapping(
         cx = np.arange(pw, dtype=np.float64) - pw // 2
         cy = np.arange(ph, dtype=np.float64) - ph // 2
         grid_cx, grid_cy = np.meshgrid(cx, cy, indexing='xy')
-        new_x, new_y = _hex_remap_batch(grid_cx, grid_cy, size, pw, ph, resolved.rotation)
+        new_x, new_y = hex_remap_batch(grid_cx.ravel(), grid_cy.ravel(), size, pw, ph, resolved.rotation)
 
         src_x = np.tile(np.arange(pw, dtype=np.int64), ph)
         src_y = np.repeat(np.arange(ph, dtype=np.int64), pw)
@@ -197,7 +121,7 @@ def create_crop_mask(width: int, height: int, resolved: ResolvedSettings):
         cx = np.arange(width, dtype=np.float64) - width // 2
         cy = np.arange(height, dtype=np.float64) - height // 2
         grid_cx, grid_cy = np.meshgrid(cx, cy, indexing='xy')
-        new_x, new_y = _hex_remap_batch(grid_cx, grid_cy, size, width, height, resolved.rotation)
+        new_x, new_y = hex_remap_batch(grid_cx.ravel(), grid_cy.ravel(), size, width, height, resolved.rotation)
 
         src_x = np.tile(np.arange(width, dtype=np.int64), height)
         src_y = np.repeat(np.arange(height, dtype=np.int64), width)

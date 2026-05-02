@@ -1,6 +1,6 @@
 """
 Hex grid preview: arranges up to 7 images in a hexagonal grid layout
-using the same hex coordinate system as hex_tiling_vectorized for
+using the same hex coordinate system as hex_remap_batch for
 pixel-perfect alignment.
 """
 
@@ -32,14 +32,14 @@ def _compute_hex_grid(
     """
     Compute hex cell membership for each canvas pixel.
 
-    Uses the same hex coordinate math as hex_tiling_vectorized but on a
+    Uses the same hex coordinate math as hex_remap_batch but on a
     multi-cell canvas without modulo wrapping.
 
     :return: (cell_q, cell_r, tile_x, tile_y)
         cell_q, cell_r: int64 (canvas_h, canvas_w) — hex cell axial coords
         tile_x, tile_y: int64 (canvas_h, canvas_w) — pixel coords within tile image
     """
-    from .modes.hex import get_matrix, get_inverse_matrix
+    from .modes.hex import get_matrix, get_inverse_matrix, _cube_round_vectorized
 
     matrix = get_matrix(rotation)
     inv_matrix = get_inverse_matrix(rotation)
@@ -57,26 +57,12 @@ def _compute_hex_grid(
     xs -= canvas_w / 2.0
     ys -= canvas_h / 2.0
 
-    # pixel_to_hex — same as hex_tiling_vectorized
+    # pixel_to_hex
     q = (ia * xs + ib * ys) / hex_size
     r = (ic * xs + id_ * ys) / hex_size
 
-    # cube_round (vectorized) — matches hex_tiling_vectorized exactly
-    s = -q - r
-    rq = np.rint(q)
-    rr = np.rint(r)
-    rs = np.rint(s)
-
-    q_diff = np.abs(rq - q)
-    r_diff = np.abs(rr - r)
-    s_diff = np.abs(rs - s)
-
-    cond_q = (q_diff > r_diff) & (q_diff > s_diff)
-    cond_r = ~cond_q & (r_diff > s_diff)
-
-    # Must match hex_tiling_vectorized: rq modified before rr uses it
-    rq = np.where(cond_q, -rr - rs, rq)
-    rr = np.where(cond_r, -rq - rs, rr)
+    # cube_round — same half-up rounding as hex_remap_batch
+    rq, rr = _cube_round_vectorized(q, r)
 
     cell_q = rq.astype(np.int64)
     cell_r = rr.astype(np.int64)
@@ -85,7 +71,7 @@ def _compute_hex_grid(
     frac_q = q - rq
     frac_r = r - rr
 
-    # hex_to_pixel for fractional offset — same as hex_tiling_vectorized
+    # hex_to_pixel for fractional offset
     px = hex_size * (ma * frac_q + mb * frac_r)
     py = hex_size * (mc * frac_q + md * frac_r)
 
@@ -100,7 +86,7 @@ class AdvancedTilingHexGridPreview:
     """
     Preview node that arranges up to 7 images in a hexagonal grid.
 
-    Uses the same hex coordinate system as hex_tiling_vectorized for
+    Uses the same hex coordinate system as hex_remap_batch for
     pixel-perfect alignment between adjacent hexes.
     """
 
@@ -157,7 +143,7 @@ class AdvancedTilingHexGridPreview:
         hex_size = max(1, round(min(tile_w, tile_h) // 2 * hex_scale))
         dim = 2 * hex_size
 
-        # Build inside mask using hex_tiling_vectorized (same as hex_inpaint)
+        # Build inside mask using hex_tiling_vectorized (same as hex_remap_batch)
         from .modes.hex import hex_tiling_vectorized
         mapped_x, mapped_y = hex_tiling_vectorized(dim, dim, rotation, float(hex_size))
         mxs = np.arange(dim, dtype=np.int64)[np.newaxis, :]
