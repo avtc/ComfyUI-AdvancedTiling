@@ -144,7 +144,7 @@ class AdvancedTilingHexGridPreview:
         dim = 2 * hex_size
 
         # Build inside mask using hex_tiling_vectorized (same as hex_remap_batch)
-        from .modes.hex import hex_tiling_vectorized
+        from .modes.hex_vectorized import hex_tiling_vectorized
         mapped_x, mapped_y = hex_tiling_vectorized(dim, dim, rotation, float(hex_size))
         mxs = np.arange(dim, dtype=np.int64)[np.newaxis, :]
         mys = np.arange(dim, dtype=np.int64)[:, np.newaxis]

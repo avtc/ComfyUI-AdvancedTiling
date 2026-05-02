@@ -87,7 +87,7 @@ def _build_neighbor_map(
 
     :return: LongTensor of shape (height, width) with values -1 to 5
     """
-    from .modes.hex import hex_tiling_vectorized
+    from .modes.hex_vectorized import hex_tiling_vectorized
     from .modes.hex_mask import _compute_sector_map
 
     hex_size = min(width, height) // 2

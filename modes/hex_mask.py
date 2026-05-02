@@ -27,7 +27,7 @@ def _build_inside_mask(width: int, height: int, rotation: float) -> torch.Tensor
 
     :return: Bool tensor of shape (height, width)
     """
-    from .hex import hex_tiling_vectorized
+    from .hex_vectorized import hex_tiling_vectorized
 
     hex_size = min(width, height) // 2
     mapped_x, mapped_y = hex_tiling_vectorized(width, height, rotation, hex_size)
