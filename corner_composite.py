@@ -170,7 +170,7 @@ def compute_corner_edge_buffer(
     import torch.nn.functional as F
     from .modes.hex_mask import (
         _build_hex_mask_at, _erode_mask, _compute_sector_map_at,
-        _manhattan_distance_to_region,
+        _manhattan_distance_to_region, _CORNER_EDGE_SECTORS,
     )
 
     unit_offsets = _CORNER_OFFSETS[corner]
