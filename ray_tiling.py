@@ -57,7 +57,7 @@ if HAS_RAYLIGHT:
             if settings.mode == "None":
                 resolved_list = []
                 for lat in latent:
-                    _, _, H_lat, W_lat = lat["samples"].shape
+                    H_lat, W_lat = lat["samples"].shape[-2], lat["samples"].shape[-1]
                     img_w = W_lat * vae_factor
                     img_h = H_lat * vae_factor
                     resolved = settings._resolve_auto(False, vae_factor, 2, img_w, img_h)

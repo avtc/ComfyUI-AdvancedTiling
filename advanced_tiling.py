@@ -430,7 +430,7 @@ class AdvancedTiling:
         patch_size = 1 if is_conv2d else getattr(diff_model, 'patch_size', 1)
 
         latent_tensor = latent["samples"]
-        _, _, H_lat, W_lat = latent_tensor.shape
+        H_lat, W_lat = latent_tensor.shape[-2], latent_tensor.shape[-1]
         img_w = W_lat * vae_factor
         img_h = H_lat * vae_factor
 
