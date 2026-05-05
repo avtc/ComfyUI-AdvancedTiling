@@ -143,7 +143,7 @@ if HAS_RAYLIGHT:
             # Build per-worker args: each worker gets its latent's img dimensions
             worker_args = []
             for lat in latent:
-                _, _, H_lat, W_lat = lat["samples"].shape
+                H_lat, W_lat = lat["samples"].shape[-2], lat["samples"].shape[-1]
                 worker_args.append((W_lat * vae_factor, H_lat * vae_factor))
 
             futures = [
